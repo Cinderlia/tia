@@ -19,7 +19,12 @@ from urllib.parse import urlencode
 
 from tia.ad.llm import LlmClient
 from tia.cap.case import parse_sink
-from tia.cap.entry import infer_read_entry, resolve_values_with_guess
+from tia.cap.entry import (
+    EntryCandidate,
+    derive_payload_constraints,
+    entry_candidates,
+    infer_entry,
+)
 from tia.inf.runtime import get_runtime
 from tia.inf.store import now_iso
 from tia.orch.judge import judge_trigger
@@ -200,7 +205,7 @@ async def run_trigger(
                              report=await kernel.report(), stages=stages, notes=notes,
                              trace=kernel.trace)
     post_vars = sorted(set(_POST_VAR_RE.findall(source_text))) or params
-    entry_method, entry_fields = infer_read_entry(source_text)
+    entry_plan = infer_entry(source_text)
     read_line = _read_line([line for line in source["lines"] if isinstance(line, dict)], table)
     notes.update(
         {
@@ -209,8 +214,12 @@ async def run_trigger(
             "post_vars": post_vars,
             "read_line": read_line,
             "read_entry": {
-                "method": entry_method,
-                "fields": [{"name": f.name, "usage": f.usage, "numeric": f.numeric} for f in entry_fields],
+                "method": entry_plan.method,
+                "has_filter": entry_plan.has_filter,
+                "mutating": entry_plan.mutating,
+                "fields": [
+                    {"name": f.name, "usage": f.usage, "numeric": f.numeric} for f in entry_plan.fields
+                ],
             },
         }
     )
@@ -278,13 +287,16 @@ async def run_trigger(
         StageRecord("P4", db_error is None, "Write successful" if db_error is None else f"Write failed: {db_error}")
     )
 
-    # Derived read-entry values: the tag locates the row we wrote; its primary
-    # key and the tag are the only legal values for the read page's parameters.
+    # Exploration: the entry parameters are ordered attempts, not a proof.
+    # The tag identifies the written row; the row's primary key and the tag are
+    # the strongest values, weaker candidates follow inside a small budget.
+    payload_column = value_columns[values.index(payload)] if payload in values else value_columns[-1]
+    pk_columns = list(table_meta.get("primary_key") or [])
+    candidates: list[EntryCandidate] = []
     entry_request: tuple[str, dict[str, str]] | None = None
-    if db_error is None and entry_fields:
-        payload_column = value_columns[values.index(payload)] if payload in values else value_columns[-1]
-        pk_columns = list(table_meta.get("primary_key") or [])
+    if db_error is None:
         order = f" ORDER BY `{pk_columns[0]}` DESC" if pk_columns else ""
+        row: dict[str, Any] | None = None
         try:
             found = await kernel.call(
                 "db_read",
@@ -298,17 +310,20 @@ async def run_trigger(
             row = (found.get("rows") or [None])[0]
         except ToolCallError:
             row = None
-        entry_values, entry_basis = await resolve_values_with_guess(
-            entry_fields,
+        candidates = await entry_candidates(
+            entry_plan,
             tag=tag,
             row=row,
             pk_columns=pk_columns,
             context=source_text,
             client=LlmClient.from_env(),
+            limit=3,
         )
-        entry_request = (entry_method, entry_values)
-        notes["read_entry_values"] = entry_values
-        notes["read_entry_basis"] = entry_basis
+        if candidates:
+            first = candidates[0]
+            entry_request = (first.method, first.values)
+            notes["read_entry_values"] = first.values
+            notes["read_entry_basis"] = first.basis
 
     # P5 Sink read probe + verify_tag forensics --------------------------------
     if db_error is None and read_line is not None:
@@ -316,14 +331,22 @@ async def run_trigger(
             kernel, case_id, sink_file, read_line, base_url, tag, entry_request
         )
     verify: dict[str, Any] | None = None
+    verify_attempts: list[dict[str, Any]] = []
     if db_error is None:
-        verify_html: str | None = None
-        verify_content_type = "text/html"
-        if entry_request:
+        for candidate in candidates:
+            attempt: dict[str, Any] = {
+                "method": candidate.method,
+                "values": candidate.values,
+                "confidence": candidate.confidence,
+                "basis": candidate.basis,
+                "found": False,
+            }
+            verify_html: str | None = None
+            verify_content_type = "text/html"
             try:
-                if entry_request[0] == "GET":
+                if candidate.method == "GET":
                     fetched = await kernel.call(
-                        "http_request", {"method": "GET", "url": base_url, "params": entry_request[1]}
+                        "http_request", {"method": "GET", "url": base_url, "params": candidate.values}
                     )
                 else:
                     fetched = await kernel.call(
@@ -331,24 +354,42 @@ async def run_trigger(
                         {
                             "method": "POST",
                             "url": base_url,
-                            "body": urlencode(entry_request[1]),
+                            "body": urlencode(candidate.values),
                             "headers": {"Content-Type": "application/x-www-form-urlencoded"},
                         },
                     )
                 verify_html = str(fetched.get("body") or "")
                 verify_content_type = str(fetched.get("content_type") or "text/html")
+                attempt["status"] = fetched.get("status")
             except ToolCallError as exc:
-                notes["read_entry_error"] = f"{exc.code.value}: {exc.message}"
-        verify_args: dict[str, Any] = {"tag": tag, "payload": payload}
-        if verify_html is not None:
-            verify_args["html"] = verify_html
-            verify_args["content_type"] = verify_content_type
-        else:
-            verify_args["url"] = base_url
-        try:
-            verify = await kernel.call("verify_tag", verify_args)
-        except ToolCallError as exc:
-            notes["verify_error"] = f"{exc.code.value}: {exc.message}"
+                attempt["error"] = f"{exc.code.value}: {exc.message}"
+                verify_attempts.append(attempt)
+                continue
+            verify_args: dict[str, Any] = {"tag": tag, "payload": payload}
+            if verify_html:
+                verify_args["html"] = verify_html
+                verify_args["content_type"] = verify_content_type
+            else:
+                verify_args["url"] = base_url
+            try:
+                attempt_verify = await kernel.call("verify_tag", verify_args)
+            except ToolCallError as exc:
+                attempt["error"] = f"{exc.code.value}: {exc.message}"
+                verify_attempts.append(attempt)
+                continue
+            attempt["found"] = bool(attempt_verify.get("found"))
+            attempt["occurrence_count"] = attempt_verify.get("occurrence_count")
+            verify_attempts.append(attempt)
+            if verify is None or (attempt["found"] and not bool(verify.get("found"))):
+                verify = attempt_verify
+            if attempt["found"]:
+                break
+        if not candidates:
+            try:
+                verify = await kernel.call("verify_tag", {"tag": tag, "payload": payload, "url": base_url})
+            except ToolCallError as exc:
+                notes["verify_error"] = f"{exc.code.value}: {exc.message}"
+        notes["entry_attempts"] = verify_attempts
         if verify is not None:
             notes["occurrence_count"] = verify.get("occurrence_count")
             best = verify.get("best") or {}
@@ -358,12 +399,23 @@ async def run_trigger(
                 "reason": best.get("executable_reason"),
                 "node_path": best.get("node_path"),
             }
+            column_length = None
+            for column in table_meta.get("columns") or []:
+                if column.get("name") == payload_column:
+                    column_length = column.get("length")
+            notes["payload_constraints"] = derive_payload_constraints(
+                verify,
+                column=payload_column,
+                column_length=column_length,
+                payload=payload,
+            )
         sink_read = notes.get("sink_read") or {}
         stages.append(
             StageRecord(
                 "P5",
                 verify is not None and bool(verify.get("found")),
                 f"found={bool(verify and verify.get('found'))} occurrences={notes.get('occurrence_count')}"
+                f" attempts={len(verify_attempts)}"
                 f" sink_read={sink_read.get('rows_with_tag')}/{sink_read.get('row_count')}",
             )
         )

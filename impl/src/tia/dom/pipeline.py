@@ -186,6 +186,7 @@ async def run_pipeline(
                 budget=budget,
                 inject_client=inject_client,
                 url_for=url_for,
+                payload_constraints=(trigger.notes or {}).get("payload_constraints"),
             )
         except ToolCallError as exc:
             record["stopped_at"] = "inject_error"
@@ -212,6 +213,7 @@ async def walk_injection_queue(
     inject_client: ToolClient | None,
     url_for: Callable[[dict[str, Any]], str] | None,
     reader: Callable[[str, int, int], list[tuple[int, str]]] | None = None,
+    payload_constraints: dict[str, Any] | None = None,
 ) -> PipelineResult:
     """Inject every candidate in queue order; the read side is already proven."""
     result = PipelineResult()
@@ -245,6 +247,7 @@ async def walk_injection_queue(
             pair_hints=[hint],
             verify_url=read_url,
             verify_entry=entry,
+            payload_constraints=payload_constraints,
         )
         store.archive_injection_item(str(item["item_id"]), inject.verdict, case_id=inject.case_id)
         store.archive_slice(str(item["write_slice_id"]), inject.verdict, case_id=inject.case_id)

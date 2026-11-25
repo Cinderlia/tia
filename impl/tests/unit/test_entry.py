@@ -8,7 +8,10 @@ import pytest
 
 from tia.cap.entry import (
     EntryField,
+    derive_payload_constraints,
+    entry_candidates,
     entry_field,
+    infer_entry,
     infer_read_entry,
     resolve_values,
     resolve_values_with_guess,
@@ -111,3 +114,65 @@ async def test_no_client_means_no_guess() -> None:
         fields, tag="abcd", row=None, pk_columns=[], context="", client=None
     )
     assert values == {"page": "abcd"}
+
+
+def test_entry_plan_marks_filter_and_mutating() -> None:
+    plan = entry_plan = infer_entry(
+        "$q = $_POST['search'];\n$r = $conn->query(\"select * from t where name like '%$q%'\");"
+    )
+    assert entry_plan.has_filter is True
+    assert entry_plan.mutating is False
+    assert [f.name for f in plan.fields] == ["search"]
+
+
+def test_entry_plan_mutating_page_without_filter() -> None:
+    plan = infer_entry("$name = $_POST['name'];\nINSERT INTO comments (user) VALUES (:name);")
+    assert plan.has_filter is False
+    assert plan.mutating is True
+
+
+@pytest.mark.asyncio
+async def test_candidates_without_filter_issue_a_bare_get() -> None:
+    plan = infer_entry("insert into comments (user) values (:user);")
+    candidates = await entry_candidates(plan, tag="abcd", row=None, pk_columns=[])
+    assert [(c.method, c.values) for c in candidates] == [("GET", {})]
+
+
+@pytest.mark.asyncio
+async def test_candidates_rank_evidence_first() -> None:
+    plan = infer_entry("$search = $_POST['search'];\nselect * from t where search like '%$search%';")
+    candidates = await entry_candidates(
+        plan, tag="abcd", row={"id": 7}, pk_columns=["id"], limit=3
+    )
+    assert candidates[0].values == {"search": "abcd"}
+    assert candidates[0].confidence >= candidates[-1].confidence
+
+
+@pytest.mark.asyncio
+async def test_candidates_on_mutating_page_prefer_get() -> None:
+    plan = infer_entry(
+        "$s = $_POST['search'];\nselect * from t where name like '%$s%';\n"
+        "insert into t (name) values (:search);"
+    )
+    candidates = await entry_candidates(plan, tag="abcd", row=None, pk_columns=[])
+    assert candidates[0].method == "GET"
+
+
+def test_payload_constraints_carry_output_context() -> None:
+    verify = {
+        "best": {
+            "context_kind": "html_text",
+            "quoting": None,
+            "executable": True,
+            "executable_reason": "HTML_EXECUTABLE",
+            "match_kind": "literal",
+            "node_path": "html>body>p",
+        }
+    }
+    constraints = derive_payload_constraints(
+        verify, column="comment", column_length=100, payload="<script>alert(1)</script>abcd"
+    )
+    assert constraints["context_kind"] == "html_text"
+    assert constraints["max_length"] == 100
+    assert constraints["payload_length"] == 29
+    assert constraints["requires_breakout"] is False

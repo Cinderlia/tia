@@ -153,6 +153,7 @@ async def run_inject(
     pair_hints: list[dict[str, Any]] | None = None,
     verify_url: str | None = None,
     verify_entry: dict[str, Any] | None = None,
+    payload_constraints: dict[str, Any] | None = None,
 ) -> InjectResult:
     kernel = Kernel(
         profile="inject", budget=budget, client=client or LocalToolClient(profile="inject")
@@ -295,6 +296,17 @@ async def run_inject(
             for column in table_item.get("columns") or []:
                 widths[str(column.get("name"))] = column.get("length")
     payload = f"{payload_base}<tia-{tag}>"
+    constraints = dict(payload_constraints or {})
+    if constraints:
+        notes["payload_constraints"] = constraints
+        max_length = constraints.get("max_length")
+        overhead = len(f"<tia-{tag}>")
+        if isinstance(max_length, int) and max_length > overhead and len(payload) > max_length:
+            keep = max_length - overhead
+            trimmed = payload_base[:keep]
+            payload = f"{trimmed}<tia-{tag}>"
+            notes["payload_trimmed"] = {"max_length": max_length, "base_chars": len(trimmed)}
+            stage("I3", True, f"payload trimmed to {len(payload)} chars for column limit {max_length}")
     fitting: list[tuple[int, str, str]] = []
     param_columns = {parameter: column for column, parameter in column_params.items()}
     for candidate in candidates:
@@ -392,7 +404,6 @@ async def run_inject(
 
     # Second-order XSS: the write entry and the read page differ. Fetch the read
     # page with its own entry parameters before classifying the tag context.
-    verify_html: str | None = None
     verify_content_type = "text/html"
     if verify_url and verify_url != form.action and verify_entry:
         entry_method = str(verify_entry.get("method") or "POST").upper()
@@ -420,37 +431,58 @@ async def run_inject(
             client=LlmClient.from_env(),
         )
         notes["read_entry_basis"] = entry_basis
-        try:
-            if entry_method == "GET":
-                page = await call("http_request", {"method": "GET", "url": verify_url, "params": entry_fields})
-            else:
-                page = await call(
-                    "http_request",
-                    {
-                        "method": "POST",
-                        "url": verify_url,
-                        "body": urlencode(entry_fields),
-                        "headers": {"Content-Type": "application/x-www-form-urlencoded"},
-                    },
-                )
-            verify_html = str(page.get("body") or "")
-            verify_content_type = str(page.get("content_type") or "text/html")
-            stage("I6", True, f"read page {verify_url} → {page.get('status')}")
-        except ToolCallError as exc:
-            notes["read_page_error"] = str(exc.envelope.error.message if exc.envelope.error else exc)
-            stage("I6", False, f"read page fetch failed: {notes['read_page_error']}")
-
-    verify_args: dict[str, Any] = {"tag": tag, "payload": payload}
-    if verify_html is not None:
-        verify_args["html"] = verify_html
-        verify_args["content_type"] = verify_content_type
+        attempt_values: list[dict[str, str]] = [entry_fields]
+        tag_only = {field.name: tag for field in entry_spec}
+        if tag_only and tag_only != entry_fields:
+            attempt_values.append(tag_only)
+        verify: dict[str, Any] | None = None
+        attempts: list[dict[str, Any]] = []
+        for values in attempt_values:
+            attempt_html: str | None = None
+            try:
+                if entry_method == "GET":
+                    page = await call("http_request", {"method": "GET", "url": verify_url, "params": values})
+                else:
+                    page = await call(
+                        "http_request",
+                        {
+                            "method": "POST",
+                            "url": verify_url,
+                            "body": urlencode(values),
+                            "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+                        },
+                    )
+                attempt_html = str(page.get("body") or "")
+                verify_content_type = str(page.get("content_type") or "text/html")
+                status = page.get("status")
+            except ToolCallError as exc:
+                attempts.append({"values": values, "error": str(exc)})
+                continue
+            this_verify = await call(
+                "verify_tag", {"tag": tag, "payload": payload, "html": attempt_html,
+                               "content_type": verify_content_type}
+            )
+            attempts.append(
+                {"values": values, "status": status, "found": bool(this_verify.get("found"))}
+            )
+            if verify is None or (this_verify.get("found") and not bool(verify.get("found"))):
+                verify = this_verify
+            if this_verify.get("found"):
+                break
+        notes["verify_attempts"] = attempts
+        stage("I6", verify is not None, f"read page {verify_url} attempts={len(attempts)}")
+        if verify is None:
+            verify = await call("verify_tag", {"tag": tag, "payload": payload, "url": verify_url or form.action})
         notes["verify_on"] = "read_page"
     else:
-        verify_args["url"] = verify_url or form.action
-        notes["verify_on"] = "url"
-    verify = await call("verify_tag", verify_args)
-    found = bool(verify.get("found"))
-    best = verify.get("best") or {}
+        try:
+            verify = await call("verify_tag", {"tag": tag, "payload": payload, "url": form.action})
+            notes["verify_on"] = "url"
+        except ToolCallError as exc:
+            notes["verify_error"] = str(exc)
+            verify = None
+    found = bool(verify.get("found") if verify else False)
+    best = (verify or {}).get("best") or {}
     executable = bool(best.get("executable"))
     notes.update({"tag_in_page": found, "executable": executable, "context_kind": best.get("context_kind")})
     stage("I6", found, f"tag_in_page={found} executable={executable} kind={best.get('context_kind')}")

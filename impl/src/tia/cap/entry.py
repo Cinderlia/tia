@@ -182,3 +182,125 @@ async def _guess(
     if not isinstance(raw, dict):
         return {}
     return {str(key): str(value) for key, value in raw.items()}
+
+
+_WRITE_SQL_RE = re.compile(r"\b(?:insert\s+into|update\s+\w+\s+set|delete\s+from)\b", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class EntryPlan:
+    """Static prior for reaching a read page.
+
+    ``has_filter``/``mutating`` describe the request shape, they do **not** decide
+    whether a candidate is allowed: exploration still tries candidates in order and
+    lets the observed page accept or reject them.
+    """
+
+    method: str
+    fields: list[EntryField]
+    has_filter: bool
+    mutating: bool
+
+
+@dataclass(frozen=True)
+class EntryCandidate:
+    """One ordered attempt at the read page, with its evidence."""
+
+    method: str
+    values: dict[str, str]
+    confidence: int
+    basis: dict[str, str]
+
+
+def infer_entry(source_text: str) -> EntryPlan:
+    """Build the static prior for the read page."""
+    has_filter = bool(re.search(r"\bwhere\b", source_text, re.IGNORECASE))
+    method, fields = infer_read_entry(source_text, require_where=False)
+    return EntryPlan(
+        method=method,
+        fields=fields,
+        has_filter=has_filter,
+        mutating=bool(_WRITE_SQL_RE.search(source_text)),
+    )
+
+
+async def entry_candidates(
+    plan: EntryPlan,
+    *,
+    tag: str,
+    row: dict[str, Any] | None,
+    pk_columns: list[str],
+    context: str = "",
+    client: LlmClient | None = None,
+    limit: int = 3,
+) -> list[EntryCandidate]:
+    """Ranked attempts for reaching the read page.
+
+    Strong evidence first (row values / tag), weak but related evidence last.
+    A page without a filter needs no parameters at all; a page that also writes
+    is only ever probed with a read-only request shape.
+    """
+    if not plan.has_filter:
+        return [EntryCandidate("GET", {}, 55, {"_": "no-filter"})]
+    if not plan.fields:
+        return [EntryCandidate("GET", {}, 40, {"_": "no-fields"})]
+    method = "GET" if plan.mutating else plan.method
+    values, basis = await resolve_values_with_guess(
+        plan.fields,
+        tag=tag,
+        row=row,
+        pk_columns=pk_columns,
+        context=context,
+        client=client,
+    )
+    candidates = [EntryCandidate(method, dict(values), 75, dict(basis))]
+    tag_only = {field.name: tag for field in plan.fields}
+    if tag_only != values:
+        candidates.append(
+            EntryCandidate(method, tag_only, 45, {field.name: "tag" for field in plan.fields})
+        )
+    if any(field.numeric for field in plan.fields):
+        numeric = dict(values)
+        numeric_basis = dict(basis)
+        for field in plan.fields:
+            if field.numeric:
+                numeric[field.name] = "1"
+                numeric_basis[field.name] = "numeric-min"
+        candidates.append(EntryCandidate(method, numeric, 35, numeric_basis))
+    seen: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
+    ranked: list[EntryCandidate] = []
+    for candidate in candidates:
+        key = (candidate.method, tuple(sorted(candidate.values.items())))
+        if key in seen:
+            continue
+        seen.add(key)
+        ranked.append(candidate)
+    return ranked[: max(1, limit)]
+
+
+def derive_payload_constraints(
+    verify: dict[str, Any] | None,
+    *,
+    column: str | None,
+    column_length: int | None,
+    payload: str,
+) -> dict[str, Any]:
+    """Summarise what the inject agent needs to know about the output side.
+
+    The trigger agent can see the sink context but not the input-side filter; the
+    inject agent sees the form but not the sink. This object carries the facts
+    from the trigger side to the injection side.
+    """
+    best = (verify or {}).get("best") or {}
+    return {
+        "column": column,
+        "max_length": column_length,
+        "payload_length": len(payload),
+        "context_kind": best.get("context_kind"),
+        "quoting": best.get("quoting"),
+        "executable": best.get("executable"),
+        "executable_reason": best.get("executable_reason"),
+        "match_kind": best.get("match_kind"),
+        "requires_breakout": str(best.get("quoting") or "").lower() not in ("", "none"),
+        "node_path": best.get("node_path"),
+    }

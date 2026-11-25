@@ -202,6 +202,7 @@ def _run_trigger(args: argparse.Namespace) -> int:
         "tag": result.notes.get("tag"),
         "occurrence_count": result.notes.get("occurrence_count"),
         "change_id": result.notes.get("change_id"),
+        "payload_constraints": result.notes.get("payload_constraints"),
         "explanation": result.notes.get("explanation"),
         "tool_calls": len(result.trace),
     }
