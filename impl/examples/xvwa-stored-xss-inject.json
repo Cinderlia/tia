@@ -1,0 +1,9 @@
+{
+  "kind": "SQL",
+  "sinkFile": "vulnerabilities/stored_xss/home.php",
+  "sinkLine": 49,
+  "sinkCode": "$stmt->bindParam(\":comment\",$comment)",
+  "sink": "vulnerabilities/stored_xss/home.php:49  $stmt->bindParam(\":comment\",$comment)",
+  "params": ["msg"],
+  "sources": [{"param": "msg", "line": 40}]
+}

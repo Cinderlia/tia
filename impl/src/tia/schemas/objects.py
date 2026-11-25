@@ -173,3 +173,15 @@ class ProbeResult(BaseModel):
     hit: bool = False
     queries: list[ProbeQuery] = Field(default_factory=list)
     http: ProbeHttp = Field(default_factory=ProbeHttp)
+
+
+class CaseOutcome(BaseModel):
+    """主 agent 归档单元：一个切片从 trigger 到 inject 的最终结果。"""
+
+    slice_id: str
+    case_id: str = ""
+    verdict: str
+    evidence_refs: list[str] = Field(default_factory=list)
+    residue: int = 0
+    notes: dict[str, str] = Field(default_factory=dict)
+    duration_ms: int = 0

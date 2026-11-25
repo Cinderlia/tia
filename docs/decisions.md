@@ -95,3 +95,20 @@
   profile 白名单默认为空，所以"没登记就拒绝"。
 - 原因：每个 case 只该写它声明的表；yaml 作为运维级兜底。
 - 需回写文档：是（§1.6 权限矩阵）。
+
+## D13 inject 的 I7 清理语义
+
+- 文档：I7 收尾 `db_undo` + `case_report`；undo 用于回滚自己造的前置数据。
+- 实现：inject 的行是应用自己写进去的，因此 I7 用 `db_write DELETE`（按 tag）清除测试数据，
+  并返回 `residue`（删除后仍匹配 tag 的行数，应为 0），change 记录保留可审计/可回滚。
+- 原因：对"应用写入的行"调 `db_undo` 会把行还原，等于没清理；`residue` 在这里度量的是
+  "自己造成的数据残留"，与 trigger 的 before_image 核对语义不同。
+- 需回写文档：是（I7 说明）。
+
+## D14 主 agent 先做确定性调度
+
+- 文档：主 agent 由 LLM/planner 选择切片与下一步。
+- 实现：`dom/main.py` 按 attempts→kind→路径排序，逐个 trigger→inject→归档；连续 3 次失败
+  熔断 `BLOCKED_NEEDS_HUMAN`。`pick()` 是替换点，接 planner 时只改这里。
+- 原因：先保证调度骨架、证据链与报告闭环，模型只影响"选哪个切片"。
+- 需回写文档：是（M4 实现顺序）。

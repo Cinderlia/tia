@@ -142,6 +142,9 @@ Web UI、模型微调、payload 生成器、IDA/Burp 集成、对目标应用的
 - 数据层：`db_schema/db_read/db_write/db_undo`，写库返回 `change_id` + `undo_sql`，回滚后 `residue`。
 - trigger 主流程：`tia-agent trigger --slice ... --base-url ...` 已能对 xvwa stored_xss 跑完
   P0–P6，得到 `EXECUTED` 且 `residue=0`（见 `impl/scripts/smoke-trigger.sh`）。
-- 下一步：inject 主流程、主 agent 队列、探针（PHP 采集器）与 trace。
+- inject 主流程：`tia-agent inject --slice ...` 走 I0–I7，用应用自己的表单 POST 投递，
+  三态验收（库里有 / 页面有 / 可执行）得到 `EXECUTABLE`，清理后 `residue=0`。
+- 主调度：`tia-agent main --slices ...` 串联 trigger → inject → 归档，输出调度报告。
+- 下一步：LLM planner 接入、探针（PHP 采集器）、taint/trace 工具、更多靶场。
 
 开发与测试命令见 `impl/README.md`。

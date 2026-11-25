@@ -39,3 +39,16 @@ def judge_trigger(
     if reason in {"NO_CARRIER", "NEEDS_RUNTIME", "INERT_PAYLOAD", "NEEDS_EXECUTABLE_PAYLOAD"}:
         return TriggerVerdict.REFLECTED_INERT, f"命中但上下文不可执行: {reason}"
     return TriggerVerdict.REFLECTED_INERT, f"命中但未判为可执行: {reason}"
+
+
+def judge_inject(
+    tag_in_db: bool, tag_in_page: bool, executable: bool
+) -> tuple[str, str]:
+    """三态矩阵 (库里有 / 页面有 / 可执行) → inject verdict。"""
+    if not tag_in_db and not tag_in_page:
+        return "WRITE_NOT_REACHED", "库里和页面上都没有 tag：写路径没走到"
+    if tag_in_db and not tag_in_page:
+        return "WRITTEN_NOT_VISIBLE", "写入成功但页面读不到：读选择器或会话问题"
+    if tag_in_db and tag_in_page and not executable:
+        return "NOT_EXECUTABLE", "写入并回显，但上下文不可执行"
+    return "EXECUTABLE", "库里有、页面有、上下文可执行"

@@ -1,0 +1,319 @@
+"""inject agent：证明"用户能从 HTTP 入口把内容写进去"（I0–I7）。
+
+与 trigger 的分工：trigger 直写数据库证明 sink 可达；inject 只走应用自己的表单，
+数据库写入由应用完成，最后用 ``db_read`` / ``verify_tag`` 做三态验收。
+"""
+
+from __future__ import annotations
+
+import contextlib
+import datetime as _dt
+import re
+import secrets
+import string
+from dataclasses import dataclass, field
+from typing import Any
+from urllib.parse import urlencode, urljoin
+
+from tia.cap.domscan import Document, parse
+from tia.dom.trigger import StageRecord
+from tia.orch.judge import judge_inject
+from tia.orch.kernel import Kernel, LocalToolClient, ToolCallError, ToolClient
+
+DEFAULT_PAYLOAD = "<script>alert(1)</script>"
+_TAG_RE = re.compile(r"<tia-([a-z0-9]{4})>")
+
+
+@dataclass
+class InjectResult:
+    case_id: str
+    verdict: str
+    stages: list[StageRecord] = field(default_factory=list)
+    notes: dict[str, Any] = field(default_factory=dict)
+    residue: int = 0
+    report: str = ""
+    trace: list[Any] = field(default_factory=list)
+
+
+@dataclass
+class _Form:
+    action: str
+    method: str
+    fields: dict[str, str]
+
+
+def _tag() -> str:
+    """4 字符小写字母数字：既能当证据，又能过常见长度限制。"""
+    alphabet = string.ascii_lowercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(4))
+
+
+def _walk(document: Document) -> list[Any]:
+    return list(document.nodes)
+
+
+def _forms(document: Document, page_url: str) -> list[_Form]:
+    forms: list[_Form] = []
+    for node in document.nodes:
+        if node.tag != "form":
+            continue
+        action = node.attrs.get("action", "")
+        method = (node.attrs.get("method") or "get").lower()
+        fields: dict[str, str] = {}
+        stack = list(node.children)
+        while stack:
+            child = stack.pop()
+            if child.tag in {"input", "textarea", "select"}:
+                name = child.attrs.get("name")
+                if name:
+                    kind = (child.attrs.get("type") or "").lower()
+                    if kind not in {"submit", "button", "reset", "file", "image"}:
+                        fields[name] = child.attrs.get("value", "")
+            stack.extend(child.children)
+        forms.append(_Form(action=urljoin(page_url, action or page_url), method=method, fields=fields))
+    return forms
+
+
+def _infer_target(source_text: str, sink_code: str, params: list[str]) -> dict[str, Any] | None:
+    """从源码里推断 INSERT 目标表与列；拿不到就回 None。"""
+    insert = re.search(r"insert\s+(?:ignore\s+)?into\s+([`\"]?)([A-Za-z_][\w]*)\1\s*\(([^)]*)\)", source_text, re.I)
+    if insert is None:
+        return None
+    table = insert.group(2)
+    columns = [c.strip().strip("`\"") for c in insert.group(3).split(",") if c.strip()]
+    bind = re.search(r'bind(?:Param|Value)\(\s*[\'"]:([A-Za-z_][\w]*)[\'"]', sink_code)
+    column = bind.group(1) if bind else (params[0] if params else columns[-1] if columns else "")
+    if column not in columns:
+        # 冒号名与列名不完全一致时，按参数名再试一次
+        candidate = params[0] if params and params[0] in columns else ""
+        column = candidate or (columns[0] if columns else "")
+    return {"table": table, "columns": columns, "column": column}
+
+
+async def run_inject(
+    raw_slice: dict[str, Any],
+    base_url: str,
+    payload_base: str = DEFAULT_PAYLOAD,
+    budget: int = 40,
+    client: ToolClient | None = None,
+    cleanup: bool = True,
+) -> InjectResult:
+    kernel = Kernel(
+        profile="inject", budget=budget, client=client or LocalToolClient(profile="inject")
+    )
+    result = InjectResult(case_id="", verdict="ENV_ERROR")
+    stages = result.stages
+    notes = result.notes
+
+    def stage(name: str, ok: bool, note: str) -> None:
+        stages.append(StageRecord(stage=name, ok=ok, note=note))
+
+    sink = str(raw_slice.get("sink") or raw_slice.get("sinkCode") or "")
+    sink_file = str(raw_slice.get("sinkFile") or (sink.split(":", 1)[0] if ":" in sink else ""))
+    line_match = re.search(r":(\d+)", sink)
+    sink_line = int(line_match.group(1)) if line_match else int(raw_slice.get("sinkLine") or 0)
+    params = [str(p) for p in raw_slice.get("params") or []]
+    if not params:
+        for source in raw_slice.get("sources") or []:
+            if source.get("param"):
+                params.append(str(source["param"]))
+    tag = _tag()
+    notes.update({"tag": tag, "sink": f"{sink_file}:{sink_line}"})
+
+    async def call(tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        data = await kernel.call(tool, arguments)
+        return data if isinstance(data, dict) else {}
+
+    # ---- I0 基线：页面不含新 tag，且库里没有残留 ----
+    try:
+        case = await call(
+            "case_open",
+            {
+                "agent": "inject",
+                "slice": {"sink": f"{sink_file}:{sink_line}  {sink}", "kind": raw_slice.get("kind", "SQL")},
+                "write_targets": [],
+            },
+        )
+    except ToolCallError as exc:
+        stage("I0", False, f"case_open 失败: {exc}")
+        result.verdict = "ENV_ERROR"
+        return result
+    result.case_id = str(case.get("case_id", ""))
+    kernel.case_id = result.case_id
+    baseline = await call("verify_tag", {"url": base_url, "tag": tag})
+    if baseline.get("found"):
+        stage("I0", False, "BASELINE_DIRTY: 页面已存在该 tag")
+        result.verdict = "BASELINE_DIRTY"
+        return await _finish(kernel, result, cleanup=False)
+    stage("I0", True, f"基线干净 tag={tag}")
+
+    # ---- I1 写路径符号化：源码里找 INSERT 目标 ----
+    try:
+        source = await call(
+            "source_read",
+            {"file": sink_file, "line_from": max(1, sink_line - 40), "line_to": sink_line + 10},
+        )
+    except ToolCallError as exc:
+        stage("I1", False, f"source_read 失败: {exc}")
+        result.verdict = "PATH_UNREACHABLE"
+        return await _finish(kernel, result)
+    text = "\n".join(str(item.get("text", "")) for item in source.get("lines") or [])
+    target = _infer_target(text, str(raw_slice.get("sinkCode") or sink), params)
+    if target is None:
+        stage("I1", False, "找不到 INSERT 目标表")
+        result.verdict = "WRITE_NOT_REACHED"
+        return await _finish(kernel, result)
+    notes["target"] = target
+    kernel.set_write_targets([{"table": target["table"], "column": target["column"], "mode": "delete"}])
+    stage("I1", True, f"target={target['table']}.{target['column']} columns={target['columns']}")
+
+    # ---- I2 入口重建：拉页面找表单 ----
+    try:
+        page = await call("http_request", {"method": "GET", "url": base_url})
+    except ToolCallError as exc:
+        stage("I2", False, f"GET 失败: {exc}")
+        result.verdict = "ENV_ERROR"
+        return await _finish(kernel, result)
+    if int(page.get("status", 0)) >= 400:
+        stage("I2", False, f"入口 HTTP {page.get('status')}")
+        result.verdict = "PATH_UNREACHABLE"
+        return await _finish(kernel, result)
+    document = parse(str(page.get("body") or ""))
+    forms = [f for f in _forms(document, base_url) if f.method == "post"]
+    field_name = next(
+        (name for name in params if any(name in form.fields for form in forms)),
+        "",
+    )
+    if not forms:
+        stage("I2", False, "页面上没有 POST 表单")
+        result.verdict = "NO_HTTP_ENTRY"
+        return await _finish(kernel, result)
+    if not field_name:
+        stage("I2", False, f"表单字段 {sorted(set().union(*[set(f.fields) for f in forms]))} 与 params {params} 不匹配")
+        result.verdict = "ENTRY_AMBIGUOUS"
+        return await _finish(kernel, result)
+    form = next(f for f in forms if field_name in f.fields)
+    notes["entry"] = {"url": form.action, "method": form.method, "field": field_name, "fields": form.fields}
+    stage("I2", True, f"form {form.action} field={field_name}")
+
+    # ---- I3 长度预算：列宽决定 payload 能不能放 ----
+    schema = await call("db_schema", {"table": target["table"]})
+    length = None
+    for table_item in schema.get("tables") or []:
+        if table_item.get("name") == target["table"]:
+            for column in table_item.get("columns") or []:
+                if column.get("name") == target["column"]:
+                    length = column.get("length")
+    payload = f"{payload_base}<tia-{tag}>"
+    if length is not None and len(payload) > int(length):
+        stage("I3", False, f"payload {len(payload)} > 列宽 {length}")
+        result.verdict = "LENGTH_EXCEEDED"
+        return await _finish(kernel, result)
+    notes["payload"] = payload
+    stage("I3", True, f"payload {len(payload)} 字符，列宽 {length}")
+    stage("I4", True, f"求交：field={field_name}，payload {len(payload)} 字符")
+
+    # ---- I4/I5 投递：走应用自己的表单 ----
+    values = dict(form.fields)
+    values[field_name] = payload
+    for param in params:
+        if param in form.fields and param != field_name:
+            values[param] = values[param] or f"tia-{tag}"
+    body = urlencode(values)
+    try:
+        submitted = await call(
+            "http_request",
+            {
+                "method": "POST",
+                "url": form.action,
+                "body": body,
+                "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+            },
+        )
+    except ToolCallError as exc:
+        stage("I5", False, f"POST 失败: {exc}")
+        result.verdict = "WRITE_NOT_REACHED"
+        return await _finish(kernel, result)
+    stage("I5", True, f"POST {form.action} → {submitted.get('status')}")
+    if int(submitted.get("status", 0)) >= 400:
+        result.verdict = "WRITE_NOT_REACHED"
+        return await _finish(kernel, result)
+
+    # ---- I6 三态验收：库里有没有 / 页面有没有 / 能不能执行 ----
+    table = target["table"]
+    column = target["column"]
+    probe = await call(
+        "db_read",
+        {
+            "sql": f"SELECT COUNT(*) AS n FROM `{table}` WHERE `{column}` LIKE '%<tia-{tag}>%'",
+        },
+    )
+    rows = probe.get("rows") or []
+    in_db = bool(rows and int(rows[0].get("n") or 0) > 0)
+    notes["tag_in_db"] = in_db
+    stage("I6", in_db, f"tag_in_db={in_db}")
+
+    verify = await call("verify_tag", {"url": form.action, "tag": tag, "payload": payload})
+    found = bool(verify.get("found"))
+    best = verify.get("best") or {}
+    executable = bool(best.get("executable"))
+    notes.update({"tag_in_page": found, "executable": executable, "context_kind": best.get("context_kind")})
+    stage("I6", found, f"tag_in_page={found} executable={executable} kind={best.get('context_kind')}")
+
+    verdict, explanation = judge_inject(in_db, found, executable)
+    notes["explanation"] = explanation
+
+    # ---- I7 收尾：删除自己造的数据，保留 change 记录可回滚 ----
+    if cleanup and in_db:
+        try:
+            deleted = await call(
+                "db_write",
+                {
+                    "case_id": result.case_id,
+                    "sql": f"DELETE FROM `{table}` WHERE `{column}` LIKE '%<tia-{tag}>%'",
+                    "expect_affected": 1,
+                },
+            )
+            change = (deleted.get("change") or {}).get("change_id")
+            again = await call(
+                "db_read",
+                {
+                    "sql": f"SELECT COUNT(*) AS n FROM `{table}` WHERE `{column}` LIKE '%<tia-{tag}>%'",
+                },
+            )
+            rows_again = again.get("rows") or []
+            result.residue = int(rows_again[0].get("n") or 0) if rows_again else 0
+            notes["cleanup"] = {"change_id": change, "residue": result.residue}
+            stage("I7", result.residue == 0, f"cleanup change={change} residue={result.residue}")
+        except ToolCallError as exc:
+            stage("I7", False, f"cleanup 失败: {exc.envelope.error.message if exc.envelope.error else exc}")
+    else:
+        stage("I7", True, "无可清理数据")
+
+    result.verdict = verdict
+    return await _finish(kernel, result)
+
+
+async def _finish(kernel: Kernel, result: InjectResult, cleanup: bool = True) -> InjectResult:
+    report = ""
+    try:
+        data = await kernel.call(
+            "case_report",
+            {"case_id": result.case_id, "format": "markdown"},
+        )
+        report = str(data.get("markdown", "")) if isinstance(data, dict) else ""
+    except ToolCallError:
+        report = ""
+    result.report = report
+    result.trace = kernel.trace
+    if result.case_id:
+        with contextlib.suppress(ToolCallError):
+            await kernel.call(
+                "case_note",
+                {"case_id": result.case_id, "key": "verdict", "value": result.verdict},
+            )
+    return result
+
+
+def _today() -> str:
+    return _dt.date.today().isoformat()
