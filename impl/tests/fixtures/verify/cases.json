@@ -1,0 +1,151 @@
+[
+  {
+    "name": "script_block_literal",
+    "html": "<html><body><script>var a1b2 = 1;</script></body></html>",
+    "tag": "a1b2",
+    "expect": {"found": true, "occurrence_count": 1, "encoded_count": 0, "executable": true, "context_kind": "script_block", "reason_prefix": "SCRIPT_BLOCK_CODE"}
+  },
+  {
+    "name": "html_text_with_script_payload",
+    "html": "<html><body><p>hello a1b2</p></body></html>",
+    "tag": "a1b2",
+    "options": {"payload": "<script>alert(1)</script>a1b2"},
+    "expect": {"found": true, "occurrence_count": 1, "executable": true, "context_kind": "html_text", "reason_prefix": "HTML_EXECUTABLE"}
+  },
+  {
+    "name": "html_text_without_payload_is_conservative",
+    "html": "<html><body><p>hello a1b2</p></body></html>",
+    "tag": "a1b2",
+    "expect": {"found": true, "occurrence_count": 1, "executable": false, "context_kind": "html_text", "reason_prefix": "NEEDS_EXECUTABLE_PAYLOAD"}
+  },
+  {
+    "name": "comment_not_executable",
+    "html": "<html><body><!-- a1b2 --><p>x</p></body></html>",
+    "tag": "a1b2",
+    "expect": {"found": true, "executable": false, "context_kind": "comment", "reason_prefix": "NOT_CLOSED"}
+  },
+  {
+    "name": "textarea_not_executable",
+    "html": "<html><body><textarea>a1b2</textarea></body></html>",
+    "tag": "a1b2",
+    "expect": {"found": true, "executable": false, "context_kind": "textarea", "reason_prefix": "NO_CARRIER"}
+  },
+  {
+    "name": "attr_breakout",
+    "html": "<html><body><input value=\"a1b2\" onmouseover=\"alert(1)\"></body></html>",
+    "tag": "a1b2",
+    "options": {"payload": "a1b2\" onmouseover=\"alert(1)"},
+    "expect": {"found": true, "executable": true, "context_kind": "attr", "reason_prefix": "ATTR_BREAKOUT", "quoting": "double"}
+  },
+  {
+    "name": "event_handler",
+    "html": "<html><body><div onclick=\"a1b2\">x</div></body></html>",
+    "tag": "a1b2",
+    "options": {"payload": "alert(1)"},
+    "expect": {"found": true, "executable": true, "context_kind": "attr", "reason_prefix": "EVENT_HANDLER"}
+  },
+  {
+    "name": "event_handler_without_payload",
+    "html": "<html><body><div onclick=\"a1b2\">x</div></body></html>",
+    "tag": "a1b2",
+    "expect": {"found": true, "executable": false, "context_kind": "attr", "reason_prefix": "NEEDS_EXECUTABLE_PAYLOAD"}
+  },
+  {
+    "name": "entity_encoded_only",
+    "html": "<html><body><p>&#97;1b2</p></body></html>",
+    "tag": "a1b2",
+    "expect": {"found": true, "occurrence_count": 0, "encoded_count": 1, "best_is_null": true, "warning": "ENCODED_ONLY"}
+  },
+  {
+    "name": "js_unicode_encoded_only",
+    "html": "<html><body><script>var x = \"\\u00611b2\";</script></body></html>",
+    "tag": "a1b2",
+    "expect": {"found": true, "occurrence_count": 0, "encoded_count": 1, "warning": "ENCODED_ONLY"}
+  },
+  {
+    "name": "content_type_plain_text",
+    "html": "<html><body><p>a1b2</p></body></html>",
+    "tag": "a1b2",
+    "options": {"content_type": "text/plain"},
+    "expect": {"found": true, "executable": false, "context_kind": "plain_text", "reason_prefix": "CONTENT_TYPE_PLAIN"}
+  },
+  {
+    "name": "csp_blocks_inline",
+    "html": "<html><body><p>a1b2</p></body></html>",
+    "tag": "a1b2",
+    "options": {"payload": "<script>alert(1)</script>", "headers": {"content-security-policy": "default-src 'self'"}},
+    "expect": {"found": true, "executable": false, "reason_prefix": "CSP_BLOCKED"}
+  },
+  {
+    "name": "csp_unsafe_inline_allows",
+    "html": "<html><body><p>a1b2</p></body></html>",
+    "tag": "a1b2",
+    "options": {"payload": "<script>alert(1)</script>", "headers": {"content-security-policy": "script-src 'unsafe-inline'"}},
+    "expect": {"found": true, "executable": true, "reason_prefix": "HTML_EXECUTABLE"}
+  },
+  {
+    "name": "iframe_sandbox",
+    "html": "<html><body><iframe sandbox><p>a1b2</p></iframe></body></html>",
+    "tag": "a1b2",
+    "options": {"payload": "<script>alert(1)</script>"},
+    "expect": {"found": true, "executable": false, "reason_prefix": "SANDBOXED"}
+  },
+  {
+    "name": "iframe_sandbox_allow_scripts",
+    "html": "<html><body><iframe sandbox=\"allow-scripts\"><p>a1b2</p></iframe></body></html>",
+    "tag": "a1b2",
+    "options": {"payload": "<script>alert(1)</script>"},
+    "expect": {"found": true, "executable": true, "reason_prefix": "HTML_EXECUTABLE"}
+  },
+  {
+    "name": "dedupe_same_element",
+    "html": "<html><body><p>a1b2 a1b2 a1b2</p></body></html>",
+    "tag": "a1b2",
+    "expect": {"found": true, "occurrence_count": 1}
+  },
+  {
+    "name": "title_not_executable",
+    "html": "<html><head><title>a1b2</title></head><body></body></html>",
+    "tag": "a1b2",
+    "expect": {"found": true, "executable": false, "context_kind": "html_text", "reason_prefix": "TITLE_NOT_EXECUTABLE"}
+  },
+  {
+    "name": "script_string_breakout",
+    "html": "<html><body><script>var x = \"a1b2\";</script></body></html>",
+    "tag": "a1b2",
+    "options": {"payload": "a1b2\";alert(1);//"},
+    "expect": {"found": true, "context_kind": "script_string", "executable": true, "reason_prefix": "SCRIPT_STRING_BREAKOUT", "quoting": "double"}
+  },
+  {
+    "name": "script_string_without_breakout",
+    "html": "<html><body><script>var x = \"a1b2\";</script></body></html>",
+    "tag": "a1b2",
+    "expect": {"found": true, "context_kind": "script_string", "executable": false, "reason_prefix": "NEEDS_CLOSING_QUOTE"}
+  },
+  {
+    "name": "js_comment_inert",
+    "html": "<html><body><script>// a1b2\nvar y = 2;</script></body></html>",
+    "tag": "a1b2",
+    "expect": {"found": true, "context_kind": "script_block", "executable": false, "reason_prefix": "JS_COMMENT"}
+  },
+  {
+    "name": "json_script_needs_runtime",
+    "html": "<html><body><script type=\"application/json\">{\"v\":\"a1b2\"}</script></body></html>",
+    "tag": "a1b2",
+    "expect": {"found": true, "context_kind": "json", "executable": false, "reason_prefix": "NEEDS_RUNTIME"}
+  },
+  {
+    "name": "error_page_suppresses_found",
+    "html": "<html><body><pre>SQL error near a1b2</pre></body></html>",
+    "tag": "a1b2",
+    "options": {"status": 500},
+    "expect": {"found": false, "warning": "ERROR_PAGE"}
+  },
+  {
+    "name": "max_occurrences_truncates",
+    "html": "<html><body><p>a1b2</p><div>a1b2</div><span>a1b2</span></body></html>",
+    "tag": "a1b2",
+    "options": {"max_occurrences": 2},
+    "expect": {"found": true, "occurrence_count": 2, "warning": "TRUNCATED_OCCURRENCES"}
+  }
+]
