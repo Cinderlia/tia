@@ -70,6 +70,11 @@ class FakeClient:
                     }
                 ]
             }
+        if tool == "db_read":
+            return {
+                "rows": [{"id": 9, "user": "Anonymous", "comment": "payload", "date": "25 Nov 2026"}],
+                "row_count": 1,
+            }
         if tool == "db_write":
             return {"change": {"change_id": "ch-test", "affected": 1, "undo_sql": "DELETE FROM comments WHERE id = 9"}}
         if tool == "verify_tag":

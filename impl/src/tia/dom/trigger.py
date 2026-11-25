@@ -15,8 +15,11 @@ import secrets
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
+from urllib.parse import urlencode
 
+from tia.ad.llm import LlmClient
 from tia.cap.case import parse_sink
+from tia.cap.entry import infer_read_entry, resolve_values_with_guess
 from tia.inf.runtime import get_runtime
 from tia.inf.store import now_iso
 from tia.orch.judge import judge_trigger
@@ -49,8 +52,6 @@ class TriggerResult:
 
 
 _SELECT_RE = re.compile(r"\bselect\b[^;]*?\bfrom\s+`?([A-Za-z_][\w]*)`?", re.I)
-
-
 def _read_line(lines: list[dict[str, Any]], table: str) -> int | None:
     """Line number of the SELECT that reads the target table, if the source shows it."""
     for item in lines:
@@ -70,6 +71,7 @@ async def _probe_sink_read(
     read_line: int,
     base_url: str,
     tag: str,
+    entry: tuple[str, dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Arm the SQL capture on the read line, fetch the page, and check whether our row was returned."""
     note: dict[str, Any] = {"line": read_line}
@@ -78,8 +80,15 @@ async def _probe_sink_read(
     except ToolCallError as exc:
         note["error"] = exc.code.value
         return note
+    arguments: dict[str, Any] = {"case_id": case_id, "url": base_url}
+    if entry:
+        arguments["method"] = entry[0]
+        if arguments["method"] == "POST":
+            arguments["body"] = urlencode(entry[1])
+        else:
+            arguments["params"] = entry[1]
     try:
-        run = await kernel.call("probe_run", {"case_id": case_id, "url": base_url})
+        run = await kernel.call("probe_run", arguments)
     except ToolCallError as exc:
         note["error"] = exc.code.value
         return note
@@ -191,8 +200,20 @@ async def run_trigger(
                              report=await kernel.report(), stages=stages, notes=notes,
                              trace=kernel.trace)
     post_vars = sorted(set(_POST_VAR_RE.findall(source_text))) or params
+    entry_method, entry_fields = infer_read_entry(source_text)
     read_line = _read_line([line for line in source["lines"] if isinstance(line, dict)], table)
-    notes.update({"table": table, "columns": columns, "post_vars": post_vars, "read_line": read_line})
+    notes.update(
+        {
+            "table": table,
+            "columns": columns,
+            "post_vars": post_vars,
+            "read_line": read_line,
+            "read_entry": {
+                "method": entry_method,
+                "fields": [{"name": f.name, "usage": f.usage, "numeric": f.numeric} for f in entry_fields],
+            },
+        }
+    )
 
     targets = (
         [{"table": table, "column": col, "mode": "insert"} for col in columns]
@@ -257,13 +278,75 @@ async def run_trigger(
         StageRecord("P4", db_error is None, "Write successful" if db_error is None else f"Write failed: {db_error}")
     )
 
+    # Derived read-entry values: the tag locates the row we wrote; its primary
+    # key and the tag are the only legal values for the read page's parameters.
+    entry_request: tuple[str, dict[str, str]] | None = None
+    if db_error is None and entry_fields:
+        payload_column = value_columns[values.index(payload)] if payload in values else value_columns[-1]
+        pk_columns = list(table_meta.get("primary_key") or [])
+        order = f" ORDER BY `{pk_columns[0]}` DESC" if pk_columns else ""
+        try:
+            found = await kernel.call(
+                "db_read",
+                {
+                    "sql": (
+                        f"SELECT * FROM `{table}` WHERE `{payload_column}` LIKE '%{tag}%'"
+                        f"{order} LIMIT 1"
+                    )
+                },
+            )
+            row = (found.get("rows") or [None])[0]
+        except ToolCallError:
+            row = None
+        entry_values, entry_basis = await resolve_values_with_guess(
+            entry_fields,
+            tag=tag,
+            row=row,
+            pk_columns=pk_columns,
+            context=source_text,
+            client=LlmClient.from_env(),
+        )
+        entry_request = (entry_method, entry_values)
+        notes["read_entry_values"] = entry_values
+        notes["read_entry_basis"] = entry_basis
+
     # P5 Sink read probe + verify_tag forensics --------------------------------
     if db_error is None and read_line is not None:
-        notes["sink_read"] = await _probe_sink_read(kernel, case_id, sink_file, read_line, base_url, tag)
+        notes["sink_read"] = await _probe_sink_read(
+            kernel, case_id, sink_file, read_line, base_url, tag, entry_request
+        )
     verify: dict[str, Any] | None = None
     if db_error is None:
+        verify_html: str | None = None
+        verify_content_type = "text/html"
+        if entry_request:
+            try:
+                if entry_request[0] == "GET":
+                    fetched = await kernel.call(
+                        "http_request", {"method": "GET", "url": base_url, "params": entry_request[1]}
+                    )
+                else:
+                    fetched = await kernel.call(
+                        "http_request",
+                        {
+                            "method": "POST",
+                            "url": base_url,
+                            "body": urlencode(entry_request[1]),
+                            "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+                        },
+                    )
+                verify_html = str(fetched.get("body") or "")
+                verify_content_type = str(fetched.get("content_type") or "text/html")
+            except ToolCallError as exc:
+                notes["read_entry_error"] = f"{exc.code.value}: {exc.message}"
+        verify_args: dict[str, Any] = {"tag": tag, "payload": payload}
+        if verify_html is not None:
+            verify_args["html"] = verify_html
+            verify_args["content_type"] = verify_content_type
+        else:
+            verify_args["url"] = base_url
         try:
-            verify = await kernel.call("verify_tag", {"url": base_url, "tag": tag, "payload": payload})
+            verify = await kernel.call("verify_tag", verify_args)
         except ToolCallError as exc:
             notes["verify_error"] = f"{exc.code.value}: {exc.message}"
         if verify is not None:

@@ -251,6 +251,14 @@ def resolve_entry(
     return entry
 
 
+def merge_ops(primary: Iterable[DbOp], fallback: Iterable[DbOp]) -> list[DbOp]:
+    """Merge operation lists, preferring the ones that carry a table name."""
+    table_ops = [op for op in primary if op.table]
+    if table_ops:
+        return _dedupe_ops(table_ops)
+    return _dedupe_ops(list(primary) + list(fallback))
+
+
 def _dedupe_ops(ops: Iterable[DbOp]) -> list[DbOp]:
     seen: set[tuple[str, str, tuple[str, ...]]] = set()
     unique: list[DbOp] = []
@@ -302,8 +310,18 @@ def pair_id_for(read_slice_id: str, write_slice_id: str) -> str:
     return f"pair-{digest}"
 
 
-def build_pairs(entries: list[SliceEntry], *, min_confidence: int = 20) -> list[dict[str, Any]]:
-    """Bidirectional read/write pairing; returns JSON-ready hints sorted by confidence."""
+def build_pairs(
+    entries: list[SliceEntry],
+    *,
+    min_confidence: int = 20,
+    allow_column_only: bool = False,
+) -> list[dict[str, Any]]:
+    """Bidirectional read/write pairing; returns JSON-ready hints sorted by confidence.
+
+    Second-order XSS needs a *table* match: a write whose table the source does
+    not reveal cannot be proven to feed a given read, so it is dropped unless
+    ``allow_column_only`` is set explicitly.
+    """
     hints: dict[tuple[str, str], dict[str, Any]] = {}
     for read_entry in entries:
         if not _is_read(read_entry):
@@ -318,6 +336,8 @@ def build_pairs(entries: list[SliceEntry], *, min_confidence: int = 20) -> list[
                 read_columns, table_level = _read_columns(read_entry, table)
                 write_columns = _write_columns(write_entry, table)
                 if not table:
+                    if not allow_column_only:
+                        continue
                     shared = tuple(sorted(set(read_columns) & set(write_columns)))
                     if not shared:
                         continue

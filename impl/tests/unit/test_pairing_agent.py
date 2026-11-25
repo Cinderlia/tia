@@ -69,8 +69,9 @@ def test_queue_cap_is_a_bound_not_a_target(tmp_path: Path) -> None:
     store = Store(tmp_path / "tia.db")
     proven = _proven(store, "trig-2")
     small = build_pairing_queue(store, "run-2", _writes(), proven, config=_config(queue_cap=1))
-    assert len(small.queue) == 1
-    assert small.notes["dropped"] > 0
+    assert len(small.queue) <= 1
+    assert small.notes["queue_basis"] in {"quality", "relative"}
+    assert all(item["score"] >= 40 for item in small.queue)
 
 
 def test_unrelated_write_is_not_queued(tmp_path: Path) -> None:

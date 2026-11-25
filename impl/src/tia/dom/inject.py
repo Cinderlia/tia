@@ -15,7 +15,9 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlencode, urljoin
 
+from tia.ad.llm import LlmClient
 from tia.cap.domscan import Document, parse
+from tia.cap.entry import entry_field, resolve_values_with_guess
 from tia.dom.trigger import StageRecord
 from tia.inf.runtime import get_runtime
 from tia.orch.judge import judge_inject
@@ -149,6 +151,8 @@ async def run_inject(
     client: ToolClient | None = None,
     cleanup: bool = True,
     pair_hints: list[dict[str, Any]] | None = None,
+    verify_url: str | None = None,
+    verify_entry: dict[str, Any] | None = None,
 ) -> InjectResult:
     kernel = Kernel(
         profile="inject", budget=budget, client=client or LocalToolClient(profile="inject")
@@ -284,8 +288,10 @@ async def run_inject(
     # ---- I3 Length budget: pick the widest writable column that fits the payload ----
     schema = await call("db_schema", {"table": target["table"]})
     widths: dict[str, int | None] = {}
+    pk_columns: list[str] = []
     for table_item in schema.get("tables") or []:
         if table_item.get("name") == target["table"]:
+            pk_columns = [str(item) for item in table_item.get("primary_key") or []]
             for column in table_item.get("columns") or []:
                 widths[str(column.get("name"))] = column.get("length")
     payload = f"{payload_base}<tia-{tag}>"
@@ -384,7 +390,65 @@ async def run_inject(
     notes["tag_in_db"] = in_db
     stage("I6", in_db, f"tag_in_db={in_db}")
 
-    verify = await call("verify_tag", {"url": form.action, "tag": tag, "payload": payload})
+    # Second-order XSS: the write entry and the read page differ. Fetch the read
+    # page with its own entry parameters before classifying the tag context.
+    verify_html: str | None = None
+    verify_content_type = "text/html"
+    if verify_url and verify_url != form.action and verify_entry:
+        entry_method = str(verify_entry.get("method") or "POST").upper()
+        entry_spec = [entry_field(item) for item in verify_entry.get("fields") or []]
+        written_row: dict[str, Any] | None = None
+        try:
+            row_hit = await call(
+                "db_read",
+                {
+                    "sql": (
+                        f"SELECT * FROM `{table}` WHERE `{column}` LIKE '%<tia-{tag}>%' LIMIT 1"
+                    )
+                },
+            )
+            rows_found = row_hit.get("rows") or []
+            written_row = rows_found[0] if rows_found else None
+        except ToolCallError:
+            written_row = None
+        entry_fields, entry_basis = await resolve_values_with_guess(
+            entry_spec,
+            tag=tag,
+            row=written_row,
+            pk_columns=pk_columns,
+            context=text,
+            client=LlmClient.from_env(),
+        )
+        notes["read_entry_basis"] = entry_basis
+        try:
+            if entry_method == "GET":
+                page = await call("http_request", {"method": "GET", "url": verify_url, "params": entry_fields})
+            else:
+                page = await call(
+                    "http_request",
+                    {
+                        "method": "POST",
+                        "url": verify_url,
+                        "body": urlencode(entry_fields),
+                        "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+                    },
+                )
+            verify_html = str(page.get("body") or "")
+            verify_content_type = str(page.get("content_type") or "text/html")
+            stage("I6", True, f"read page {verify_url} → {page.get('status')}")
+        except ToolCallError as exc:
+            notes["read_page_error"] = str(exc.envelope.error.message if exc.envelope.error else exc)
+            stage("I6", False, f"read page fetch failed: {notes['read_page_error']}")
+
+    verify_args: dict[str, Any] = {"tag": tag, "payload": payload}
+    if verify_html is not None:
+        verify_args["html"] = verify_html
+        verify_args["content_type"] = verify_content_type
+        notes["verify_on"] = "read_page"
+    else:
+        verify_args["url"] = verify_url or form.action
+        notes["verify_on"] = "url"
+    verify = await call("verify_tag", verify_args)
     found = bool(verify.get("found"))
     best = verify.get("best") or {}
     executable = bool(best.get("executable"))

@@ -33,6 +33,7 @@ from tia.orch.pairing import (
     build_pairs,
     extract_ops,
     group_by_slice,
+    merge_ops,
     resolve_entry,
 )
 from tia.orch.slicing import score_slice
@@ -57,6 +58,8 @@ class PairingConfig:
     per_write_fanout: int = 3
     queue_cap: int = 10
     llm_batch: int = 20
+    quality_threshold: int = 55
+    allow_column_only: bool = False
 
 
 @dataclass
@@ -93,8 +96,14 @@ def _entry_text(raw: dict[str, Any]) -> str:
 
 
 def _needs_modelling(entry: SliceEntry) -> bool:
-    """Entries with no ops, or with a table but no columns (``select *``/bare write), need a model."""
+    """Entries with no ops, an unknown table, or no columns need source context.
+
+    A write slice often carries only its ``bindParam`` line inline; the table
+    lives in a nearby ``INSERT`` statement that the source window supplies.
+    """
     if not entry.ops:
+        return True
+    if any(not op.table for op in entry.ops):
         return True
     return all(not op.columns for op in entry.ops)
 
@@ -189,7 +198,7 @@ def build_pairing_queue(
                 except Exception:  # noqa: BLE001 - the modeler is best-effort
                     ops = []
             if ops:
-                entry.ops = ops
+                entry.ops = merge_ops(ops, entry.ops)
                 modelled += 1
         result.n_modeled = modelled
         skipped = len(pending) - budget
@@ -203,7 +212,11 @@ def build_pairing_queue(
         result.stages.append(PairingStage("R2", True, "no source reader; static ops only"))
 
     # R3: bidirectional pairing and slice scores.
-    pairs = build_pairs(entries, min_confidence=cfg.min_confidence)
+    pairs = build_pairs(
+        entries,
+        min_confidence=cfg.min_confidence,
+        allow_column_only=cfg.allow_column_only,
+    )
     result.n_pairs = len(pairs)
     grouped = group_by_slice(pairs)
     for slice_id, raw in zip(seeded_ids, usable, strict=False):
@@ -242,8 +255,18 @@ def build_pairing_queue(
             }
         )
     ranked.sort(key=lambda item: (-int(item["score"]), item["item_id"]))
-    dropped = max(0, len(ranked) - cfg.queue_cap)
-    queue = ranked[: cfg.queue_cap]
+    # Adaptive bar: with plenty of good candidates the queue keeps only
+    # confident pairs; when the supply is thin, lower-scored pairs are kept
+    # rather than leaving the inject agent with an empty queue.
+    qualified = [item for item in ranked if int(item["score"]) >= cfg.quality_threshold]
+    floor = max(2, cfg.queue_cap // 2)
+    if len(qualified) >= floor:
+        queue = qualified[: cfg.queue_cap]
+        basis = "quality"
+    else:
+        queue = ranked[: cfg.queue_cap]
+        basis = "relative"
+    dropped = max(0, len(ranked) - len(queue))
     store.replace_injection_queue(run_id, queue)
     result.queue = queue
     result.stages.append(
@@ -251,12 +274,13 @@ def build_pairing_queue(
             "R4",
             True,
             f"queued {len(queue)} injection candidates"
-            + (f"; {dropped} below the cap of {cfg.queue_cap}" if dropped else ""),
+            + (f"; {dropped} below the {basis} bar of {cfg.queue_cap}" if dropped else ""),
         )
     )
     result.notes = {
         "capped": result.capped,
         "dropped": dropped,
+        "queue_basis": basis,
         "source_reads": result.n_source_reads,
         "modeled": result.n_modeled,
     }

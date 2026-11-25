@@ -17,6 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from tia.cap.entry import infer_read_entry
 from tia.dom.inject import run_inject
 from tia.dom.main import seed_queue
 from tia.dom.pairing_agent import PairingConfig, build_pairing_queue
@@ -24,6 +25,31 @@ from tia.dom.trigger import normalize_slice, run_trigger
 from tia.inf.runtime import get_runtime
 from tia.orch.kernel import ToolCallError, ToolClient
 from tia.schemas.objects import CaseOutcome
+
+
+def _read_entry(
+    reader: Callable[[str, int, int], list[tuple[int, str]]] | None,
+    raw: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Infer the read page's own entry parameters (second-order read side)."""
+    path = str(raw.get("sinkFile") or "")
+    line = int(raw.get("sinkLine") or 0)
+    if reader is None or not path or not line:
+        return None
+    try:
+        lines = reader(path, max(1, line - 80), line + 10)
+    except Exception:  # noqa: BLE001 - entry inference is best-effort
+        return None
+    text = "\n".join(str(text) for _, text in lines)
+    method, fields = infer_read_entry(text)
+    if not fields:
+        return None
+    return {
+        "method": method,
+        "fields": [
+            {"name": field.name, "usage": field.usage, "numeric": field.numeric} for field in fields
+        ],
+    }
 
 
 @dataclass
@@ -185,6 +211,7 @@ async def walk_injection_queue(
     budget: int,
     inject_client: ToolClient | None,
     url_for: Callable[[dict[str, Any]], str] | None,
+    reader: Callable[[str, int, int], list[tuple[int, str]]] | None = None,
 ) -> PipelineResult:
     """Inject every candidate in queue order; the read side is already proven."""
     result = PipelineResult()
@@ -198,6 +225,10 @@ async def walk_injection_queue(
             continue
         write_raw = dict(write_row["slice"])
         write_url = url_for(write_raw) if url_for is not None else base_url
+        read_row = store.get_slice(str(item["read_slice_id"]))
+        read_raw = dict(read_row["slice"]) if read_row is not None else {}
+        read_url = url_for(read_raw) if (url_for is not None and read_raw) else base_url
+        entry = _read_entry(reader, read_raw) if read_raw else None
         hint = {
             "pair_id": item["pair_id"],
             "table": item["table"],
@@ -212,6 +243,8 @@ async def walk_injection_queue(
             budget=min(budget, 40),
             client=inject_client,
             pair_hints=[hint],
+            verify_url=read_url,
+            verify_entry=entry,
         )
         store.archive_injection_item(str(item["item_id"]), inject.verdict, case_id=inject.case_id)
         store.archive_slice(str(item["write_slice_id"]), inject.verdict, case_id=inject.case_id)
