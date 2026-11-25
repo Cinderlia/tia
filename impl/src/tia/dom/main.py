@@ -260,14 +260,29 @@ def _source_reader() -> Reader | None:
     return read
 
 
-def seed_queue(queue_store: Any, run_id: str, slices: list[dict[str, Any]]) -> list[str]:
-    """Seed trigger slices (score only); pairing runs later, on proven slices."""
+def seed_queue(
+    queue_store: Any,
+    run_id: str,
+    slices: list[dict[str, Any]],
+    *,
+    order_mode: str = "second",
+) -> list[str]:
+    """Seed slices (score only); pairing runs later, on proven second-order slices.
+
+    ``order_mode`` is dictated by where the slice came from (the navi ``direct/``
+    tree versus the joined/inject trees), never inferred from slice features.
+    """
     usable = [raw for raw in slices if _sink_file(raw)]
-    ids = queue_store.seed_slices(run_id, usable)
+    ids = queue_store.seed_slices(run_id, usable, order_mode=order_mode)
     history = queue_store.verdict_history()
     for index, (slice_id_, raw) in enumerate(zip(ids, usable, strict=False)):
         entry = resolve_entry(raw, index)
-        scored = score_slice(raw, paired=False, history=history.get(f"{entry.file}:{entry.line}", []))
+        scored = score_slice(
+            raw,
+            paired=False,
+            history=history.get(f"{entry.file}:{entry.line}", []),
+            order_mode=order_mode,
+        )
         queue_store.set_slice_score(slice_id_, scored.score, scored.reasons, scored.digest)
     return [str(item) for item in ids]
 

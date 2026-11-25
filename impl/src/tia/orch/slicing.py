@@ -53,6 +53,7 @@ def score_slice(
     *,
     paired: bool = False,
     history: list[str] | None = None,
+    order_mode: str = "second",
 ) -> SliceScore:
     """Heuristic prior in [0, 100]; every adjustment carries a readable reason."""
     digest = slice_digest(raw)
@@ -66,6 +67,14 @@ def score_slice(
         reasons.append(f"{'+' if delta > 0 else ''}{delta} {reason}")
 
     kind = str(digest["kind"]).lower()
+    if order_mode == "direct":
+        # First-order: the input and the sink sit on one request path, no
+        # cross-page write/read round trip is needed.
+        add(8, "first-order: input and sink are on the same request path")
+        if digest.get("params"):
+            add(4, "first-order: source parameter is known")
+        if any(word in code for word in ("shell_exec", "system(", "exec(", "passthru", "popen")):
+            add(-8, "first-order: sink executes a command, side effects are risky")
     if "xss" in kind:
         add(5, "XSS sink: output evidence is observable")
     elif any(word in kind for word in ("sql", "command", "code", "exec")):

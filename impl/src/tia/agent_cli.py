@@ -99,12 +99,41 @@ def _parser() -> argparse.ArgumentParser:
     pairing.add_argument("--store", default=None)
     pairing.add_argument("--json", action="store_true")
 
+    direct = sub.add_parser("direct", help="First-order agent: deliver a payload, verify the page")
+    direct.add_argument("--slice", required=True, help="Navi direct slice file")
+    direct.add_argument("--index", type=int, default=0)
+    direct.add_argument("--base-url", required=True)
+    direct.add_argument("--budget", type=int, default=40)
+    direct.add_argument("--db-name", default=None)
+    direct.add_argument("--db-user", default=None)
+    direct.add_argument("--db-password", default=None)
+    direct.add_argument("--store", default=None)
+    direct.add_argument("--json", action="store_true")
     pipeline = sub.add_parser(
         "pipeline",
         help="Main → trigger proof → pairing → injection queue (one stage failure stops downstream)",
     )
-    pipeline.add_argument("--slices", required=True, help="Trigger slices (navi trigger joined)")
-    pipeline.add_argument("--write-slices", required=True, help="Injection slices (navi inject 1-write)")
+    pipeline.add_argument(
+        "--slices",
+        default=None,
+        help="Second-order trigger slices (navi trigger/joined); optional in direct-only runs",
+    )
+    pipeline.add_argument(
+        "--direct-slices",
+        default=None,
+        help="First-order slices (navi direct/1-output); not inferred, the tree decides",
+    )
+    pipeline.add_argument(
+        "--write-slices",
+        default=None,
+        help="Injection slices (navi inject/1-write); only needed for second-order rounds",
+    )
+    pipeline.add_argument(
+        "--mode",
+        default="second",
+        choices=["direct", "second", "direct-first", "second-first", "hybrid"],
+        help="Slice consumption policy",
+    )
     pipeline.add_argument("--base-url", required=True)
     pipeline.add_argument("--timeout", type=float, default=600.0, help="Wall-clock budget in seconds")
     pipeline.add_argument("--limit", type=int, default=0, help="Max trigger slices (0 = until timeout/exhaustion)")
@@ -374,13 +403,50 @@ def _run_pairing(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_direct(args: argparse.Namespace) -> int:
+    from tia.dom.direct import run_direct
+
+    _configure(args, "inject")
+    raw = _load_slice(args.slice, args.index)
+    result = asyncio.run(
+        run_direct(
+            raw,
+            base_url=args.base_url,
+            budget=args.budget,
+        )
+    )
+    for stage in result.stages:
+        print(f"[{stage.stage}] {stage.note}", file=sys.stderr)
+    print(result.verdict, file=sys.stderr)
+    summary = {
+        "ok": True,
+        "agent": "direct",
+        "case_id": result.case_id,
+        "verdict": result.verdict,
+        "stage": [[stage.stage, stage.ok, stage.note] for stage in result.stages],
+        "notes": result.notes,
+    }
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    if not args.json:
+        print(result.report)
+    return 0 if result.verdict == "EXECUTED" else 1
+
+
 def _run_pipeline(args: argparse.Namespace) -> int:
     from tia.dom.pipeline import run_pipeline
 
+    if args.mode == "direct" and not args.direct_slices:
+        raise SystemExit("--mode direct needs --direct-slices")
+    if args.mode != "direct" and not args.slices:
+        raise SystemExit(f"--mode {args.mode} needs --slices (second-order trigger slices)")
+    if args.mode != "direct" and not args.write_slices:
+        raise SystemExit(f"--mode {args.mode} needs --write-slices (injection slices)")
+
     _configure(args, "main")
     store = get_runtime().store
-    trigger_slices = _load_slices(args.slices)
-    write_slices = _load_slices(args.write_slices)
+    trigger_slices = _load_slices(args.slices) if args.slices else []
+    write_slices = _load_slices(args.write_slices) if args.write_slices else []
+    direct_slices = _load_slices(args.direct_slices) if args.direct_slices else []
     run_id = args.run_id or f"pipe-{int(time.time())}"
 
     def url_for(raw: dict[str, Any]) -> str:
@@ -403,6 +469,8 @@ def _run_pipeline(args: argparse.Namespace) -> int:
             budget=args.budget,
             queue_cap=args.cap,
             url_for=url_for_fn,
+            direct_slices=direct_slices,
+            mode=args.mode,
         )
     )
     for item in result.outcomes:
@@ -410,6 +478,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
     summary = {
         "ok": True,
         "agent": "pipeline",
+        "mode": args.mode,
         "run_id": run_id,
         "stop_reason": result.stop_reason,
         "rounds": result.rounds,
@@ -428,8 +497,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"tia-agent {__version__}")
         return 0
     if args.command is None:
-        parser.error("Subcommand required: trigger | inject | main | pairing | pipeline")
+        parser.error("Subcommand required: direct | trigger | inject | main | pairing | pipeline")
     handlers = {
+        "direct": _run_direct,
         "trigger": _run_trigger,
         "inject": _run_inject,
         "main": _run_main,

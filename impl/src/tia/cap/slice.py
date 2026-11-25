@@ -54,6 +54,7 @@ def _slice_public(item: dict[str, Any]) -> dict[str, Any]:
         "sink_file": item["sink_file"],
         "sink_line": item["sink_line"],
         "attempts": item["attempts"],
+        "order_mode": item.get("order_mode", "second"),
         "score": item.get("score", 0),
         "digest": item.get("digest", {}),
         "slice": payload,

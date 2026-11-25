@@ -178,6 +178,7 @@ class Store:
                 ("score", "ALTER TABLE slice ADD COLUMN score INTEGER NOT NULL DEFAULT 0"),
                 ("reasons", "ALTER TABLE slice ADD COLUMN reasons TEXT NOT NULL DEFAULT '[]'"),
                 ("digest", "ALTER TABLE slice ADD COLUMN digest TEXT NOT NULL DEFAULT '{}'"),
+                ("order_mode", "ALTER TABLE slice ADD COLUMN order_mode TEXT NOT NULL DEFAULT 'second'"),
             ):
                 if name not in columns:
                     conn.execute(ddl)
@@ -493,7 +494,9 @@ class Store:
 
     # -- slice queue -------------------------------------------------------
 
-    def seed_slices(self, run_id: str, slices: list[dict[str, Any]]) -> list[str]:
+    def seed_slices(
+        self, run_id: str, slices: list[dict[str, Any]], *, order_mode: str = "second"
+    ) -> list[str]:
         """Insert slices, de-duplicating on (sink_file, sink_line); returns the pending ids."""
         seeded: list[str] = []
         ts = now_iso()
@@ -515,8 +518,8 @@ class Store:
                     seeded.append(str(exists["id"]))
                     continue
                 conn.execute(
-                    "INSERT INTO slice (id, run_id, kind, sink_file, sink_line, slice_json, created_at, updated_at)"
-                    " VALUES (?,?,?,?,?,?,?,?)",
+                    "INSERT INTO slice (id, run_id, kind, sink_file, sink_line, slice_json,"
+                    " order_mode, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
                     (
                         slice_id,
                         run_id,
@@ -524,6 +527,7 @@ class Store:
                         sink_file,
                         sink_line,
                         json.dumps(raw, ensure_ascii=False),
+                        order_mode,
                         ts,
                         ts,
                     ),
@@ -531,17 +535,25 @@ class Store:
             seeded.append(slice_id)
         return seeded
 
-    def next_slice(self, ttl_minutes: int = 30, run_id: str | None = None) -> dict[str, Any] | None:
+    def next_slice(
+        self,
+        ttl_minutes: int = 30,
+        run_id: str | None = None,
+        order_mode: str | None = None,
+    ) -> dict[str, Any] | None:
         """Lease the next pending slice; running slices older than the TTL return to pending."""
         self.requeue_expired(ttl_minutes)
         sql = "SELECT id FROM slice WHERE status='pending'"
-        args: tuple[Any, ...] = ()
+        args: list[Any] = []
         if run_id:
             sql += " AND run_id=?"
-            args = (run_id,)
+            args.append(run_id)
+        if order_mode:
+            sql += " AND order_mode=?"
+            args.append(order_mode)
         sql += " ORDER BY score DESC, attempts, kind, sink_file, sink_line LIMIT 1"
         with self._conn() as conn:
-            row = conn.execute(sql, args).fetchone()
+            row = conn.execute(sql, tuple(args)).fetchone()
             if row is None:
                 return None
             slice_id = str(row["id"])
@@ -553,6 +565,17 @@ class Store:
         loaded = dict(fresh)
         loaded["slice"] = json.loads(loaded.pop("slice_json"))
         return loaded
+
+    def count_pending(self, run_id: str, order_mode: str | None = None) -> int:
+        """Pending slices left in the run, optionally for one order mode."""
+        sql = "SELECT COUNT(*) AS n FROM slice WHERE status='pending' AND run_id=?"
+        args: list[Any] = [run_id]
+        if order_mode:
+            sql += " AND order_mode=?"
+            args.append(order_mode)
+        with self._conn() as conn:
+            row = conn.execute(sql, tuple(args)).fetchone()
+        return int(row["n"])
 
     def requeue_expired(self, ttl_minutes: int = 30) -> int:
         cutoff = datetime.now().astimezone().timestamp() - ttl_minutes * 60
@@ -619,7 +642,10 @@ class Store:
 
     def peek_slices(self, limit: int = 5, run_id: str | None = None) -> list[dict[str, Any]]:
         """Pending slices in queue order, digest only (no lease, no attempt bump)."""
-        sql = "SELECT id, run_id, kind, sink_file, sink_line, attempts, score, reasons, digest FROM slice WHERE status='pending'"
+        sql = (
+            "SELECT id, run_id, kind, sink_file, sink_line, attempts, score, reasons, digest, order_mode"
+            " FROM slice WHERE status='pending'"
+        )
         args: tuple[Any, ...] = ()
         if run_id:
             sql += " AND run_id=?"
@@ -635,6 +661,7 @@ class Store:
                 "run_id": row["run_id"],
                 "attempts": row["attempts"],
                 "score": row["score"],
+                "order_mode": row["order_mode"],
                 "reasons": json.loads(row["reasons"] or "[]"),
                 "digest": json.loads(row["digest"] or "{}"),
             }

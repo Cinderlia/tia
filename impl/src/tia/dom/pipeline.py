@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from tia.cap.entry import infer_read_entry
+from tia.dom.direct import run_direct
 from tia.dom.inject import run_inject
 from tia.dom.main import seed_queue
 from tia.dom.pairing_agent import PairingConfig, build_pairing_queue
@@ -60,6 +61,39 @@ class PipelineResult:
     report: str = ""
 
 
+MODES = ("direct", "second", "direct-first", "second-first", "hybrid")
+
+
+def pick_family(
+    mode: str, direct_left: int, second_left: int, round_index: int
+) -> str | None:
+    """Choose which slice family to lease next.
+
+    ``direct``/``second`` pin one family; the ``-first`` modes drain one family
+    before touching the other; ``hybrid`` interleaves in proportion to what is
+    still pending, so neither family starves while both have work.
+    """
+    if direct_left <= 0 and second_left <= 0:
+        return None
+    if mode == "direct":
+        return "direct" if direct_left > 0 else None
+    if mode == "second":
+        return "second" if second_left > 0 else None
+    if mode == "direct-first":
+        return "direct" if direct_left > 0 else ("second" if second_left > 0 else None)
+    if mode == "second-first":
+        return "second" if second_left > 0 else ("direct" if direct_left > 0 else None)
+    # hybrid: Bresenham-style proportional split of the remaining slices.
+    if direct_left <= 0:
+        return "second"
+    if second_left <= 0:
+        return "direct"
+    total = direct_left + second_left
+    before = (round_index * direct_left) // total
+    after = ((round_index + 1) * direct_left) // total
+    return "direct" if after > before else "second"
+
+
 def _reader() -> Callable[[str, int, int], list[tuple[int, str]]] | None:
     try:
         from tia.ad.fs import FsAdapter
@@ -89,10 +123,17 @@ async def run_pipeline(
     trigger_client: ToolClient | None = None,
     inject_client: ToolClient | None = None,
     url_for: Callable[[dict[str, Any]], str] | None = None,
+    direct_slices: list[dict[str, Any]] | None = None,
+    mode: str = "second",
 ) -> PipelineResult:
-    """Loop over trigger slices until the queue is empty or the timeout expires."""
+    """Loop over trigger/direct slices until the queue is empty or the timeout expires."""
+    if mode not in MODES:
+        raise ValueError(f"unknown mode: {mode!r} (expected one of {MODES})")
     result = PipelineResult()
-    seed_queue(store, trigger_run_id, trigger_slices)
+    if mode != "direct":
+        seed_queue(store, trigger_run_id, trigger_slices, order_mode="second")
+    if mode != "second" and direct_slices:
+        seed_queue(store, trigger_run_id, direct_slices, order_mode="direct")
     deadline = time.monotonic() + max(timeout_sec, 0.0)
     reader = _reader()
 
@@ -103,10 +144,22 @@ async def run_pipeline(
         if max_slices and len(result.rounds) >= max_slices:
             result.stop_reason = "SLICE_LIMIT"
             break
-        leased = store.next_slice(run_id=trigger_run_id)
+        family = pick_family(
+            mode,
+            store.count_pending(trigger_run_id, "direct"),
+            store.count_pending(trigger_run_id, "second"),
+            len(result.rounds),
+        )
+        if family is None:
+            result.stop_reason = "EXHAUSTED" if result.rounds else "NO_TRIGGER_SLICE"
+            break
+        leased = store.next_slice(run_id=trigger_run_id, order_mode=family)
         if leased is None:
             result.stop_reason = "EXHAUSTED" if result.rounds else "NO_TRIGGER_SLICE"
             break
+        if family == "direct":
+            await _run_direct_round(store, result, leased, base_url, url_for)
+            continue
 
         round_index = len(result.rounds)
         raw = dict(leased["slice"])
@@ -202,6 +255,65 @@ async def run_pipeline(
 
     result.report = _report(result)
     return result
+
+
+async def _run_direct_round(
+    store: Any,
+    result: PipelineResult,
+    leased: dict[str, Any],
+    base_url: str,
+    url_for: Callable[[dict[str, Any]], str] | None,
+) -> None:
+    """One first-order round: direct agent, no pairing, no injection queue."""
+    round_index = len(result.rounds)
+    raw = dict(leased["slice"])
+    page_url = url_for(raw) if url_for is not None else base_url
+    try:
+        direct = await run_direct(
+            normalize_slice(raw),
+            base_url=page_url,
+            slice_id=str(leased["id"]),
+        )
+    except ToolCallError as exc:
+        store.archive_slice(str(leased["id"]), "ERROR")
+        result.rounds.append(
+            {
+                "round": round_index,
+                "stage": "direct",
+                "trigger_slice": str(leased["id"]),
+                "trigger_case": None,
+                "trigger_verdict": "ERROR",
+                "queue_items": 0,
+                "injections": [],
+                "stopped_at": "error",
+                "error": exc.envelope.model_dump(),
+            }
+        )
+        return
+    store.archive_slice(str(leased["id"]), direct.verdict, case_id=direct.case_id)
+    result.outcomes.append(
+        CaseOutcome(
+            slice_id=str(leased["id"]),
+            case_id=direct.case_id,
+            verdict=direct.verdict,
+            evidence_refs=[step.evidence_ref for step in direct.trace if step.evidence_ref],
+            residue=direct.residue or 0,
+            notes={"stage": "direct", "attempts": len(direct.notes.get("attempts") or [])},
+            duration_ms=0,
+        )
+    )
+    result.rounds.append(
+        {
+            "round": round_index,
+            "stage": "direct",
+            "trigger_slice": str(leased["id"]),
+            "trigger_case": direct.case_id,
+            "trigger_verdict": direct.verdict,
+            "queue_items": 0,
+            "injections": [],
+            "stopped_at": None,
+        }
+    )
 
 
 async def walk_injection_queue(
