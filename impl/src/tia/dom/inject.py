@@ -17,6 +17,7 @@ from urllib.parse import urlencode, urljoin
 
 from tia.cap.domscan import Document, parse
 from tia.dom.trigger import StageRecord
+from tia.inf.runtime import get_runtime
 from tia.orch.judge import judge_inject
 from tia.orch.kernel import Kernel, LocalToolClient, ToolCallError, ToolClient
 
@@ -74,9 +75,24 @@ def _forms(document: Document, page_url: str) -> list[_Form]:
     return forms
 
 
+_INSERT_RE = re.compile(
+    r"insert\s+(?:ignore\s+)?into\s+([`\"]?)([A-Za-z_][\w]*)\1\s*\(([^)]*)\)", re.I
+)
+
+
+def _insert_line(lines: list[dict[str, Any]]) -> int | None:
+    """Absolute line number of the INSERT statement inside a source window."""
+    for item in lines:
+        if _INSERT_RE.search(str(item.get("text", ""))):
+            number = item.get("n")
+            if isinstance(number, int):
+                return number
+    return None
+
+
 def _infer_target(source_text: str, sink_code: str, params: list[str]) -> dict[str, Any] | None:
     """Infer INSERT target table and columns from source; return None if unavailable."""
-    insert = re.search(r"insert\s+(?:ignore\s+)?into\s+([`\"]?)([A-Za-z_][\w]*)\1\s*\(([^)]*)\)", source_text, re.I)
+    insert = _INSERT_RE.search(source_text)
     if insert is None:
         return None
     table = insert.group(2)
@@ -164,8 +180,15 @@ async def run_inject(
         result.verdict = "WRITE_NOT_REACHED"
         return await _finish(kernel, result)
     notes["target"] = target
+    insert_line = _insert_line([item for item in source.get("lines") or [] if isinstance(item, dict)])
+    if insert_line is not None:
+        target["line"] = insert_line
     kernel.set_write_targets([{"table": target["table"], "column": target["column"], "mode": "delete"}])
-    stage("I1", True, f"target={target['table']}.{target['column']} columns={target['columns']}")
+    stage(
+        "I1",
+        True,
+        f"target={target['table']}.{target['column']} columns={target['columns']} line={insert_line}",
+    )
 
     # ---- I2 Entry reconstruction: fetch page to find form ----
     try:
@@ -220,22 +243,56 @@ async def run_inject(
         if param in form.fields and param != field_name:
             values[param] = values[param] or f"tia-{tag}"
     body = urlencode(values)
+    armed = False
+    if insert_line is not None:
+        try:
+            await call("probe_arm", {"case_id": result.case_id, "file": sink_file, "line": insert_line})
+            armed = True
+        except ToolCallError as exc:
+            notes["probe_error"] = str(exc.envelope.error.message if exc.envelope.error else exc)
     try:
-        submitted = await call(
-            "http_request",
-            {
-                "method": "POST",
-                "url": form.action,
-                "body": body,
-                "headers": {"Content-Type": "application/x-www-form-urlencoded"},
-            },
-        )
+        if armed:
+            submitted = await call(
+                "probe_run",
+                {
+                    "case_id": result.case_id,
+                    "url": form.action,
+                    "method": "POST",
+                    "body": body,
+                    "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+                },
+            )
+        else:
+            submitted = await call(
+                "http_request",
+                {
+                    "method": "POST",
+                    "url": form.action,
+                    "body": body,
+                    "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+                },
+            )
     except ToolCallError as exc:
         stage("I5", False, f"POST failed: {exc}")
         result.verdict = "WRITE_NOT_REACHED"
         return await _finish(kernel, result)
-    stage("I5", True, f"POST {form.action} → {submitted.get('status')}")
-    if int(submitted.get("status", 0)) >= 400:
+    finally:
+        if armed:
+            with contextlib.suppress(ToolCallError):
+                await call("probe_disarm", {"case_id": result.case_id})
+    status = submitted.get("http", {}).get("status") if armed else submitted.get("status")
+    stage("I5", True, f"POST {form.action} → {status} probe={armed}")
+    if armed and (submitted.get("queries") or []):
+        query = (submitted.get("queries") or [{}])[0]
+        notes["probe"] = {
+            "mode": submitted.get("mode"),
+            "sql": query.get("sql"),
+            "bindings": query.get("bindings"),
+            "affected_rows": query.get("affected_rows"),
+            "last_insert_id": query.get("last_insert_id"),
+            "matched_at": query.get("matched_at"),
+        }
+    if int(status or 0) >= 400:
         result.verdict = "WRITE_NOT_REACHED"
         return await _finish(kernel, result)
 
@@ -295,6 +352,8 @@ async def run_inject(
 
 
 async def _finish(kernel: Kernel, result: InjectResult, cleanup: bool = True) -> InjectResult:
+    if result.case_id:
+        get_runtime().store.set_case_verdict(result.case_id, str(result.verdict), ceiling="EXECUTABLE")
     report = ""
     try:
         data = await kernel.call(

@@ -9,6 +9,7 @@ the LLM only affects "what to do next", not "what the tool returns". Integrate t
 
 from __future__ import annotations
 
+import contextlib
 import re
 import secrets
 from dataclasses import dataclass, field
@@ -45,6 +46,60 @@ class TriggerResult:
     stages: list[StageRecord] = field(default_factory=list)
     notes: dict[str, Any] = field(default_factory=dict)
     trace: list[StepRecord] = field(default_factory=list)
+
+
+_SELECT_RE = re.compile(r"\bselect\b[^;]*?\bfrom\s+`?([A-Za-z_][\w]*)`?", re.I)
+
+
+def _read_line(lines: list[dict[str, Any]], table: str) -> int | None:
+    """Line number of the SELECT that reads the target table, if the source shows it."""
+    for item in lines:
+        text = str(item.get("text", ""))
+        match = _SELECT_RE.search(text)
+        if match is not None and match.group(1).lower() == table.lower():
+            number = item.get("n")
+            if isinstance(number, int):
+                return number
+    return None
+
+
+async def _probe_sink_read(
+    kernel: Kernel,
+    case_id: str,
+    sink_file: str,
+    read_line: int,
+    base_url: str,
+    tag: str,
+) -> dict[str, Any]:
+    """Arm the SQL capture on the read line, fetch the page, and check whether our row was returned."""
+    note: dict[str, Any] = {"line": read_line}
+    try:
+        await kernel.call("probe_arm", {"case_id": case_id, "file": sink_file, "line": read_line})
+    except ToolCallError as exc:
+        note["error"] = exc.code.value
+        return note
+    try:
+        run = await kernel.call("probe_run", {"case_id": case_id, "url": base_url})
+    except ToolCallError as exc:
+        note["error"] = exc.code.value
+        return note
+    finally:
+        with contextlib.suppress(ToolCallError):
+            await kernel.call("probe_disarm", {"case_id": case_id})
+    queries = run.get("queries") or []
+    note["hit"] = bool(run.get("hit"))
+    note["mode"] = run.get("mode")
+    if queries:
+        query = queries[0]
+        note["sql"] = query.get("sql")
+        note["matched_at"] = query.get("matched_at")
+        note["row_count"] = query.get("row_count")
+        note["rows_with_tag"] = sum(
+            1
+            for row in query.get("rows") or []
+            if tag in " ".join(str(value) for value in row.values())
+        )
+    return note
 
 
 def normalize_slice(raw: dict[str, Any]) -> dict[str, Any]:
@@ -131,7 +186,8 @@ async def run_trigger(
                              report=await kernel.report(), stages=stages, notes=notes,
                              trace=kernel.trace)
     post_vars = sorted(set(_POST_VAR_RE.findall(source_text))) or params
-    notes.update({"table": table, "columns": columns, "post_vars": post_vars})
+    read_line = _read_line([line for line in source["lines"] if isinstance(line, dict)], table)
+    notes.update({"table": table, "columns": columns, "post_vars": post_vars, "read_line": read_line})
 
     targets = (
         [{"table": table, "column": col, "mode": "insert"} for col in columns]
@@ -196,7 +252,9 @@ async def run_trigger(
         StageRecord("P4", db_error is None, "Write successful" if db_error is None else f"Write failed: {db_error}")
     )
 
-    # P5 verify_tag forensics --------------------------------------------------
+    # P5 Sink read probe + verify_tag forensics --------------------------------
+    if db_error is None and read_line is not None:
+        notes["sink_read"] = await _probe_sink_read(kernel, case_id, sink_file, read_line, base_url, tag)
     verify: dict[str, Any] | None = None
     if db_error is None:
         try:
@@ -212,9 +270,14 @@ async def run_trigger(
                 "reason": best.get("executable_reason"),
                 "node_path": best.get("node_path"),
             }
+        sink_read = notes.get("sink_read") or {}
         stages.append(
-            StageRecord("P5", verify is not None and bool(verify.get("found")),
-                        f"found={bool(verify and verify.get('found'))} occurrences={notes.get('occurrence_count')}")
+            StageRecord(
+                "P5",
+                verify is not None and bool(verify.get("found")),
+                f"found={bool(verify and verify.get('found'))} occurrences={notes.get('occurrence_count')}"
+                f" sink_read={sink_read.get('rows_with_tag')}/{sink_read.get('row_count')}",
+            )
         )
 
     verdict, explanation = judge_trigger(

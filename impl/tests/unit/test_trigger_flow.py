@@ -85,6 +85,24 @@ class FakeClient:
                     "node_path": "html>body>p",
                 },
             }
+        if tool == "probe_arm":
+            return {"probe_id": "probe-case-test-7", "armed_at": "2026-11-25T00:00:00+00:00"}
+        if tool == "probe_run":
+            return {
+                "hit": True,
+                "mode": "read",
+                "queries": [
+                    {
+                        "sql": "select user,comment,date from comments",
+                        "matched_at": "origin",
+                        "row_count": 1,
+                        "rows": [{"user": "Anonymous", "comment": "payload", "date": "25 Nov 2026"}],
+                    }
+                ],
+                "http": {"status": 200, "bytes": 100},
+            }
+        if tool == "probe_disarm":
+            return {"disarmed": True, "removed_output": True, "output": "x.json"}
         if tool == "db_undo":
             return {"reverted": [{"change_id": "ch-test", "ok": True, "rows": 1}], "residue": 0}
         if tool == "case_report":

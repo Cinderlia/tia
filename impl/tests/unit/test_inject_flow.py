@@ -71,6 +71,27 @@ class FakeInjectClient:
                 self.stored = 1
                 return {"status": 200, "body": self.page, "content_type": "text/html"}
             return {"status": 200, "body": self.page, "content_type": "text/html"}
+        if tool == "probe_arm":
+            return {"probe_id": "probe-case-inject-51", "armed_at": "2026-11-25T00:00:00+00:00"}
+        if tool == "probe_run":
+            self.submitted = True
+            self.stored = 1
+            return {
+                "hit": True,
+                "mode": "write",
+                "queries": [
+                    {
+                        "sql": "insert into comments (user,comment,date) values('a','b','c')",
+                        "bindings": ["a", "b", "c"],
+                        "affected_rows": 1,
+                        "last_insert_id": 7,
+                        "matched_at": "origin",
+                    }
+                ],
+                "http": {"status": 200, "bytes": 1234},
+            }
+        if tool == "probe_disarm":
+            return {"disarmed": True, "removed_output": True, "output": "x.json"}
         if tool == "db_schema":
             return {
                 "tables": [
