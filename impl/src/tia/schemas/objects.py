@@ -183,5 +183,5 @@ class CaseOutcome(BaseModel):
     verdict: str
     evidence_refs: list[str] = Field(default_factory=list)
     residue: int = 0
-    notes: dict[str, str] = Field(default_factory=dict)
+    notes: dict[str, Any] = Field(default_factory=dict)
     duration_ms: int = 0

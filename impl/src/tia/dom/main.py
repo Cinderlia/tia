@@ -7,13 +7,17 @@ LLM planner (reasoning for slice selection) can be added later, simply replacing
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from tia.ad.fs import FsAdapter
 from tia.dom.inject import run_inject
 from tia.dom.trigger import normalize_slice, run_trigger
+from tia.inf.runtime import get_runtime
 from tia.orch.kernel import ToolClient
-from tia.orch.slicing import pair_files, score_slice
+from tia.orch.pairing import Reader, resolve_entry
+from tia.orch.slicing import score_slice
 from tia.schemas.objects import CaseOutcome
 
 
@@ -67,7 +71,7 @@ async def run_main(
             budget=min(budget, 40),
             client=trigger_client,
         )
-        notes = {"trigger": trigger.verdict, "trigger_case": trigger.case_id}
+        notes: dict[str, Any] = {"trigger": trigger.verdict, "trigger_case": trigger.case_id}
         if trigger.verdict == "EXECUTED" and trigger.residue == 0:
             inject = await run_inject(
                 raw,
@@ -116,6 +120,107 @@ async def run_main(
     return result
 
 
+async def run_injection_queue(
+    queue_store: Any,
+    base_url: str,
+    run_id: str | None = None,
+    limit: int = 100,
+    payload_base: str = "<script>alert(1)</script>",
+    budget: int = 120,
+    trigger_client: ToolClient | None = None,
+    inject_client: ToolClient | None = None,
+    url_for: Callable[[dict[str, Any]], str] | None = None,
+) -> MainResult:
+    """Walk the pairing queue: trigger the read slice, inject the paired write slice.
+
+    Only matched read/write candidates are queued, so the trigger agent never
+    receives an unrelated slice. The walk continues after a success (the queue
+    is a candidate list, not a search for the first hit) and stops only when
+    the queue is exhausted or the time-control limit is reached.
+    """
+    result = MainResult()
+    for _ in range(max(limit, 0)):
+        item = queue_store.next_injection_item(run_id)
+        if item is None:
+            result.stop_reason = "DONE"
+            break
+        read_row = queue_store.get_slice(str(item["read_slice_id"]))
+        write_row = queue_store.get_slice(str(item["write_slice_id"]))
+        if read_row is None or write_row is None:
+            queue_store.archive_injection_item(str(item["item_id"]), "MISSING_SLICE")
+            continue
+        read_raw = dict(read_row["slice"])
+        write_raw = dict(write_row["slice"])
+        read_url = url_for(read_raw) if url_for is not None else base_url
+        write_url = url_for(write_raw) if url_for is not None else base_url
+        started = time.monotonic()
+        trigger = await run_trigger(
+            normalize_slice(read_raw),
+            base_url=read_url,
+            payload_base=payload_base,
+            budget=min(budget, 40),
+            client=trigger_client,
+        )
+        notes: dict[str, Any] = {
+            "item": item["item_id"],
+            "pair_score": item["score"],
+            "table": item["table"],
+            "columns": item["columns"],
+            "direction": item["direction"],
+            "trigger": trigger.verdict,
+            "trigger_case": trigger.case_id,
+        }
+        inject_verdict = ""
+        case_id = trigger.case_id
+        residue = trigger.residue or 0
+        refs = [step.evidence_ref for step in trigger.trace if step.evidence_ref]
+        if trigger.verdict == "EXECUTED" and trigger.residue == 0:
+            hint = {
+                "pair_id": item["pair_id"],
+                "table": item["table"],
+                "columns": item["columns"],
+                "confidence": item["score"],
+                "direction": item["direction"],
+                "peer_slice_id": str(item["read_slice_id"]),
+            }
+            inject = await run_inject(
+                write_raw,
+                base_url=write_url,
+                payload_base=payload_base,
+                budget=min(budget, 40),
+                client=inject_client,
+                pair_hints=[hint],
+            )
+            inject_verdict = inject.verdict
+            case_id = inject.case_id
+            residue = inject.residue or 0
+            refs = refs + [step.evidence_ref for step in inject.trace if step.evidence_ref]
+            notes["inject"] = inject.verdict
+            notes["inject_case"] = inject.case_id
+        verdict = inject_verdict or trigger.verdict
+        queue_store.archive_injection_item(str(item["item_id"]), verdict, case_id=case_id)
+        queue_store.archive_slice(str(item["read_slice_id"]), trigger.verdict, case_id=trigger.case_id)
+        queue_store.archive_slice(
+            str(item["write_slice_id"]), inject_verdict or "NOT_EXECUTED", case_id=case_id
+        )
+        result.outcomes.append(
+            CaseOutcome(
+                slice_id=str(item["item_id"]),
+                case_id=case_id,
+                verdict=verdict,
+                evidence_refs=[ref for ref in refs if ref],
+                residue=residue,
+                notes=notes,
+                duration_ms=int((time.monotonic() - started) * 1000),
+            )
+        )
+    else:
+        if queue_store.next_injection_item(run_id) is not None:
+            result.stop_reason = "LIMIT_REACHED"
+    result.report = _report(result)
+    return result
+
+
 def _report(result: MainResult) -> str:
     lines = [
         "# TIA Scheduling Report",
@@ -132,23 +237,56 @@ def _report(result: MainResult) -> str:
     return "\n".join(lines)
 
 
+def _sink_file(raw: dict[str, Any]) -> str:
+    sink_value = raw.get("sink")
+    sink: dict[str, Any] = sink_value if isinstance(sink_value, dict) else {}
+    return str(sink.get("file") or raw.get("sinkFile") or "")
+
+
+def _source_reader() -> Reader | None:
+    """Read-only source window from ``app_root``; pairing degrades without it."""
+    try:
+        adapter = FsAdapter(get_runtime().settings.app_root)
+    except Exception:  # noqa: BLE001 - pairing is optional, the queue still works
+        return None
+
+    def read(path: str, line_from: int, line_to: int) -> list[tuple[int, str]]:
+        return adapter.read(path, line_from, line_to).lines
+
+    return read
+
+
 def seed_queue(queue_store: Any, run_id: str, slices: list[dict[str, Any]]) -> list[str]:
-    """Seed the queue and attach heuristic scores/digests (M1 prior)."""
-    ids: list[str] = queue_store.seed_slices(run_id, slices)
-    paired_files = pair_files(slices)
-    history: dict[str, list[str]] = queue_store.verdict_history()
-    for slice_id_, raw in zip(ids, slices, strict=False):
-        sink_value = raw.get("sink")
-        sink: dict[str, Any] = sink_value if isinstance(sink_value, dict) else {}
-        file_ = str(sink.get("file") or raw.get("sinkFile") or "")
-        line = int(sink.get("line") or raw.get("sinkLine") or 0)
-        scored = score_slice(
-            raw,
-            paired=file_ in paired_files,
-            history=history.get(f"{file_}:{line}", []),
-        )
+    """Seed trigger slices (score only); pairing runs later, on proven slices."""
+    usable = [raw for raw in slices if _sink_file(raw)]
+    ids = queue_store.seed_slices(run_id, usable)
+    history = queue_store.verdict_history()
+    for index, (slice_id_, raw) in enumerate(zip(ids, usable, strict=False)):
+        entry = resolve_entry(raw, index)
+        scored = score_slice(raw, paired=False, history=history.get(f"{entry.file}:{entry.line}", []))
         queue_store.set_slice_score(slice_id_, scored.score, scored.reasons, scored.digest)
-    return ids
+    return [str(item) for item in ids]
+
+
+def _switch_target(
+    queue_store: Any,
+    run_id: str | None,
+    pairs: list[dict[str, Any]],
+    seen: set[str],
+) -> dict[str, Any] | None:
+    """Lease the paired peer of a pair hint (highest confidence first)."""
+    for pair in pairs:
+        peer_id = str(pair.get("peer_slice_id") or "")
+        if not peer_id or peer_id in seen:
+            continue
+        row = queue_store.lease_slice(peer_id)
+        if row is None:
+            continue
+        if run_id and str(row.get("run_id")) != run_id:
+            queue_store.skip_slice(peer_id, f"run mismatch: {row.get('run_id')}", status="pending")
+            continue
+        return dict(row)
+    return None
 
 
 async def run_queue(
@@ -161,29 +299,63 @@ async def run_queue(
     trigger_client: ToolClient | None = None,
     inject_client: ToolClient | None = None,
     max_consecutive_failures: int = 3,
+    max_switches: int = 3,
+    url_for: Callable[[dict[str, Any]], str] | None = None,
+    trigger_only: bool = False,
 ) -> MainResult:
-    """M0→M6 over the persisted queue: lease, run, archive; the queue is the source of truth."""
+    """M0->M6 over the persisted queue: lease, run, archive; the queue is the source of truth.
+
+    When injection on one slice proves futile, the agent may hop to a paired
+    slice (a read/write hint of the same table and column) instead of walking
+    the queue blindly. Switch hops are bounded by ``max_switches``.
+    """
     result = MainResult()
     failures = 0
+    switches = 0
+    seen: set[str] = set()
+    leased: dict[str, Any] | None = None
     for _ in range(max(limit, 0)):
-        item = queue_store.next_slice(run_id=run_id)
+        item = leased if leased is not None else queue_store.next_slice(run_id=run_id)
+        leased = None
         if item is None:
             result.stop_reason = "DONE"
             break
         raw = item["slice"]
         sid = str(item["id"])
+        seen.add(sid)
+        pairs = queue_store.pairs_for_slice(sid, limit=3)
+        page_url = url_for(raw) if url_for is not None else base_url
         started = time.monotonic()
         trigger = await run_trigger(
             normalize_slice(raw),
-            base_url=base_url,
+            base_url=page_url,
             payload_base=payload_base,
             budget=min(budget, 40),
             client=trigger_client,
         )
-        notes = {"trigger": trigger.verdict, "trigger_case": trigger.case_id}
-        if trigger.verdict == "EXECUTED" and trigger.residue == 0:
+        notes: dict[str, Any] = {"trigger": trigger.verdict, "trigger_case": trigger.case_id}
+        if pairs:
+            notes["pairs"] = [
+                {
+                    "pair_id": pair["pair_id"],
+                    "confidence": pair["confidence"],
+                    "side": pair.get("side"),
+                    "peer": pair.get("peer_slice_id"),
+                    "table": pair["table"],
+                    "columns": pair["columns"],
+                }
+                for pair in pairs
+            ]
+        injected = False
+        if not trigger_only and trigger.verdict == "EXECUTED" and trigger.residue == 0:
+            injected = True
             inject = await run_inject(
-                raw, base_url=base_url, payload_base=payload_base, budget=min(budget, 40), client=inject_client
+                raw,
+                base_url=page_url,
+                payload_base=payload_base,
+                budget=min(budget, 40),
+                client=inject_client,
+                pair_hints=pairs,
             )
             refs = [step.evidence_ref for step in inject.trace if step.evidence_ref]
             outcome = CaseOutcome(
@@ -210,16 +382,28 @@ async def run_queue(
         if outcome.verdict not in {"EXECUTED", "EXECUTABLE", "NOT_EXECUTABLE", "WRITTEN_NOT_VISIBLE"}:
             # Demote failures so lower-quality slices fall behind on the next read.
             queue_store.bump_slice_score(sid, -15)
+        if (
+            injected
+            and outcome.verdict not in {"EXECUTABLE", "EXECUTED"}
+            and switches < max_switches
+        ):
+            peer = _switch_target(queue_store, run_id, pairs, seen)
+            if peer is not None:
+                switches += 1
+                outcome.notes["switched_to"] = str(peer["id"])
+                leased = peer
         result.outcomes.append(outcome)
         if outcome.verdict in {"EXECUTED", "EXECUTABLE", "NOT_EXECUTABLE", "WRITTEN_NOT_VISIBLE"}:
             failures = 0
-        else:
+        elif not trigger_only:
+            # In trigger-only mode a non-reflecting slice is data, not a blocker:
+            # the pairing stage only consumes the ones that proved reachable.
             failures += 1
             if failures >= max_consecutive_failures:
                 result.stop_reason = "BLOCKED_NEEDS_HUMAN"
                 break
     else:
-        if queue_store.next_slice(run_id=run_id) is not None:
+        if leased is not None or queue_store.next_slice(run_id=run_id) is not None:
             result.stop_reason = "LIMIT_REACHED"
     result.report = _report(result)
     return result

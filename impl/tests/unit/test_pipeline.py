@@ -1,0 +1,139 @@
+"""Pipeline loop: a failed chain stops downstream stages but not the main loop."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from tia.dom import pipeline as pipeline_mod
+from tia.dom.pipeline import run_pipeline
+from tia.inf.store import Store
+from tia.orch.kernel import ToolCallError
+
+
+class _Result:
+    def __init__(self, verdict: str, residue: int = 0) -> None:
+        self.verdict = verdict
+        self.residue = residue
+        self.case_id = "case-1"
+        self.trace: list[Any] = []
+        self.stages: list[Any] = []
+        self.notes: dict[str, Any] = {}
+
+
+def _trigger_slices(n: int) -> list[dict[str, Any]]:
+    return [
+        {
+            "kind": "xss",
+            "sinkFile": "app/view.php",
+            "sinkLine": 61 + index,
+            "sinkCode": "select comment from comments",
+            "params": ["msg"],
+        }
+        for index in range(n)
+    ]
+
+
+def _write_slices() -> list[dict[str, Any]]:
+    return [
+        {
+            "kind": "xss",
+            "sinkFile": "app/view.php",
+            "sinkLine": 20,
+            "sinkCode": "insert into comments (comment) values (:comment)",
+            "params": ["msg"],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_failed_trigger_skips_downstream_but_loop_continues(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    store = Store(tmp_path / "tia.db")
+    verdicts = iter(["READ_NOT_REFLECTED", "EXECUTED", "EXECUTED"])
+    injected: list[str] = []
+
+    async def fake_trigger(raw: dict[str, Any], **kwargs: Any) -> _Result:
+        return _Result(next(verdicts))
+
+    async def fake_inject(raw: dict[str, Any], **kwargs: Any) -> _Result:
+        injected.append("inject")
+        return _Result("EXECUTABLE")
+
+    monkeypatch.setattr(pipeline_mod, "run_trigger", fake_trigger)
+    monkeypatch.setattr(pipeline_mod, "run_inject", fake_inject)
+
+    result = await run_pipeline(
+        store,
+        trigger_run_id="run-1",
+        trigger_slices=_trigger_slices(3),
+        write_slices=_write_slices(),
+        base_url="http://x/",
+        timeout_sec=30,
+        queue_cap=5,
+    )
+
+    assert result.stop_reason == "EXHAUSTED"
+    assert len(result.rounds) == 3
+    assert result.rounds[0]["stopped_at"] == "trigger"
+    assert result.rounds[0]["injections"] == []
+    assert len(injected) == 2
+    assert result.rounds[1]["injections"]
+
+
+@pytest.mark.asyncio
+async def test_timeout_stops_the_loop(tmp_path: Path, monkeypatch: Any) -> None:
+    store = Store(tmp_path / "tia.db")
+
+    async def fake_trigger(raw: dict[str, Any], **kwargs: Any) -> _Result:  # pragma: no cover
+        raise AssertionError("trigger must not run when the budget is exhausted")
+
+    monkeypatch.setattr(pipeline_mod, "run_trigger", fake_trigger)
+
+    result = await run_pipeline(
+        store,
+        trigger_run_id="run-2",
+        trigger_slices=_trigger_slices(2),
+        write_slices=_write_slices(),
+        base_url="http://x/",
+        timeout_sec=0,
+    )
+    assert result.stop_reason == "TIMEOUT"
+    assert result.rounds == []
+
+
+@pytest.mark.asyncio
+async def test_slice_error_is_recorded_and_skipped(tmp_path: Path, monkeypatch: Any) -> None:
+    from tia.schemas.envelope import Envelope, ErrorBody, ErrorCode
+
+    store = Store(tmp_path / "tia.db")
+    calls = {"n": 0}
+
+    async def fake_trigger(raw: dict[str, Any], **kwargs: Any) -> _Result:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            envelope = Envelope.failure(
+                tool="db_schema",
+                profile="main",
+                error=ErrorBody(code=ErrorCode.NOT_FOUND, message="no table"),
+            )
+            raise ToolCallError("db_schema", envelope)
+        return _Result("READ_NOT_REFLECTED")
+
+    monkeypatch.setattr(pipeline_mod, "run_trigger", fake_trigger)
+
+    result = await run_pipeline(
+        store,
+        trigger_run_id="run-3",
+        trigger_slices=_trigger_slices(2),
+        write_slices=_write_slices(),
+        base_url="http://x/",
+        timeout_sec=30,
+    )
+    assert result.stop_reason == "EXHAUSTED"
+    assert result.rounds[0]["stopped_at"] == "error"
+    assert result.rounds[1]["trigger_verdict"] == "READ_NOT_REFLECTED"
+

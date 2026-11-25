@@ -108,6 +108,38 @@ CREATE TABLE IF NOT EXISTS slice (
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS pair_hint (
+    pair_id       TEXT PRIMARY KEY,
+    run_id        TEXT NOT NULL,
+    read_slice_id TEXT NOT NULL,
+    write_slice_id TEXT NOT NULL,
+    table_name    TEXT NOT NULL DEFAULT '',
+    columns       TEXT NOT NULL DEFAULT '[]',
+    confidence    INTEGER NOT NULL DEFAULT 0,
+    direction     TEXT NOT NULL DEFAULT 'unknown',
+    reasons       TEXT NOT NULL DEFAULT '[]',
+    created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pair_run ON pair_hint (run_id);
+CREATE TABLE IF NOT EXISTS injection_queue (
+    item_id        TEXT PRIMARY KEY,
+    run_id         TEXT NOT NULL,
+    rank           INTEGER NOT NULL DEFAULT 0,
+    write_slice_id TEXT NOT NULL,
+    read_slice_id  TEXT NOT NULL,
+    pair_id        TEXT NOT NULL,
+    table_name     TEXT NOT NULL DEFAULT '',
+    columns        TEXT NOT NULL DEFAULT '[]',
+    score          INTEGER NOT NULL DEFAULT 0,
+    direction      TEXT NOT NULL DEFAULT '',
+    reasons        TEXT NOT NULL DEFAULT '[]',
+    status         TEXT NOT NULL DEFAULT 'pending',
+    verdict        TEXT NOT NULL DEFAULT '',
+    case_id        TEXT NOT NULL DEFAULT '',
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_injection_run ON injection_queue (run_id, status, rank);
 """
 
 
@@ -490,8 +522,9 @@ class Store:
         args += (max(1, min(limit, 50)),)
         with self._conn() as conn:
             rows = conn.execute(sql, args).fetchall()
-        return [
-            {
+        peeked: list[dict[str, Any]] = []
+        for row in rows:
+            item = {
                 "slice_id": row["id"],
                 "run_id": row["run_id"],
                 "attempts": row["attempts"],
@@ -499,8 +532,174 @@ class Store:
                 "reasons": json.loads(row["reasons"] or "[]"),
                 "digest": json.loads(row["digest"] or "{}"),
             }
-            for row in rows
-        ]
+            item["pairs"] = self._pairs_for(row["id"], limit=3)
+            peeked.append(item)
+        return peeked
+
+    # -- read/write pairing ------------------------------------------------
+    def replace_pairs(self, run_id: str, pairs: list[dict[str, Any]]) -> int:
+        """Replace the pairing snapshot of one run; pairing is a derived prior, not evidence."""
+        now = now_iso()
+        with self._conn() as conn:
+            conn.execute("DELETE FROM pair_hint WHERE run_id=?", (run_id,))
+            for pair in pairs:
+                conn.execute(
+                    "INSERT INTO pair_hint (pair_id, run_id, read_slice_id, write_slice_id, table_name,"
+                    " columns, confidence, direction, reasons, created_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        str(pair["pair_id"]),
+                        run_id,
+                        str(pair["read_slice_id"]),
+                        str(pair["write_slice_id"]),
+                        str(pair.get("table") or ""),
+                        json.dumps(pair.get("columns") or [], ensure_ascii=False),
+                        int(pair.get("confidence") or 0),
+                        str(pair.get("direction") or "unknown"),
+                        json.dumps(pair.get("reasons") or [], ensure_ascii=False),
+                        now,
+                    ),
+                )
+        return len(pairs)
+
+    def list_pairs(self, run_id: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM pair_hint"
+        args: tuple[Any, ...] = ()
+        if run_id:
+            sql += " WHERE run_id=?"
+            args = (run_id,)
+        sql += " ORDER BY confidence DESC LIMIT ?"
+        args += (max(1, min(limit, 2000)),)
+        with self._conn() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        return [self._pair_row(row) for row in rows]
+
+    def pairs_for_slice(self, slice_id: str, limit: int = 3) -> list[dict[str, Any]]:
+        return self._pairs_for(slice_id, limit)
+
+    def _pairs_for(self, slice_id: str, limit: int = 3) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM pair_hint WHERE read_slice_id=? OR write_slice_id=?"
+                " ORDER BY confidence DESC LIMIT ?",
+                (slice_id, slice_id, max(1, limit)),
+            ).fetchall()
+        pairs: list[dict[str, Any]] = []
+        for row in rows:
+            pair = self._pair_row(row)
+            pair["side"] = "read" if pair["read_slice_id"] == slice_id else "write"
+            pair["peer_slice_id"] = (
+                pair["write_slice_id"] if pair["side"] == "read" else pair["read_slice_id"]
+            )
+            pairs.append(pair)
+        return pairs
+
+    # -- injection queue ---------------------------------------------------
+    def replace_injection_queue(self, run_id: str, items: list[dict[str, Any]]) -> int:
+        """Replace one run's injection queue with a ranked snapshot."""
+        now = now_iso()
+        with self._conn() as conn:
+            conn.execute("DELETE FROM injection_queue WHERE run_id=?", (run_id,))
+            for rank, item in enumerate(items):
+                conn.execute(
+                    "INSERT INTO injection_queue (item_id, run_id, rank, write_slice_id, read_slice_id,"
+                    " pair_id, table_name, columns, score, direction, reasons, status, created_at, updated_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,'pending',?,?)",
+                    (
+                        str(item["item_id"]),
+                        run_id,
+                        rank,
+                        str(item["write_slice_id"]),
+                        str(item["read_slice_id"]),
+                        str(item["pair_id"]),
+                        str(item.get("table") or ""),
+                        json.dumps(item.get("columns") or [], ensure_ascii=False),
+                        int(item.get("score") or 0),
+                        str(item.get("direction") or ""),
+                        json.dumps(item.get("reasons") or [], ensure_ascii=False),
+                        now,
+                        now,
+                    ),
+                )
+        return len(items)
+
+    def list_injection_queue(
+        self, run_id: str | None = None, *, status: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM injection_queue WHERE 1=1"
+        args: list[Any] = []
+        if run_id:
+            sql += " AND run_id=?"
+            args.append(run_id)
+        if status:
+            sql += " AND status=?"
+            args.append(status)
+        sql += " ORDER BY rank ASC LIMIT ?"
+        args.append(max(1, min(limit, 2000)))
+        with self._conn() as conn:
+            rows = conn.execute(sql, tuple(args)).fetchall()
+        return [self._injection_row(row) for row in rows]
+
+    def next_injection_item(self, run_id: str | None = None) -> dict[str, Any] | None:
+        sql = "SELECT item_id FROM injection_queue WHERE status='pending'"
+        args: tuple[Any, ...] = ()
+        if run_id:
+            sql += " AND run_id=?"
+            args = (run_id,)
+        sql += " ORDER BY rank ASC LIMIT 1"
+        with self._conn() as conn:
+            row = conn.execute(sql, args).fetchone()
+            if row is None:
+                return None
+            item_id = str(row["item_id"])
+            conn.execute(
+                "UPDATE injection_queue SET status='running', updated_at=? WHERE item_id=?",
+                (now_iso(), item_id),
+            )
+            fresh = conn.execute("SELECT * FROM injection_queue WHERE item_id=?", (item_id,)).fetchone()
+        return self._injection_row(fresh) if fresh is not None else None
+
+    def archive_injection_item(self, item_id: str, verdict: str, *, case_id: str = "") -> bool:
+        with self._conn() as conn:
+            cur = conn.execute(
+                "UPDATE injection_queue SET status='done', verdict=?, case_id=?, updated_at=?"
+                " WHERE item_id=?",
+                (verdict, case_id, now_iso(), item_id),
+            )
+            return cur.rowcount > 0
+
+    @staticmethod
+    def _injection_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "item_id": row["item_id"],
+            "run_id": row["run_id"],
+            "rank": row["rank"],
+            "write_slice_id": row["write_slice_id"],
+            "read_slice_id": row["read_slice_id"],
+            "pair_id": row["pair_id"],
+            "table": row["table_name"],
+            "columns": json.loads(row["columns"] or "[]"),
+            "score": row["score"],
+            "direction": row["direction"],
+            "reasons": json.loads(row["reasons"] or "[]"),
+            "status": row["status"],
+            "verdict": row["verdict"],
+            "case_id": row["case_id"],
+        }
+
+    @staticmethod
+    def _pair_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "pair_id": row["pair_id"],
+            "read_slice_id": row["read_slice_id"],
+            "write_slice_id": row["write_slice_id"],
+            "table": row["table_name"],
+            "columns": json.loads(row["columns"] or "[]"),
+            "confidence": row["confidence"],
+            "direction": row["direction"],
+            "reasons": json.loads(row["reasons"] or "[]"),
+        }
+
 
     def lease_slice(self, slice_id: str) -> dict[str, Any] | None:
         """Lease one specific slice (planner choice); None when it is not pending."""
@@ -513,6 +712,39 @@ class Store:
             if cursor.rowcount == 0:
                 return None
             row = conn.execute("SELECT * FROM slice WHERE id=?", (slice_id,)).fetchone()
+        loaded = dict(row)
+        loaded["slice"] = json.loads(loaded.pop("slice_json"))
+        return loaded
+
+    def list_slice_rows(
+        self, run_id: str | None = None, *, verdicts: tuple[str, ...] = (), limit: int = 2000
+    ) -> list[dict[str, Any]]:
+        """Full slice rows (with payload) filtered by run and verdict — the proven-read feed."""
+        sql = "SELECT * FROM slice WHERE 1=1"
+        args: list[Any] = []
+        if run_id:
+            sql += " AND run_id=?"
+            args.append(run_id)
+        if verdicts:
+            marks = ",".join("?" for _ in verdicts)
+            sql += f" AND verdict IN ({marks})"
+            args.extend(verdicts)
+        sql += " ORDER BY score DESC, created_at LIMIT ?"
+        args.append(max(1, min(limit, 5000)))
+        with self._conn() as conn:
+            rows = conn.execute(sql, tuple(args)).fetchall()
+        loaded: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["slice"] = json.loads(item.pop("slice_json"))
+            loaded.append(item)
+        return loaded
+
+    def get_slice(self, slice_id: str) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            row = conn.execute("SELECT * FROM slice WHERE id=?", (slice_id,)).fetchone()
+        if row is None:
+            return None
         loaded = dict(row)
         loaded["slice"] = json.loads(loaded.pop("slice_json"))
         return loaded

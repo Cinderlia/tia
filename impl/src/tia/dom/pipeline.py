@@ -1,0 +1,249 @@
+"""Pipeline: main-agent loop over trigger slices.
+
+The main agent keeps leasing the highest-score trigger slice. For each one the
+trigger agent proves it reachable; only then does the pairing agent match
+injection slices for that single proven slice; only then does the inject agent
+walk the candidate queue. A failed stage never runs its downstream stages, but
+the loop moves on to the next trigger slice.
+
+The loop ends when the trigger queue is exhausted or the run hits its wall-clock
+timeout. Pairing/verdict failures are data for the report, not loop ends.
+"""
+
+from __future__ import annotations
+
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Any
+
+from tia.dom.inject import run_inject
+from tia.dom.main import seed_queue
+from tia.dom.pairing_agent import PairingConfig, build_pairing_queue
+from tia.dom.trigger import normalize_slice, run_trigger
+from tia.inf.runtime import get_runtime
+from tia.orch.kernel import ToolCallError, ToolClient
+from tia.schemas.objects import CaseOutcome
+
+
+@dataclass
+class PipelineResult:
+    rounds: list[dict[str, Any]] = field(default_factory=list)
+    outcomes: list[CaseOutcome] = field(default_factory=list)
+    stop_reason: str = "DONE"
+    report: str = ""
+
+
+def _reader() -> Callable[[str, int, int], list[tuple[int, str]]] | None:
+    try:
+        from tia.ad.fs import FsAdapter
+
+        adapter = FsAdapter(get_runtime().settings.app_root)
+    except Exception:  # noqa: BLE001 - pairing degrades without the source tree
+        return None
+
+    def read(path: str, line_from: int, line_to: int) -> list[tuple[int, str]]:
+        return list(adapter.read(path, line_from, line_to).lines)
+
+    return read
+
+
+async def run_pipeline(
+    store: Any,
+    trigger_run_id: str,
+    trigger_slices: list[dict[str, Any]],
+    write_slices: list[dict[str, Any]],
+    base_url: str,
+    *,
+    timeout_sec: float = 600.0,
+    max_slices: int = 0,
+    payload_base: str = "<script>alert(1)</script>",
+    budget: int = 120,
+    queue_cap: int = 10,
+    trigger_client: ToolClient | None = None,
+    inject_client: ToolClient | None = None,
+    url_for: Callable[[dict[str, Any]], str] | None = None,
+) -> PipelineResult:
+    """Loop over trigger slices until the queue is empty or the timeout expires."""
+    result = PipelineResult()
+    seed_queue(store, trigger_run_id, trigger_slices)
+    deadline = time.monotonic() + max(timeout_sec, 0.0)
+    reader = _reader()
+
+    while True:
+        if time.monotonic() >= deadline:
+            result.stop_reason = "TIMEOUT"
+            break
+        if max_slices and len(result.rounds) >= max_slices:
+            result.stop_reason = "SLICE_LIMIT"
+            break
+        leased = store.next_slice(run_id=trigger_run_id)
+        if leased is None:
+            result.stop_reason = "EXHAUSTED" if result.rounds else "NO_TRIGGER_SLICE"
+            break
+
+        round_index = len(result.rounds)
+        raw = dict(leased["slice"])
+        trigger_url = url_for(raw) if url_for is not None else base_url
+        try:
+            trigger = await run_trigger(
+                normalize_slice(raw),
+                base_url=trigger_url,
+                payload_base=payload_base,
+                budget=min(budget, 40),
+                client=trigger_client,
+            )
+        except ToolCallError as exc:
+            # A broken slice must not stop the loop: archive it and pick the next.
+            store.archive_slice(str(leased["id"]), "ERROR")
+            result.rounds.append(
+                {
+                    "round": round_index,
+                    "trigger_slice": str(leased["id"]),
+                    "trigger_case": None,
+                    "trigger_verdict": "ERROR",
+                    "queue_items": 0,
+                    "injections": [],
+                    "stopped_at": "error",
+                    "error": exc.envelope.model_dump(),
+                }
+            )
+            continue
+        store.archive_slice(str(leased["id"]), trigger.verdict, case_id=trigger.case_id)
+        result.outcomes.append(
+            CaseOutcome(
+                slice_id=str(leased["id"]),
+                case_id=trigger.case_id,
+                verdict=trigger.verdict,
+                evidence_refs=[step.evidence_ref for step in trigger.trace if step.evidence_ref],
+                residue=trigger.residue or 0,
+                notes={"stage": "trigger"},
+                duration_ms=0,
+            )
+        )
+        record: dict[str, Any] = {
+            "round": round_index,
+            "trigger_slice": str(leased["id"]),
+            "trigger_case": trigger.case_id,
+            "trigger_verdict": trigger.verdict,
+            "queue_items": 0,
+            "injections": [],
+        }
+        if trigger.verdict != "EXECUTED" or (trigger.residue or 0) != 0:
+            # Not reachable: the rest of this chain is skipped, loop continues.
+            record["stopped_at"] = "trigger"
+            result.rounds.append(record)
+            continue
+
+        pair_run_id = f"{trigger_run_id}-pair-{round_index}"
+        proven = store.get_slice(str(leased["id"]))
+        pairing = build_pairing_queue(
+            store,
+            pair_run_id,
+            write_slices,
+            [proven] if proven is not None else [],
+            reader=reader,
+            config=PairingConfig(queue_cap=queue_cap),
+        )
+        record["queue_items"] = len(pairing.queue)
+        if not pairing.queue:
+            record["stopped_at"] = "pairing"
+            result.rounds.append(record)
+            continue
+
+        try:
+            injected = await walk_injection_queue(
+                store,
+                pair_run_id,
+                base_url,
+                payload_base=payload_base,
+                budget=budget,
+                inject_client=inject_client,
+                url_for=url_for,
+            )
+        except ToolCallError as exc:
+            record["stopped_at"] = "inject_error"
+            record["error"] = exc.envelope.model_dump()
+            result.rounds.append(record)
+            continue
+        record["injections"] = [
+            {"item": item.slice_id, "verdict": item.verdict} for item in injected.outcomes
+        ]
+        result.outcomes.extend(injected.outcomes)
+        result.rounds.append(record)
+
+    result.report = _report(result)
+    return result
+
+
+async def walk_injection_queue(
+    store: Any,
+    pair_run_id: str,
+    base_url: str,
+    *,
+    payload_base: str,
+    budget: int,
+    inject_client: ToolClient | None,
+    url_for: Callable[[dict[str, Any]], str] | None,
+) -> PipelineResult:
+    """Inject every candidate in queue order; the read side is already proven."""
+    result = PipelineResult()
+    while True:
+        item = store.next_injection_item(pair_run_id)
+        if item is None:
+            break
+        write_row = store.get_slice(str(item["write_slice_id"]))
+        if write_row is None:
+            store.archive_injection_item(str(item["item_id"]), "MISSING_SLICE")
+            continue
+        write_raw = dict(write_row["slice"])
+        write_url = url_for(write_raw) if url_for is not None else base_url
+        hint = {
+            "pair_id": item["pair_id"],
+            "table": item["table"],
+            "columns": item["columns"],
+            "confidence": item["score"],
+            "direction": item["direction"],
+        }
+        inject = await run_inject(
+            write_raw,
+            base_url=write_url,
+            payload_base=payload_base,
+            budget=min(budget, 40),
+            client=inject_client,
+            pair_hints=[hint],
+        )
+        store.archive_injection_item(str(item["item_id"]), inject.verdict, case_id=inject.case_id)
+        store.archive_slice(str(item["write_slice_id"]), inject.verdict, case_id=inject.case_id)
+        result.outcomes.append(
+            CaseOutcome(
+                slice_id=str(item["item_id"]),
+                case_id=inject.case_id,
+                verdict=inject.verdict,
+                evidence_refs=[step.evidence_ref for step in inject.trace if step.evidence_ref],
+                residue=inject.residue or 0,
+                notes={
+                    "stage": "inject",
+                    "pair_score": item["score"],
+                    "table": item["table"],
+                    "columns": item["columns"],
+                },
+                duration_ms=0,
+            )
+        )
+    return result
+
+
+def _report(result: PipelineResult) -> str:
+    lines = [
+        "# TIA Pipeline Report",
+        "",
+        f"- Rounds: {len(result.rounds)}",
+        f"- Stop reason: {result.stop_reason}",
+        "",
+        "| Stage | Slice | Verdict |",
+        "| --- | --- | --- |",
+    ]
+    for item in result.outcomes:
+        lines.append(f"| {item.notes.get('stage', '')} | {item.slice_id} | {item.verdict} |")
+    return "\n".join(lines)

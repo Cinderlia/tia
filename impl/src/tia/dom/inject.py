@@ -133,6 +133,14 @@ def _infer_target(source_text: str, sink_code: str, params: list[str]) -> dict[s
     return {"table": table, "columns": columns, "column": column}
 
 
+def _best_pair_hint(pair_hints: list[dict[str, Any]] | None) -> dict[str, Any] | None:
+    """Highest-confidence read/write hint that names a table."""
+    for hint in pair_hints or []:
+        if hint.get("table"):
+            return hint
+    return None
+
+
 async def run_inject(
     raw_slice: dict[str, Any],
     base_url: str,
@@ -140,6 +148,7 @@ async def run_inject(
     budget: int = 40,
     client: ToolClient | None = None,
     cleanup: bool = True,
+    pair_hints: list[dict[str, Any]] | None = None,
 ) -> InjectResult:
     kernel = Kernel(
         profile="inject", budget=budget, client=client or LocalToolClient(profile="inject")
@@ -206,6 +215,26 @@ async def run_inject(
         params = sorted(set(_POST_VAR_RE.findall(text)))
         notes["params_from_source"] = params
     target = _infer_target(text, str(raw_slice.get("sinkCode") or sink), params)
+    hint = _best_pair_hint(pair_hints)
+    if hint is not None:
+        # The pairing prior names the write target directly; source inference is
+        # the fallback when the slice carries no usable SQL literal.
+        hint_columns = [str(item) for item in hint.get("columns") or []]
+        base_columns = list(target["columns"]) if target else []
+        column = hint_columns[0] if hint_columns else str((target or {}).get("column") or "")
+        target = {
+            "table": str(hint["table"]),
+            "columns": base_columns or hint_columns or [column],
+            "column": column,
+            "source": "pair_hint",
+        }
+        notes["pair"] = {
+            "pair_id": hint.get("pair_id"),
+            "confidence": hint.get("confidence"),
+            "side": hint.get("side"),
+            "table": hint.get("table"),
+            "columns": hint_columns,
+        }
     if target is None:
         stage("I1", False, "INSERT target table not found")
         result.verdict = "WRITE_NOT_REACHED"
