@@ -82,7 +82,7 @@ async def test_call_unimplemented_tool_returns_unsupported() -> None:
         ClientSession(read, write) as session,
     ):
         await session.initialize()
-        result = await session.call_tool("source_read", {"path": "home.php"})
+        result = await session.call_tool("probe_arm", {"file": "home.php", "line": 1})
     envelope = json.loads(result.content[0].text)
     assert envelope["ok"] is False
     assert envelope["error"]["code"] == "UNSUPPORTED"

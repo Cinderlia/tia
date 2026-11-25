@@ -35,6 +35,8 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.6",
     "mypy>=1.10",
+    "types-PyYAML>=6.0",
+    "types-PyMySQL>=1.1",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -62,7 +64,7 @@ python_version = "3.11"
 strict = true
 warn_unreachable = true
 show_error_codes = true
-files = ["src", "tests"]
+files = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

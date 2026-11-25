@@ -28,6 +28,7 @@ htmlcov/
 .hypothesis/
 
 # ---- 运行时产物 ----
+impl/var/
 *.log
 logs/
 .runtime/

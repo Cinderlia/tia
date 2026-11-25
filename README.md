@@ -134,3 +134,14 @@ Web UI、模型微调、payload 生成器、IDA/Burp 集成、对目标应用的
 ---
 
 设计口径以 `tia-design-kit/` 为准；实现与文档不一致时，先改文档再改代码，或把偏差明确记入 `NOTES.md`。
+
+## 当前进度
+
+- M0 骨架：36 工具注册、按 profile 下发（main 14 / trigger 36 / inject 36）、统一信封与 12 错误码。
+- `verify_tag`：DOM 偏移级定位 + 8 类上下文 + 可执行三问，fixtures 23 条，在线/离线同源。
+- 数据层：`db_schema/db_read/db_write/db_undo`，写库返回 `change_id` + `undo_sql`，回滚后 `residue`。
+- trigger 主流程：`tia-agent trigger --slice ... --base-url ...` 已能对 xvwa stored_xss 跑完
+  P0–P6，得到 `EXECUTED` 且 `residue=0`（见 `impl/scripts/smoke-trigger.sh`）。
+- 下一步：inject 主流程、主 agent 队列、探针（PHP 采集器）与 trace。
+
+开发与测试命令见 `impl/README.md`。

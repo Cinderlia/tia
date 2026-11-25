@@ -1,0 +1,11 @@
+{
+  "kind": "SQL",
+  "sink": "vulnerabilities/stored_xss/home.php:49  $stmt->bindParam(\":comment\",$comment)",
+  "params": ["msg"],
+  "nodes": [
+    {"id": "n1", "at": "vulnerabilities/stored_xss/home.php:40", "code": "$_POST[\"msg\"]"},
+    {"id": "n2", "at": "vulnerabilities/stored_xss/home.php:49", "code": "$stmt->bindParam(\":comment\",$comment)"}
+  ],
+  "edges": [{"from": "n1", "to": "n2", "kind": "data"}],
+  "optionalGuards": []
+}

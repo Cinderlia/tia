@@ -52,14 +52,14 @@ async def test_main_profile_tool_is_not_found_even_if_known() -> None:
 
 
 async def test_unimplemented_tool_returns_unsupported() -> None:
-    envelope = await registry.dispatch("trigger", "source_read", {"path": "home.php"})
+    envelope = await registry.dispatch("trigger", "probe_arm", {"file": "home.php", "line": 1})
     assert envelope.ok is False
     assert envelope.error is not None
     assert envelope.error.code is ErrorCode.UNSUPPORTED
 
 
 async def test_dispatch_envelope_is_json_serializable() -> None:
-    envelope = await registry.dispatch("trigger", "source_read", {})
+    envelope = await registry.dispatch("trigger", "probe_arm", {})
     payload = envelope.model_dump_json()
     assert '"ok":false' in payload
     assert '"code":"UNSUPPORTED"' in payload

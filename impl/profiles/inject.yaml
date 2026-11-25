@@ -1,0 +1,11 @@
+profile: inject
+write_allow_tables: []
+write_deny_columns:
+  - password
+  - passwd
+  - secret
+  - token
+  - api_key
+max_rows_per_write: 1
+max_source_lines: 500
+max_http_bytes: 32768

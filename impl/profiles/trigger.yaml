@@ -1,0 +1,13 @@
+profile: trigger
+# 写库白名单：留空 = 只能写 case_open/case_note 登记过的表（默认最严）。
+write_allow_tables: []
+# 这些列任何情况下都不许写（密码、令牌类）。
+write_deny_columns:
+  - password
+  - passwd
+  - secret
+  - token
+  - api_key
+max_rows_per_write: 1
+max_source_lines: 500
+max_http_bytes: 32768

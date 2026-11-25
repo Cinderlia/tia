@@ -50,3 +50,48 @@
 - `<style>` 归 `attr` + `STYLE_NOT_SCRIPTABLE`（8 类里没有 style 专属类）。
 - JS 行/块注释里的命中归 `script_block` + `JS_COMMENT`（不可执行）。
 - 需回写文档：是（§5 判定表补 style / JS 注释两行）。
+
+## D7 `Occurrence` 暂留在 `cap/verify.py`
+
+- 文档：§2 把 `Occurrence` 列为共享对象，应在 `schemas/objects.py`。
+- 实现：它的 `context_kind` 依赖 DOM 扫描的类型，先留在 `cap/verify.py`；其余 8 个对象已在
+  `schemas/objects.py`。
+- 原因：现在上移会引入 `schemas → cap` 的反向依赖；等 `domscan` 的类型下沉到 schemas 后再搬。
+- 需回写文档：否（阶段性）。
+
+## D8 sqlite 表名用 `case_file`
+
+- 文档：T04 六张表 `case/change/evidence/flow/probe/session`。
+- 实现：`case` 是 sqlite 关键字，建表失败，改名为 `case_file`；其余五张表名不变。
+- 原因：避免到处引号化；对外只暴露 `case_id`，不暴露表名。
+- 需回写文档：是（T04 表名）。
+
+## D9 trigger 主流程用确定性规划器
+
+- 文档：trigger 由 planner（pydantic-ai）决定 P0–P6 的下一步。
+- 实现：`dom/trigger.py` 用规则推进阶段；`Kernel` 已按"工具调用/证据/预算"抽好，
+  接 LLM 时只替换"选择下一步"的函数，工具语义不变。
+- 原因：先验证流程与证据链，再让模型介入；qwen 只用于测试，不宜作为流程正确性的前提。
+- 需回写文档：是（T10 阶段实现顺序）。
+
+## D10 trigger 的 P0/P1 顺序
+
+- 文档：P0 `case_open`，P1 `source_read`。
+- 实现：先 `source_read` 推断目标表，再 `case_open` 并登记 `write_targets`；阶段记录仍标 P0/P1。
+- 原因：写闸门以 case 登记的写目标为准，先有目标才能建案（否则建完还要补登记）。
+- 需回写文档：是（§8 P0/P1 说明）。
+
+## D11 `db_write` 的 CONFLICT 只回 change_id
+
+- 文档：`CONFLICT` 时"仍返回 change，便于回滚"。
+- 实现：信封失败时没有 `data`，把 `change_id` 写进 message，并提示用 `db_undo --case` 回滚。
+- 原因：保持统一信封形状（H9）优先于塞数据；change 已在库里，信息没丢。
+- 需回写文档：是（§4.3 失败语义）。
+
+## D12 写闸门以 case 登记的写目标为准
+
+- 文档：`write_allow_tables` 由 profile yaml 决定。
+- 实现：`allowed = profile.write_allow_tables ∪ case.write_targets`；trigger/inject 的
+  profile 白名单默认为空，所以"没登记就拒绝"。
+- 原因：每个 case 只该写它声明的表；yaml 作为运维级兜底。
+- 需回写文档：是（§1.6 权限矩阵）。
