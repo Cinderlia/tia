@@ -22,6 +22,8 @@ TIA 不做 payload 生成器，也不做漏洞扫描器。它把「漏洞存在�
 .
 ├── .gitignore          # 忽略设计资料、工作区与各类构建产物
 ├── README.md
+├── docs/
+│   └── environment.md  # 开发/测试环境事实与依赖安装规约
 ├── impl/               # 实现（规划中）
 │   ├── pyproject.toml
 │   ├── src/tia/        # server / orch / dom / cap / ad / inf
@@ -97,6 +99,15 @@ uv run tia-report c001
 ```
 
 三个 profile 的授权范围不同：`main` 只有 14 个只读/调度工具；`trigger` 与 `inject` 按需开放写与验证能力，写域由 profile 的 `write_allow_tables` / `write_deny_columns` 收口。
+
+## 开发与测试环境
+
+- **开发机 / 仓库**：`jmliang@172.28.8.69:/home/jmliang/tia`，远程 `git@github.com:Cinderlia/tia.git`。
+- **测试容器**：`docker exec -it --user root -w /app php84-dev bash`。容器为 Debian 13 + PHP 8.4.25 + Apache + MariaDB；`/home/jmliang/tia` 挂载到 `/home/so/tia`；端口 `8008→80`、`3006→3306`；目标应用（bWAPP / DVWA / WeGIA 等）位于 `/app`。
+- **本地模型**：OpenAI 兼容，`http://172.28.8.100:8000/v1`，模型 `Qwen3.8-27B`，Key `sk-a-strong-key`；不计量，供 planner / judge 使用。
+- **依赖规约**：Python 包与 apt 包一律装在容器内，并同步登记到 `impl/pyproject.toml` / `impl/requirements-extra.txt` / `impl/deploy/apt-packages.txt`，换环境可一键还原。
+
+完整事实与变更记录见 [`docs/environment.md`](docs/environment.md)。
 
 ## 里程碑
 
