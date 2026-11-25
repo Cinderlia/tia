@@ -1,7 +1,7 @@
-"""`tia` 顶层命令行：把子命令转发到各自的入口模块。
+"""`tia` top-level CLI: forwards subcommands to their respective entry modules.
 
-三个正式入口（`tia-server` / `tia-agent` / `tia-report`）也能独立执行；
-这里只做统一的发现入口与 `--help` / `--version`。
+The three formal entry points (`tia-server` / `tia-agent` / `tia-report`) can also run independently;
+this only provides a unified discovery entry and `--help` / `--version`.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ _COMMANDS: dict[str, str] = {
 def _version() -> str:
     try:
         return dist_version("tia")
-    except PackageNotFoundError:  # 未安装（例如直接从源码树运行）
+    except PackageNotFoundError:  # not installed (e.g., running directly from source tree)
         return __version__
 
 
@@ -35,21 +35,21 @@ def build_parser() -> argparse.ArgumentParser:
         prog=_PROG,
         description="TIA —— Trace-based Injection Agent",
         epilog=(
-            "入口：tia-server（共享能力服务）/ tia-agent（主、触发、注入编排）"
-            " / tia-report（Markdown 报告）"
+            "Entry: tia-server (shared capability service) / tia-agent (main, trigger, injection orchestration)"
+            " / tia-report (Markdown report)"
         ),
     )
     parser.add_argument("--version", action="version", version=f"{_PROG} {_version()}")
     subparsers = parser.add_subparsers(dest="command", metavar="<command>")
 
-    server = subparsers.add_parser("server", help="启动 MCP 能力服务（stdio）")
-    server.add_argument("args", nargs=argparse.REMAINDER, help="透传给 tia-server 的参数")
+    server = subparsers.add_parser("server", help="Start MCP capability service (stdio)")
+    server.add_argument("args", nargs=argparse.REMAINDER, help="Arguments passed through to tia-server")
 
-    agent = subparsers.add_parser("agent", help="运行编排 agent")
-    agent.add_argument("args", nargs=argparse.REMAINDER, help="透传给 tia-agent 的参数")
+    agent = subparsers.add_parser("agent", help="Run orchestration agent")
+    agent.add_argument("args", nargs=argparse.REMAINDER, help="Arguments passed through to tia-agent")
 
-    report = subparsers.add_parser("report", help="生成 case 的 Markdown 报告")
-    report.add_argument("args", nargs=argparse.REMAINDER, help="透传给 tia-report 的参数")
+    report = subparsers.add_parser("report", help="Generate Markdown report for case")
+    report.add_argument("args", nargs=argparse.REMAINDER, help="Arguments passed through to tia-report")
 
     return parser
 
@@ -71,5 +71,5 @@ def main(argv: Sequence[str] | None = None) -> int:
     return _dispatch(args.command, args.args)
 
 
-if __name__ == "__main__":  # pragma: no cover - 由 __main__ 调用
+if __name__ == "__main__":  # pragma: no cover - invoked by __main__
     sys.exit(main())

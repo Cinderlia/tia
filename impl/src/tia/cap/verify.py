@@ -1,13 +1,13 @@
-"""`verify_tag`：唯一验收口径。
+"""`verify_tag`: The sole acceptance criterion.
 
-只回事实，不下结论（H5）：
+Report facts only, no conclusions (H5):
 
-* tag 是否出现、出现在哪些上下文；
-* 每个命中的 ``executable`` 是保守估计，理由写在 ``executable_reason``；
-* ``verdict_ceiling`` 恒为 ``EXECUTABLE``——要拿 ``EXECUTED`` 需要浏览器证据。
+* Whether the tag appears and in which contexts;
+* Each matched ``executable`` is a conservative estimate, with the rationale in ``executable_reason``;
+* ``verdict_ceiling`` is always ``EXECUTABLE``—obtaining ``EXECUTED`` requires browser evidence.
 
-离线（``html=``）与在线（``url=``）走同一个判定函数，保证可复现（规范 §9）。
-判据以《验收判定规范》为准，版本见 ``RULE_VERSION``。
+Offline (``html=``) and online (``url=``) use the same judgment function to ensure reproducibility (Spec §9).
+Criteria follow the "Acceptance Judgment Specification"; version is in ``RULE_VERSION``.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ MAX_OCCURRENCES_LIMIT = 200
 DEFAULT_MAX_OCCURRENCES = 10
 HTTP_TIMEOUT_SECONDS = 30.0
 
-#: context_kind 排序优先级（验收规范 §3.2）。
+#: context_kind sorting priority (Acceptance Spec §3.2).
 CONTEXT_PRIORITY: dict[str, int] = {
     "script_block": 0,
     "attr": 1,
@@ -88,12 +88,12 @@ class VerifyTagInput(BaseModel):
     params: dict[str, str] = Field(default_factory=dict)
     session_id: str | None = None
     tag: str
-    #: 可选：完整 payload。给了才能判"闭合/承载"这类需要看注入内容的问题；
-    #: 只给 4 字符 tag 时按保守解判（见 _judge_executable）。
+    #: Optional: full payload. Required to judge "closed/carrying" issues that depend on injected content;
+    #: If only the 4-character tag is provided, a conservative judgment is applied (see _judge_executable).
     payload: str | None = None
     max_occurrences: int = Field(default=DEFAULT_MAX_OCCURRENCES, ge=1, le=MAX_OCCURRENCES_LIMIT)
     upwalk: UpwalkOptions = Field(default_factory=UpwalkOptions)
-    #: 离线模式的响应元信息；在线模式由 HTTP 响应填充。
+    #: Response metadata for offline mode; populated by HTTP response in online mode.
     content_type: str | None = None
     headers: dict[str, str] = Field(default_factory=dict)
     status: int | None = None
@@ -101,11 +101,11 @@ class VerifyTagInput(BaseModel):
     @model_validator(mode="after")
     def _check_source(self) -> VerifyTagInput:
         if (self.url is None) == (self.html is None):
-            raise ValueError("url 与 html 必须二选一")
+            raise ValueError("url and html are mutually exclusive")
         if not self.tag or len(self.tag) > 64 or any(char.isspace() for char in self.tag):
-            raise ValueError("tag 必须是 1..64 个非空白字符")
+            raise ValueError("tag must be 1..64 non-whitespace characters")
         if self.url is not None and not self.url.startswith(("http://", "https://")):
-            raise ValueError("url 目前只接受绝对 http(s) 地址")
+            raise ValueError("url currently only accepts absolute http(s) addresses")
         return self
 
 
@@ -143,12 +143,12 @@ class VerifyTagResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# 命中扫描
+# Hit scan
 # ---------------------------------------------------------------------------
 
 
 def _encoded_pattern(tag: str) -> re.Pattern[str]:
-    """为 tag 生成"字符级可还原编码"的匹配式（规范 §3.1 的四类变换）。"""
+    """Generate a "character-level reconstructible encoding" match pattern for the tag (four transformations in Spec §3.1)."""
     parts: list[str] = []
     for char in tag:
         code = ord(char)
@@ -200,14 +200,14 @@ def _encoded_spans(text: str, tag: str, literal: list[tuple[int, int]]) -> list[
         if match.start() in literal_starts and match.group(0) == tag:
             continue
         if match.group(0) == tag:
-            # 原样子串，已经由 literal 覆盖。
+            # Original substring, already covered by literal.
             continue
         spans.append((match.start(), match.end()))
     return spans
 
 
 # ---------------------------------------------------------------------------
-# 可执行判定（规范 §6）
+# Executability judgment (Spec §6)
 # ---------------------------------------------------------------------------
 
 
@@ -270,7 +270,7 @@ def _judge(
     is_html: bool,
     attr_value: str,
 ) -> tuple[bool, str, str]:
-    """返回 ``(executable, reason, confidence)``；不确定一律 False。"""
+    """Returns ``(executable, reason, confidence)``; defaults to False when uncertain."""
     kind = context.kind
     if not is_html:
         return False, "CONTENT_TYPE_PLAIN", "high"
@@ -350,7 +350,7 @@ def _judge(
 
 
 # ---------------------------------------------------------------------------
-# 主流程
+# Main flow
 # ---------------------------------------------------------------------------
 
 
@@ -364,7 +364,7 @@ def analyze(
     status: int | None = None,
     max_occurrences: int = DEFAULT_MAX_OCCURRENCES,
 ) -> VerifyTagResult:
-    """纯函数入口：同一 (html, tag, options) 任意时刻结果一致（规范 §9）。"""
+    """Pure function entry: same (html, tag, options) yields consistent results at any time (spec §9)."""
     safe_headers = headers or {}
     document = domscan.parse(html)
     literal = _literal_spans(html, tag)
@@ -418,7 +418,7 @@ def analyze(
             )
         )
 
-    # 响应头 / URL 里的 tag：返回但不进 best（规范 §3.3）。
+    # tag in response headers / URL: returned but not included in best (spec §3.3).
     for _name, value in safe_headers.items():
         if tag in value:
             key = ("header", None)
@@ -493,26 +493,26 @@ def _fetch(input_: VerifyTagInput) -> tuple[str, str, dict[str, str], int]:
     except httpx.HTTPError as exc:
         raise ToolError(
             ErrorCode.ENV_ERROR,
-            f"请求失败: {type(exc).__name__}: {exc}",
+            f"Request failed: {type(exc).__name__}: {exc}",
             retryable=True,
-            hint="检查目标是否可达、URL 是否正确",
+            hint="Check if target is reachable and URL is correct",
         ) from exc
     headers = {key.lower(): value for key, value in response.headers.items()}
     return response.text, response.headers.get("content-type", "text/html"), headers, response.status_code
 
 
 async def verify_tag(arguments: dict[str, Any]) -> ToolOutput:
-    """MCP handler：参数校验 → 取页面（或离线 HTML）→ 纯函数判定。"""
+    """MCP handler: parameter validation → fetch page (or offline HTML) → pure function decision."""
     try:
         input_ = VerifyTagInput.model_validate(arguments)
     except ValidationError as exc:
         raise ToolError(
             ErrorCode.BAD_ARGS,
-            "参数不合法: " + "; ".join(
+            "Invalid parameters: " + "; ".join(
                 f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}"
                 for error in exc.errors()
             ),
-            hint="url 与 html 二选一；tag 为 1..64 个非空白字符",
+            hint="Either url or html; tag must be 1..64 non-whitespace characters",
         ) from exc
 
     if input_.html is not None:
@@ -525,7 +525,7 @@ async def verify_tag(arguments: dict[str, Any]) -> ToolOutput:
         html, content_type, headers, status = _fetch(input_)
         warnings = []
         if input_.session_id is not None:
-            warnings.append("SESSION_NOT_IMPLEMENTED: 当前版本忽略 session_id")
+            warnings.append("SESSION_NOT_IMPLEMENTED: current version ignores session_id")
 
     result = analyze(
         html,
