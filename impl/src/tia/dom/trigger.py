@@ -10,6 +10,7 @@ the LLM only affects "what to do next", not "what the tool returns". Integrate t
 from __future__ import annotations
 
 import contextlib
+import os
 import re
 import secrets
 from dataclasses import dataclass, field
@@ -29,6 +30,9 @@ from tia.inf.runtime import get_runtime
 from tia.inf.store import now_iso
 from tia.orch.judge import judge_trigger
 from tia.orch.kernel import Kernel, LocalToolClient, StepRecord, ToolCallError, ToolClient
+
+#: Exploration budget: enough attempts for complex entry pages, still bounded.
+ENTRY_ATTEMPTS = max(1, int(os.environ.get("TIA_ENTRY_ATTEMPTS", "8")))
 
 _INSERT_RE = re.compile(r"insert\s+into\s+`?(\w+)`?\s*\(([^)]*)\)", re.IGNORECASE)
 _SELECT_TABLE_RE = re.compile(r"\bfrom\s+`?(\w+)`?", re.IGNORECASE)
@@ -174,6 +178,7 @@ async def run_trigger(
     payload_base: str = "<script>alert(1)</script>",
     budget: int = 40,
     client: ToolClient | None = None,
+    slice_id: str | None = None,
 ) -> TriggerResult:
     rt = get_runtime()
     slice_doc = normalize_slice(raw_slice)
@@ -190,6 +195,7 @@ async def run_trigger(
     opened = await kernel.call("case_open", {"slice": slice_doc, "agent": "trigger", "write_targets": []})
     case_id = str(opened["case_id"])
     kernel.case_id = case_id
+    kernel.slice_id = slice_id
     stages.append(StageRecord("P0", True, f"case_id={case_id}"))
 
     # P1 Locate read points and entry ---------------------------------------------------
@@ -317,7 +323,7 @@ async def run_trigger(
             pk_columns=pk_columns,
             context=source_text,
             client=LlmClient.from_env(),
-            limit=3,
+            limit=ENTRY_ATTEMPTS,
         )
         if candidates:
             first = candidates[0]
@@ -333,7 +339,7 @@ async def run_trigger(
     verify: dict[str, Any] | None = None
     verify_attempts: list[dict[str, Any]] = []
     if db_error is None:
-        for candidate in candidates:
+        for candidate in candidates[:ENTRY_ATTEMPTS]:
             attempt: dict[str, Any] = {
                 "method": candidate.method,
                 "values": candidate.values,

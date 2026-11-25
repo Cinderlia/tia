@@ -118,6 +118,7 @@ async def run_pipeline(
                 payload_base=payload_base,
                 budget=min(budget, 40),
                 client=trigger_client,
+                slice_id=str(leased["id"]),
             )
         except ToolCallError as exc:
             # A broken slice must not stop the loop: archive it and pick the next.
@@ -248,6 +249,7 @@ async def walk_injection_queue(
             verify_url=read_url,
             verify_entry=entry,
             payload_constraints=payload_constraints,
+            slice_id=str(item["write_slice_id"]),
         )
         store.archive_injection_item(str(item["item_id"]), inject.verdict, case_id=inject.case_id)
         store.archive_slice(str(item["write_slice_id"]), inject.verdict, case_id=inject.case_id)

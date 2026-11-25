@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from tia.cap.registry import dispatch
+from tia.inf.experience import ExperienceRecorder
 from tia.inf.runtime import get_runtime
 from tia.inf.store import now_iso
 from tia.schemas.envelope import Envelope, ErrorCode
@@ -89,6 +90,8 @@ class Kernel:
     client: ToolClient = field(default_factory=lambda: LocalToolClient(profile="trigger"))
     trace: list[StepRecord] = field(default_factory=list)
     used: int = 0
+    slice_id: str | None = None
+    _recorder: ExperienceRecorder | None = None
 
     async def call(
         self,
@@ -125,6 +128,7 @@ class Kernel:
                     observed_at=now_iso(),
                 )
             )
+            self._record_call(tool, args, envelope)
             if strict:
                 raise ToolCallError(tool, envelope)
             return None
@@ -138,7 +142,30 @@ class Kernel:
             StepRecord(tool=tool, ok=True, cost_ms=envelope.cost_ms, evidence_ref=ref,
                        observed_at=now_iso())
         )
+        self._record_call(tool, args, envelope)
         return envelope.data
+
+    def _record_call(self, tool: str, args: dict[str, Any], envelope: Envelope) -> None:
+        """Persist arguments + a short gist; the raw return goes to a file, not to agents."""
+        if not self.case_id:
+            return
+        try:
+            if self._recorder is None:
+                self._recorder = ExperienceRecorder(get_runtime().store)
+            error = envelope.error.model_dump() if envelope.error else None
+            self._recorder.record(
+                case_id=self.case_id,
+                slice_id=self.slice_id,
+                agent=self.profile,
+                tool=tool,
+                arguments=args,
+                ok=envelope.ok,
+                cost_ms=envelope.cost_ms,
+                data=envelope.data,
+                error=error,
+            )
+        except Exception:  # noqa: BLE001 - tracing must never break a case
+            return
 
     # -- Evidence -------------------------------------------------------------
 

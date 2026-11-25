@@ -69,6 +69,9 @@ async def slice_next(arguments: dict[str, Any]) -> ToolOutput:
     if params.peek:
         # Planner view: ranked digests, nothing leased.
         candidates = store.peek_slices(params.limit, run_id=params.run_id)
+        for candidate in candidates:
+            # Recent attempts for the same slice: summaries only, never raw returns.
+            candidate["experience"] = store.slice_experience(str(candidate["slice_id"]), limit=6)
         return ToolOutput(
             data={
                 "found": bool(candidates),

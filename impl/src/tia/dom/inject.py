@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime as _dt
+import os
 import re
 import secrets
 import string
@@ -17,13 +18,21 @@ from urllib.parse import urlencode, urljoin
 
 from tia.ad.llm import LlmClient
 from tia.cap.domscan import Document, parse
-from tia.cap.entry import entry_field, resolve_values_with_guess
+from tia.cap.entry import (
+    EntryPlan,
+    entry_candidates,
+    entry_field,
+    resolve_values_with_guess,
+)
 from tia.dom.trigger import StageRecord
 from tia.inf.runtime import get_runtime
 from tia.orch.judge import judge_inject
 from tia.orch.kernel import Kernel, LocalToolClient, ToolCallError, ToolClient
 
 DEFAULT_PAYLOAD = "<script>alert(1)</script>"
+
+#: Verification attempts on the read page: bounded exploration, not one shot.
+VERIFY_ATTEMPTS = max(1, int(os.environ.get("TIA_VERIFY_ATTEMPTS", "4")))
 _TAG_RE = re.compile(r"<tia-([a-z0-9]{4})>")
 _POST_VAR_RE = re.compile(r"\$_POST\[\s*[\'\"]([A-Za-z_][\w]*)[\'\"]\s*\]")
 
@@ -154,10 +163,12 @@ async def run_inject(
     verify_url: str | None = None,
     verify_entry: dict[str, Any] | None = None,
     payload_constraints: dict[str, Any] | None = None,
+    slice_id: str | None = None,
 ) -> InjectResult:
     kernel = Kernel(
         profile="inject", budget=budget, client=client or LocalToolClient(profile="inject")
     )
+    kernel.slice_id = slice_id
     result = InjectResult(case_id="", verdict="ENV_ERROR")
     stages = result.stages
     notes = result.notes
@@ -431,10 +442,21 @@ async def run_inject(
             client=LlmClient.from_env(),
         )
         notes["read_entry_basis"] = entry_basis
-        attempt_values: list[dict[str, str]] = [entry_fields]
-        tag_only = {field.name: tag for field in entry_spec}
-        if tag_only and tag_only != entry_fields:
-            attempt_values.append(tag_only)
+        plan = EntryPlan(method=entry_method, fields=entry_spec, has_filter=True, mutating=False)
+        entry_candidates_list = await entry_candidates(
+            plan,
+            tag=tag,
+            row=written_row,
+            pk_columns=pk_columns,
+            context=text,
+            client=LlmClient.from_env(),
+            limit=VERIFY_ATTEMPTS,
+        )
+        attempt_values = [candidate.values for candidate in entry_candidates_list] or [entry_fields]
+        notes["verify_attempt_candidates"] = [
+            {"method": candidate.method, "confidence": candidate.confidence, "values": candidate.values}
+            for candidate in entry_candidates_list
+        ]
         verify: dict[str, Any] | None = None
         attempts: list[dict[str, Any]] = []
         for values in attempt_values:
@@ -535,12 +557,6 @@ async def _finish(kernel: Kernel, result: InjectResult, cleanup: bool = True) ->
         report = ""
     result.report = report
     result.trace = kernel.trace
-    if result.case_id:
-        with contextlib.suppress(ToolCallError):
-            await kernel.call(
-                "case_note",
-                {"case_id": result.case_id, "key": "verdict", "value": result.verdict},
-            )
     return result
 
 

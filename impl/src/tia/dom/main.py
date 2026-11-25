@@ -70,6 +70,7 @@ async def run_main(
             payload_base=payload_base,
             budget=min(budget, 40),
             client=trigger_client,
+            slice_id=sid,
         )
         notes: dict[str, Any] = {"trigger": trigger.verdict, "trigger_case": trigger.case_id}
         if trigger.verdict == "EXECUTED" and trigger.residue == 0:
@@ -79,6 +80,7 @@ async def run_main(
                 payload_base=payload_base,
                 budget=min(budget, 40),
                 client=inject_client,
+                slice_id=sid,
             )
             refs = [step.evidence_ref for step in inject.trace if step.evidence_ref]
             outcome = CaseOutcome(
@@ -160,6 +162,7 @@ async def run_injection_queue(
             payload_base=payload_base,
             budget=min(budget, 40),
             client=trigger_client,
+            slice_id=str(item["read_slice_id"]),
         )
         notes: dict[str, Any] = {
             "item": item["item_id"],
@@ -190,6 +193,7 @@ async def run_injection_queue(
                 budget=min(budget, 40),
                 client=inject_client,
                 pair_hints=[hint],
+                slice_id=str(item["write_slice_id"]),
             )
             inject_verdict = inject.verdict
             case_id = inject.case_id
@@ -332,6 +336,7 @@ async def run_queue(
             payload_base=payload_base,
             budget=min(budget, 40),
             client=trigger_client,
+            slice_id=sid,
         )
         notes: dict[str, Any] = {"trigger": trigger.verdict, "trigger_case": trigger.case_id}
         if pairs:
@@ -356,6 +361,7 @@ async def run_queue(
                 budget=min(budget, 40),
                 client=inject_client,
                 pair_hints=pairs,
+                slice_id=sid,
             )
             refs = [step.evidence_ref for step in inject.trace if step.evidence_ref]
             outcome = CaseOutcome(

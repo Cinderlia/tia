@@ -140,6 +140,23 @@ CREATE TABLE IF NOT EXISTS injection_queue (
     updated_at     TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_injection_run ON injection_queue (run_id, status, rank);
+CREATE TABLE IF NOT EXISTS tool_trace (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id     TEXT NOT NULL,
+    slice_id    TEXT,
+    agent       TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
+    tool        TEXT NOT NULL,
+    arguments   TEXT NOT NULL DEFAULT '{}',
+    ok          INTEGER NOT NULL DEFAULT 1,
+    cost_ms     INTEGER NOT NULL DEFAULT 0,
+    summary     TEXT NOT NULL DEFAULT '{}',
+    error_code  TEXT,
+    raw_path    TEXT NOT NULL DEFAULT '',
+    observed_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tool_trace_case ON tool_trace(case_id, seq);
+CREATE INDEX IF NOT EXISTS idx_tool_trace_slice ON tool_trace(slice_id, id);
 """
 
 
@@ -372,6 +389,95 @@ class Store:
                 ),
             )
         return seq
+
+    # -- tool trace / slice experience -------------------------------------
+
+    def add_tool_trace(
+        self,
+        *,
+        case_id: str,
+        slice_id: str | None,
+        agent: str,
+        tool: str,
+        arguments: dict[str, Any],
+        ok: bool,
+        cost_ms: int,
+        summary: dict[str, Any],
+        error_code: str | None,
+        observed_at: str,
+    ) -> int:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) AS s FROM tool_trace WHERE case_id=?", (case_id,)
+            ).fetchone()
+            seq = int(row["s"]) + 1
+            conn.execute(
+                "INSERT INTO tool_trace (case_id, slice_id, agent, seq, tool, arguments, ok,"
+                " cost_ms, summary, error_code, observed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    case_id,
+                    slice_id,
+                    agent,
+                    seq,
+                    tool,
+                    json.dumps(arguments, ensure_ascii=False),
+                    1 if ok else 0,
+                    cost_ms,
+                    json.dumps(summary, ensure_ascii=False),
+                    error_code,
+                    observed_at,
+                ),
+            )
+        return seq
+
+    def set_tool_trace_raw(self, *, case_id: str, seq: int, raw_path: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE tool_trace SET raw_path=? WHERE case_id=? AND seq=?", (raw_path, case_id, seq)
+            )
+
+    def list_tool_trace(
+        self,
+        *,
+        case_id: str | None = None,
+        slice_id: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM tool_trace WHERE 1=1"
+        params: list[Any] = []
+        if case_id:
+            query += " AND case_id=?"
+            params.append(case_id)
+        if slice_id:
+            query += " AND slice_id=?"
+            params.append(slice_id)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(max(1, min(limit, 500)))
+        with self._conn() as conn:
+            rows = conn.execute(query, params).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["arguments"] = json.loads(item["arguments"] or "{}")
+            item["summary"] = json.loads(item["summary"] or "{}")
+            item["ok"] = bool(item["ok"])
+            result.append(item)
+        return result
+
+    def slice_experience(self, slice_id: str, limit: int = 12) -> list[dict[str, Any]]:
+        """Summarised attempts for one slice, newest first; never the raw return."""
+        rows = self.list_tool_trace(slice_id=slice_id, limit=limit)
+        return [
+            {
+                "tool": row["tool"],
+                "agent": row["agent"],
+                "ok": row["ok"],
+                "summary": row["summary"],
+                "error": row["error_code"],
+                "at": row["observed_at"],
+            }
+            for row in rows
+        ]
 
     def add_flow(self, case_id: str, kind: str, body: dict[str, Any], code_ver: str = "") -> int:
         with self._conn() as conn:
