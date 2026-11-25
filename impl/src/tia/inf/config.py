@@ -1,7 +1,7 @@
-"""配置：profile yaml + 环境变量 + 路径。
+"""Config: profile yaml + env vars + paths.
 
-所有配置在进程启动时读一次，运行期不可变（对应 H12 / G3：身份与预算由启动参数决定）。
-路径与连接信息的默认值只服务于容器内开发环境，部署时全部走环境变量。
+All config is read once at process startup and is immutable at runtime (per H12 / G3: identity and budget are determined by startup parameters).
+Default values for paths and connection info serve only the in-container dev environment; all are overridden by env vars in deployment.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from typing import Any
 
 import yaml
 
-#: 本文件位于 ``impl/src/tia/inf/config.py``。
+#: This file is located at ``impl/src/tia/inf/config.py``.
 _IMPL_ROOT = Path(__file__).resolve().parents[3]
 
 
@@ -23,10 +23,10 @@ def _env(name: str, default: str = "") -> str:
 
 @dataclass(frozen=True, slots=True)
 class DbConfig:
-    """目标库连接信息。
+    """Target database connection info.
 
-    ``name`` 是用户填写的库名；账号按约定为 ``tia_<name>`` 且只授权该库
-    （``scripts/setup-db.sh`` 用 root 创建），因此 agent 即使写错 SQL 也碰不到别的库。
+    ``name`` is the user-provided database name; the account is conventionally ``tia_<name>`` and granted access only to that database
+    (created by root via ``scripts/setup-db.sh``), so the agent cannot access other databases even if it writes incorrect SQL.
     """
 
     host: str = "127.0.0.1"
@@ -52,7 +52,7 @@ class DbConfig:
 
 @dataclass(frozen=True, slots=True)
 class ProfileConfig:
-    """``impl/profiles/<profile>.yaml`` 的内容。"""
+    """Content of ``impl/profiles/<profile>.yaml``."""
 
     name: str
     write_allow_tables: frozenset[str] = frozenset()

@@ -88,7 +88,7 @@ class VerifyTagInput(BaseModel):
     params: dict[str, str] = Field(default_factory=dict)
     session_id: str | None = None
     tag: str
-    #: Optional: full payload. Required to judge "closed/carrying" issues that depend on injected content;
+    #: Optional: full payload. Required to judge issues like "closed/carrying" that depend on injected content;
     #: If only the 4-character tag is provided, a conservative judgment is applied (see _judge_executable).
     payload: str | None = None
     max_occurrences: int = Field(default=DEFAULT_MAX_OCCURRENCES, ge=1, le=MAX_OCCURRENCES_LIMIT)
@@ -143,7 +143,7 @@ class VerifyTagResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Hit scan
+# Hit scanning
 # ---------------------------------------------------------------------------
 
 
@@ -270,7 +270,7 @@ def _judge(
     is_html: bool,
     attr_value: str,
 ) -> tuple[bool, str, str]:
-    """Returns ``(executable, reason, confidence)``; defaults to False when uncertain."""
+    """Returns ``(executable, reason, confidence)``; defaults to False if uncertain."""
     kind = context.kind
     if not is_html:
         return False, "CONTENT_TYPE_PLAIN", "high"
@@ -502,7 +502,7 @@ def _fetch(input_: VerifyTagInput) -> tuple[str, str, dict[str, str], int]:
 
 
 async def verify_tag(arguments: dict[str, Any]) -> ToolOutput:
-    """MCP handler: parameter validation → fetch page (or offline HTML) → pure function decision."""
+    """MCP handler: parameter validation → fetch page (or offline HTML) → pure function evaluation."""
     try:
         input_ = VerifyTagInput.model_validate(arguments)
     except ValidationError as exc:

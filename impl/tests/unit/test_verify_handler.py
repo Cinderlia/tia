@@ -1,4 +1,4 @@
-"""`verify_tag` handler 层：参数错误必须回 BAD_ARGS 信封，而 main profile 仍不可见。"""
+"""`verify_tag` handler layer: parameter errors must return a BAD_ARGS envelope, while the main profile remains invisible."""
 
 from __future__ import annotations
 

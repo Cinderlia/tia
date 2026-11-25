@@ -1,8 +1,8 @@
-"""MySQL 适配器。
+"""MySQL adapter.
 
-职责仅限"把 SQL 发出去、把结果读回来"，不含任何业务判断。
-连接信息来自 :class:`tia.inf.config.DbConfig`；账号由 ``scripts/setup-db.sh``
-用 root 创建，只授权目标库的 SELECT/INSERT/UPDATE/DELETE。
+Responsibility is limited to "sending SQL and reading results back", with no business logic.
+Connection info comes from :class:`tia.inf.config.DbConfig`; the account is created by ``scripts/setup-db.sh``
+using root, with only SELECT/INSERT/UPDATE/DELETE privileges on the target database.
 """
 
 from __future__ import annotations
@@ -29,15 +29,15 @@ class MysqlAdapter:
     def __init__(self, config: DbConfig) -> None:
         self.config = config
 
-    # -- 连接 -------------------------------------------------------------
+    # -- Connection -------------------------------------------------------------
 
     def connect(self) -> pymysql.connections.Connection:
         if not self.config.configured:
             raise ToolError(
                 ErrorCode.ENV_ERROR,
-                "未配置目标库",
+                "Target database not configured",
                 retryable=False,
-                hint="设置 TIA_DB_NAME（用户填写的库名），或用 --db-name 传入",
+                hint="Set TIA_DB_NAME (user-provided database name), or pass --db-name",
             )
         try:
             return pymysql.connect(
@@ -55,12 +55,12 @@ class MysqlAdapter:
         except pymysql.MySQLError as exc:
             raise ToolError(
                 ErrorCode.ENV_ERROR,
-                f"连不上目标库: {exc}",
+                f"Cannot connect to target database: {exc}",
                 retryable=True,
-                hint="确认容器内 MariaDB 已启动、账号已由 scripts/setup-db.sh 创建",
+                hint="Ensure MariaDB is running in the container and the account has been created by scripts/setup-db.sh",
             ) from exc
 
-    # -- 读 ---------------------------------------------------------------
+    # -- Read ---------------------------------------------------------------
 
     def select(self, sql: str, params: tuple[Any, ...] | None = None) -> QueryResult:
         started = time.perf_counter()
@@ -78,7 +78,7 @@ class MysqlAdapter:
             return None
         return next(iter(result.rows[0].values()))
 
-    # -- 表结构 -----------------------------------------------------------
+    # -- Table Schema -----------------------------------------------------------
 
     def table_schema(self, tables: list[str]) -> list[dict[str, Any]]:
         if not tables:
@@ -188,7 +188,7 @@ class MysqlAdapter:
 
 def quote_ident(name: str) -> str:
     if not name or not all(ch.isalnum() or ch in "_$" for ch in name):
-        raise ToolError(ErrorCode.BAD_ARGS, f"非法标识符: {name!r}")
+        raise ToolError(ErrorCode.BAD_ARGS, f"Invalid identifier: {name!r}")
     return f"`{name}`"
 
 

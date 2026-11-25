@@ -1,9 +1,9 @@
-"""数据与探针层：db_schema / db_read / db_write / db_undo。
+"""Data and probe layer: db_schema / db_read / db_write / db_undo.
 
-三条硬规则在这里落实：
-- 只经应用写入的目标列，不允许本工具写（调用方用 WriteTarget 声明允许列）；
-- 每次写都返回 ``change_id`` + ``undo_sql``，并落 change 表（H4）；
-- ``db_undo`` 必须能给出 ``residue``，agent 报告里引用该数字。
+Three hard rules are enforced here:
+- Target columns written only via the application are not writable by this tool (caller declares allowed columns via WriteTarget);
+- Every write returns ``change_id`` + ``undo_sql`` and persists to the change table (H4);
+- ``db_undo`` must provide ``residue``, which is referenced in agent reports.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ def _validate(model: type[BaseModel], arguments: dict[str, Any]) -> Any:
     try:
         return model.model_validate(arguments)
     except ValidationError as exc:
-        raise _bad(f"参数不合法: {exc.errors()[0]['msg']}") from exc
+        raise _bad(f"Invalid parameters: {exc.errors()[0]['msg']}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -67,13 +67,13 @@ async def db_schema(arguments: dict[str, Any]) -> ToolOutput:
         )
         tables = [str(r["TABLE_NAME"]) for r in rows.rows]
         if not tables:
-            raise ToolError(ErrorCode.NOT_FOUND, f"没有匹配 {params.like!r} 的表")
+            raise ToolError(ErrorCode.NOT_FOUND, f"No table matching {params.like!r}")
     else:
-        raise _bad("table 与 like 至少要给一个")
+        raise _bad("At least one of table or like must be provided")
 
     schema = adapter.table_schema(tables)
     if not schema and params.table:
-        raise ToolError(ErrorCode.NOT_FOUND, f"表不存在: {params.table}")
+        raise ToolError(ErrorCode.NOT_FOUND, f"Table does not exist: {params.table}")
     for entry in schema:
         if "columns" not in params.include:
             entry.pop("columns", None)
@@ -119,9 +119,9 @@ async def db_read(arguments: dict[str, Any]) -> ToolOutput:
     if encoded > params.max_bytes:
         raise ToolError(
             ErrorCode.TRUNCATED,
-            f"结果 {encoded} 字节超过 max_bytes={params.max_bytes}",
+            f"Result {encoded} bytes exceeds max_bytes={params.max_bytes}",
             retryable=True,
-            hint="缩小列、加 WHERE 或降低 limit",
+            hint="Reduce columns, add WHERE clause, or lower limit",
         )
     data = {
         "columns": result.columns,
@@ -255,8 +255,8 @@ async def db_write(arguments: dict[str, Any]) -> ToolOutput:
     if statement.op in {"update", "delete"} and not pk:
         raise ToolError(
             ErrorCode.UNSUPPORTED,
-            f"表 {statement.table} 没有主键，无法生成可验证的 undo",
-            hint="选择带主键的目标表，或改用 INSERT（用自增主键回滚）",
+            f"Table {statement.table} has no primary key; cannot generate verifiable undo",
+            hint="Select a target table with a primary key, or use INSERT (rollback via auto-increment PK)",
         )
 
     conn = adapter.connect()
@@ -314,16 +314,16 @@ async def db_write(arguments: dict[str, Any]) -> ToolOutput:
     if params.expect_affected is not None and affected != params.expect_affected:
         raise ToolError(
             ErrorCode.CONFLICT,
-            f"affected={affected} 与 expect_affected={params.expect_affected} 不符（change_id={change_id} 已记录）",
+            f"affected={affected} does not match expect_affected={params.expect_affected} (change_id={change_id} recorded)",
             retryable=False,
-            hint="change 已落库，可用 db_undo 按 case 回滚",
+            hint="Change persisted; use db_undo to rollback by case",
         )
     if affected > 1 and not params.allow_multi:
         raise ToolError(
             ErrorCode.CONFLICT,
-            f"affected={affected} > 1（change_id={change_id} 已记录）",
+            f"affected={affected} > 1 (change_id={change_id} recorded)",
             retryable=False,
-            hint="影响多行需显式 allow_multi；回滚仍可用 db_undo",
+            hint="Multi-row impact requires explicit allow_multi; rollback still available via db_undo",
         )
 
     return ToolOutput(
@@ -358,7 +358,7 @@ class DbUndoInput(BaseModel):
 
 
 def _load_change(change: dict[str, Any]) -> dict[str, Any]:
-    """sqlite 里 before/after image 存的是 JSON 文本，用前先还原。"""
+    """In sqlite, before/after images are stored as JSON text; deserialize before use."""
     out = dict(change)
     for key in ("before_image", "after_image"):
         value = out.get(key)
@@ -372,7 +372,7 @@ def _split_sql(script: str) -> list[str]:
 
 
 def _residue(adapter: MysqlAdapter, change: dict[str, Any]) -> int:
-    """回滚后仍与 before_image 不符的行数。"""
+    """Number of rows still mismatching before_image after rollback."""
     table = str(change["table_name"])
     before = change["before_image"]
     after = change["after_image"]
@@ -401,18 +401,18 @@ async def db_undo(arguments: dict[str, Any]) -> ToolOutput:
     params = _validate(DbUndoInput, arguments)
     rt = get_runtime()
     if not params.change_id and not params.case_id:
-        raise _bad("change_id 与 case_id 至少要给一个")
+        raise _bad("At least one of change_id or case_id must be provided")
 
     changes: list[dict[str, Any]] = []
     if params.change_id:
         change = rt.store.get_change(params.change_id)
         if change is None:
-            raise ToolError(ErrorCode.NOT_FOUND, f"change 不存在: {params.change_id}")
+            raise ToolError(ErrorCode.NOT_FOUND, f"change not found: {params.change_id}")
         if change["agent"] != rt.settings.profile.name:
             raise ToolError(
                 ErrorCode.POLICY_DENIED,
-                "只能回滚本 profile 命名空间内的 change",
-                hint=f"该 change 属于 {change['agent']}",
+                "can only roll back changes within the current profile namespace",
+                hint=f"this change belongs to {change['agent']}",
             )
         changes = [change]
     else:
@@ -439,7 +439,7 @@ async def db_undo(arguments: dict[str, Any]) -> ToolOutput:
                 conn.commit()
             finally:
                 conn.close()
-        except Exception as exc:  # noqa: BLE001 - 回滚失败要如实记录，不能中断整个收尾
+        except Exception as exc:  # noqa: BLE001 - rollback failures must be logged accurately, do not interrupt the entire finalization
             reverted.append({"change_id": change["id"], "ok": False, "error": str(exc)})
             continue
         if ok:

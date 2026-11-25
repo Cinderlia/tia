@@ -1,4 +1,4 @@
-# ---- 设计资料与本机工作区：不入版本库 ----
+# ---- Design docs and local workspace: not in version control ----
 tia-design-kit/
 dsh-workdir/
 
@@ -17,7 +17,7 @@ venv/
 env/
 .python-version
 
-# ---- 测试与类型检查 ----
+# ---- Testing and type checking ----
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -27,7 +27,7 @@ coverage.xml
 htmlcov/
 .hypothesis/
 
-# ---- 运行时产物 ----
+# ---- Runtime artifacts ----
 impl/var/
 *.log
 logs/
@@ -38,7 +38,7 @@ out/
 tmp/
 !docs/**/tmp/
 
-# ---- 本地配置与密钥 ----
+# ---- Local config and secrets ----
 .env
 .env.*
 !.env.example
@@ -47,7 +47,7 @@ tmp/
 profiles.local.yaml
 secrets.yaml
 
-# ---- 编辑器 / 系统 ----
+# ---- Editor / system ----
 .idea/
 .vscode/
 *.swp
@@ -55,6 +55,6 @@ secrets.yaml
 .DS_Store
 Thumbs.db
 
-# ---- 采集器编译产物 ----
+# ---- Collector build artifacts ----
 impl/probe-php/vendor/
 *.phar

@@ -1,7 +1,7 @@
-"""源码与入口：source_read / source_grep。
+"""Source and entry: source_read / source_grep.
 
-轻量词法标记（``in_string`` / ``in_comment``）只做"这一行大概在什么状态"的提示，
-不是解析器；拿不准时宁可给 false，也不输出误导性的 true。
+Lightweight lexical markers (``in_string`` / ``in_comment``) only hint at "the approximate state of this line",
+not a parser; when uncertain, prefer returning false over outputting a misleading true.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ def _validate(model: type[BaseModel], arguments: dict[str, Any]) -> Any:
     try:
         return model.model_validate(arguments)
     except ValidationError as exc:
-        raise _bad(f"参数不合法: {exc.errors()[0]['msg']}") from exc
+        raise _bad(f"Invalid parameter: {exc.errors()[0]['msg']}") from exc
 
 
 class SourceReadInput(BaseModel):
@@ -50,7 +50,7 @@ class SourceGrepInput(BaseModel):
 
 
 def _scan_states(lines: list[tuple[int, str]]) -> list[dict[str, Any]]:
-    """逐行给出 in_comment / in_string（简化 PHP 词法）。"""
+    """Provide in_comment / in_string per line (simplified PHP lexical analysis)."""
     in_block_comment = False
     quote: str | None = None
     result: list[dict[str, Any]] = []
@@ -106,11 +106,11 @@ async def source_read(arguments: dict[str, Any]) -> ToolOutput:
         line_from = params.line_from
         line_to = params.line_to
         if line_from is None or line_to is None:
-            raise _bad("需要 line_from/line_to 或 around")
+            raise _bad("line_from/line_to or around is required")
         if line_to < line_from:
-            raise _bad("line_to 必须 >= line_from")
+            raise _bad("line_to must be >= line_from")
     if line_to - line_from + 1 > MAX_LINES:
-        raise _bad(f"区间超过 {MAX_LINES} 行", "用 around 或缩小范围")
+        raise _bad(f"Range exceeds {MAX_LINES} lines", "use around or narrow the range")
 
     from tia.ad.fs import FsAdapter
 

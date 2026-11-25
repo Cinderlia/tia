@@ -1,10 +1,10 @@
-"""触发 agent 主流程（P0–P6）。
+"""Trigger the agent main flow (P0–P6).
 
-P0 建案 → P1 定位读点与入口 → P2 读点可达 → P3 备数据 → P4 写入 payload
-→ P5 verify_tag 取证 → P6 回滚 + 报告。
+P0 Create case → P1 Locate read points and entry → P2 Read point reachable → P3 Prepare data → P4 Write payload
+→ P5 verify_tag forensics → P6 Rollback + report.
 
-本实现用"确定性规划器"代替 LLM planner：每一步的决策规则写在这里，
-LLM 只影响"下一步做什么"，不影响"工具返回什么"。等主流程稳定后再接 planner。
+This implementation uses a "deterministic planner" instead of an LLM planner: decision rules for each step are defined here;
+the LLM only affects "what to do next", not "what the tool returns". Integrate the planner once the main flow is stable.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ class TriggerResult:
 
 
 def normalize_slice(raw: dict[str, Any]) -> dict[str, Any]:
-    """把 navi 的 sink/slice JSON 归一成 Slice 形态（sink 统一为 dict）。"""
+    """Normalize navi sink/slice JSON into Slice form (sink unified as dict)."""
     doc = dict(raw)
     sink: Any = doc.get("sink")
     if isinstance(sink, dict) and "file" in sink and "line" in sink:
@@ -112,13 +112,13 @@ async def run_trigger(
         profile="trigger", budget=budget, client=client or LocalToolClient(profile="trigger")
     )
 
-    # P0 建案 ------------------------------------------------------------
+    # P0 Create case ------------------------------------------------------------
     opened = await kernel.call("case_open", {"slice": slice_doc, "agent": "trigger", "write_targets": []})
     case_id = str(opened["case_id"])
     kernel.case_id = case_id
     stages.append(StageRecord("P0", True, f"case_id={case_id}"))
 
-    # P1 定位读点与入口 ---------------------------------------------------
+    # P1 Locate read points and entry ---------------------------------------------------
     source = await kernel.call("source_read", {"file": sink_file, "around": {"line": sink_line, "n": 40}})
     source_text = "\n".join(str(line["text"]) for line in source["lines"])
     notes["source_sha256"] = source["sha256"]
@@ -126,7 +126,7 @@ async def run_trigger(
     table = inferred["table"]
     columns = inferred["insert_columns"]
     if not table:
-        stages.append(StageRecord("P1", False, "未能从源码推断目标表"))
+        stages.append(StageRecord("P1", False, "Failed to infer target table from source code"))
         return TriggerResult(case_id=case_id, verdict="SQL_ERROR", residue=None,
                              report=await kernel.report(), stages=stages, notes=notes,
                              trace=kernel.trace)
@@ -142,7 +142,7 @@ async def run_trigger(
     await kernel.call("case_note", {"case_id": case_id, "key": "write_targets", "value": targets})
     stages.append(StageRecord("P1", True, f"table={table} columns={columns} post_vars={post_vars}"))
 
-    # P2 读点可达（本环境暂无 PHP 探针，用 HTTP + schema 作为降级证据） ----
+    # P2 Read point reachable (no PHP probe in this environment; using HTTP + schema as fallback evidence) ----
     page = await kernel.call("http_request", {"method": "GET", "url": base_url})
     body = str(page.get("body", ""))
     status = int(page.get("status", 0))
@@ -158,22 +158,22 @@ async def run_trigger(
         }
     )
     if status >= 400:
-        stages.append(StageRecord("P2", False, f"页面返回 {status}"))
+        stages.append(StageRecord("P2", False, f"Page returned {status}"))
         return TriggerResult(case_id=case_id, verdict="READ_EMPTY", residue=None,
                              report=await kernel.report(), stages=stages, notes=notes,
                              trace=kernel.trace)
-    stages.append(StageRecord("P2", True, f"HTTP {status}，表单字段 {form_fields}"))
+    stages.append(StageRecord("P2", True, f"HTTP {status}, form fields {form_fields}"))
 
-    # P3 备数据 ----------------------------------------------------------
+    # P3 Prepare data ----------------------------------------------------------
     schema = await kernel.call("db_schema", {"table": table})
     table_meta = schema["tables"][0]
     notes["table_meta"] = {
         "columns": [c["name"] for c in table_meta["columns"]],
         "primary_key": table_meta.get("primary_key", []),
     }
-    stages.append(StageRecord("P3", True, f"表 {table} 共 {len(table_meta['columns'])} 列"))
+    stages.append(StageRecord("P3", True, f"Table {table} has {len(table_meta['columns'])} columns"))
 
-    # P4 设计并写入 payload ----------------------------------------------
+    # P4 Design and write payload ----------------------------------------------
     tag = _tag()
     payload = f"{payload_base}{tag}"
     value_columns = columns or [c["name"] for c in table_meta["columns"] if c["name"] not in table_meta.get("primary_key", [])]
@@ -193,10 +193,10 @@ async def run_trigger(
         db_error = f"{exc.code.value}: {exc.message}"
         notes["db_error"] = db_error
     stages.append(
-        StageRecord("P4", db_error is None, "写入成功" if db_error is None else f"写入失败: {db_error}")
+        StageRecord("P4", db_error is None, "Write successful" if db_error is None else f"Write failed: {db_error}")
     )
 
-    # P5 verify_tag 取证 --------------------------------------------------
+    # P5 verify_tag forensics --------------------------------------------------
     verify: dict[str, Any] | None = None
     if db_error is None:
         try:
@@ -222,7 +222,7 @@ async def run_trigger(
     )
     notes["explanation"] = explanation
 
-    # P6 回滚 + 报告 ------------------------------------------------------
+    # P6 Rollback + report ------------------------------------------------------
     residue: int | None = None
     try:
         undo = await kernel.call("db_undo", {"case_id": case_id})
@@ -234,7 +234,7 @@ async def run_trigger(
 
     rt.store.set_case_verdict(case_id, str(verdict), ceiling="EXECUTABLE")
     report = await kernel.report()
-    stages.append(StageRecord("P6", True, "报告已生成"))
+    stages.append(StageRecord("P6", True, "Report generated"))
     notes["observed_at"] = now_iso()
     return TriggerResult(
         case_id=case_id,

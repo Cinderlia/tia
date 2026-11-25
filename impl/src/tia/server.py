@@ -1,7 +1,7 @@
-"""MCP 能力服务（stdio）。
+"""MCP capability service (stdio).
 
-一个进程只服务一个 profile：profile 在构造时确定，运行期不可变（H12 / 闸门 G3）。
-main profile 只下发 14 个情报类工具；trigger / inject 下发全部 36 个。
+One process serves one profile: the profile is fixed at construction and immutable at runtime (H12 / Gate G3).
+The main profile exposes only 14 intelligence tools; trigger / inject expose all 36.
 """
 
 from __future__ import annotations
@@ -20,9 +20,9 @@ from tia.cap import registry
 from tia.schemas.envelope import as_json_value
 
 _INSTRUCTIONS = (
-    "TIA 能力服务。所有工具返回统一信封：成功 {ok:true, data, evidence_refs, ...}；"
-    "失败 {ok:false, error:{code, message, retryable, hint}}。"
-    "verify_tag 只回事实，不返回安全结论。"
+    "TIA capability service. All tools return a unified envelope: success {ok:true, data, evidence_refs, ...}; "
+    "failure {ok:false, error:{code, message, retryable, hint}}. "
+    "verify_tag returns facts only, not security conclusions. "
 )
 
 
@@ -38,7 +38,7 @@ def _tool_definitions(profile: str) -> list[types.Tool]:
 
 
 def build_server(profile: str) -> Server:
-    """构造一个绑定到 ``profile`` 的低层 MCP Server。"""
+    """Construct a low-level MCP Server bound to ``profile``."""
     if profile not in registry.PROFILES:
         raise ValueError(f"unknown profile: {profile}")
 
@@ -82,13 +82,13 @@ async def serve(profile: str) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tia-server",
-        description="TIA 共享能力服务（MCP stdio）",
+        description="TIA shared capability service (MCP stdio)",
     )
     parser.add_argument(
         "--profile",
         choices=registry.PROFILES,
         required=True,
-        help="能力集合：main（只读情报）/ trigger / inject",
+        help="Capability sets: main (read-only intelligence) / trigger / inject",
     )
     parser.add_argument("--version", action="version", version=f"tia-server {__version__}")
     return parser

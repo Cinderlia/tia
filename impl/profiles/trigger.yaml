@@ -1,7 +1,7 @@
 profile: trigger
-# 写库白名单：留空 = 只能写 case_open/case_note 登记过的表（默认最严）。
+# Write whitelist: empty = only tables registered in case_open/case_note are writable (default strictest).
 write_allow_tables: []
-# 这些列任何情况下都不许写（密码、令牌类）。
+# These columns must never be written under any circumstances (passwords, tokens, etc.).
 write_deny_columns:
   - password
   - passwd

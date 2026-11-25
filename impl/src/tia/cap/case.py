@@ -1,7 +1,7 @@
-"""控制层：case_open / case_note / case_report。
+"""Control layer: case_open / case_note / case_report.
 
-case 是 agent 的"案卷"：切片、写目标、笔记、证据、change 都挂在 case 上。
-报告只允许引用 ``evidence_refs``（H5：不要让模型自由发挥结论）。
+A case is the agent's "dossier": slices, goals, notes, evidence, and changes are all attached to the case.
+Reports may only reference ``evidence_refs`` (H5: do not let the model freely conclude).
 """
 
 from __future__ import annotations
@@ -27,11 +27,11 @@ def _validate(model: type[BaseModel], arguments: dict[str, Any]) -> Any:
     try:
         return model.model_validate(arguments)
     except ValidationError as exc:
-        raise _bad(f"参数不合法: {exc.errors()[0]['msg']}") from exc
+        raise _bad(f"Invalid parameter: {exc.errors()[0]['msg']}") from exc
 
 
 def parse_sink(sink: Any) -> tuple[str, int, str]:
-    """把 sink 的三种写法归一成 (file, line, code)。"""
+    """Normalize the three sink formats into (file, line, code)."""
     if isinstance(sink, dict):
         return str(sink.get("file", "")), int(sink.get("line", 0)), str(sink.get("code", ""))
     text = str(sink)
@@ -59,12 +59,12 @@ async def case_open(arguments: dict[str, Any]) -> ToolOutput:
     params = _validate(CaseOpenInput, arguments)
     rt = get_runtime()
     if not params.slice.get("sink"):
-        raise _bad("slice.sink 不能为空")
+        raise _bad("slice.sink cannot be empty")
     file, line, _ = parse_sink(params.slice.get("sink"))
     case_id = rt.store.open_case(params.agent, params.slice, params.write_targets)
     open_questions: list[str] = []
     if not file or not line:
-        open_questions.append("slice.sink 缺少 file:line")
+        open_questions.append("slice.sink missing file:line")
     return ToolOutput(
         data={
             "case_id": case_id,
@@ -87,11 +87,11 @@ async def case_note(arguments: dict[str, Any]) -> ToolOutput:
     params = _validate(CaseNoteInput, arguments)
     rt = get_runtime()
     if params.key not in NOTE_KEYS:
-        raise _bad(f"key {params.key!r} 不在白名单", f"允许: {sorted(NOTE_KEYS)}")
+        raise _bad(f"key {params.key!r} not in whitelist", f"Allowed: {sorted(NOTE_KEYS)}")
     try:
         revision = rt.store.add_note(params.case_id, params.key, params.value)
     except KeyError as exc:
-        raise ToolError(ErrorCode.NOT_FOUND, f"case 不存在: {params.case_id}") from exc
+        raise ToolError(ErrorCode.NOT_FOUND, f"case not found: {params.case_id}") from exc
     return ToolOutput(data={"ok": True, "revision": revision})
 
 
@@ -107,7 +107,7 @@ async def case_report(arguments: dict[str, Any]) -> ToolOutput:
     rt = get_runtime()
     case = rt.store.get_case(params.case_id)
     if case is None:
-        raise ToolError(ErrorCode.NOT_FOUND, f"case 不存在: {params.case_id}")
+        raise ToolError(ErrorCode.NOT_FOUND, f"case not found: {params.case_id}")
 
     evidence = rt.store.list_evidence(params.case_id)
     changes = rt.store.list_changes(params.case_id)
@@ -123,27 +123,27 @@ async def case_report(arguments: dict[str, Any]) -> ToolOutput:
         f"# case {params.case_id}",
         "",
         f"- agent: `{case['agent']}`",
-        f"- verdict: `{case['verdict'] or '未判定'}`",
-        f"- 读点: `{sink_file}:{sink_line}`",
+        f"- verdict: `{case['verdict'] or 'undetermined'}`",
+        f"- read point: `{sink_file}:{sink_line}`",
         f"- sink kind: `{slice_doc.get('kind', '')}`",
-        f"- 创建时间: {case['created_at']}",
+        f"- created at: {case['created_at']}",
     ]
     if sink_code:
         lines.append(f"- sink code: `{sink_code}`")
     lines.append("")
 
-    lines.append("## 证据")
+    lines.append("## Evidence")
     if evidence:
         for row in evidence:
             lines.append(f"- `{row['ref']}` — {row['tool']}（{row['observed_at']}）")
     else:
-        lines.append("- 无（本 case 没有任何证据引用）")
+        lines.append("- None (no evidence references in this case)")
     lines.append("")
 
     if changes:
-        lines.append("## 写库与回滚")
+        lines.append("## Write and Rollback")
         for change in changes:
-            state = "已回滚" if change["reverted"] else "未回滚"
+            state = "reverted" if change["reverted"] else "not reverted"
             lines.append(
                 f"- `{change['id']}` {change['op'].upper()} `{change['table_name']}`"
                 f" affected={change['affected']} {state}"
@@ -153,14 +153,14 @@ async def case_report(arguments: dict[str, Any]) -> ToolOutput:
         lines.append("")
 
     if notes:
-        lines.append("## 备注")
+        lines.append("## Notes")
         for key, value in notes.items():
             lines.append(f"- {key}: `{json.dumps(value, ensure_ascii=False, default=str)[:500]}`")
         lines.append("")
 
     warnings: list[str] = []
     if not evidence:
-        warnings.append("NO_EVIDENCE:报告无法只靠 evidence_refs 重建")
+        warnings.append("NO_EVIDENCE: report cannot be reconstructed from evidence_refs alone")
     refs = [row["ref"] for row in evidence]
     markdown = "\n".join(lines).strip() + "\n"
     return ToolOutput(

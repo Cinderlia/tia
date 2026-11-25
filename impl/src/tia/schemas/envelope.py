@@ -1,11 +1,11 @@
-"""统一信封与错误码。
+"""Unified envelope and error codes.
 
-工具层只返回这两种形态，不向调用方抛异常：
+The tool layer returns only these two forms and does not raise exceptions to callers:
 
-* 成功：``{"ok": true, "tool": "...", "data": {...}, "evidence_refs": [...], ...}``
-* 失败：``{"ok": false, "tool": "...", "error": {"code": "...", ...}}``
+* Success: ``{"ok": true, "tool": "...", "data": {...}, "evidence_refs": [...], ...}``
+* Failure: ``{"ok": false, "tool": "...", "error": {"code": "...", ...}}``
 
-错误码是闭集；新增错误码必须先改设计文档。
+Error codes form a closed set; new codes require updating the design document first.
 """
 
 from __future__ import annotations
@@ -15,14 +15,14 @@ from typing import Any, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field
 
-#: 信封 data 只允许 JSON 结构；深层元素交给各工具自己的 pydantic 模型。
-#: 注意：这里刻意不用递归别名——pydantic 2.14 对隐式递归别名会在建 schema 时爆栈，
-#: 而 PEP 695 的 ``type`` 语法要求 Python 3.12+（本项目下限 3.11）。
+#: Envelope data allows only JSON structures; deep elements are handled by each tool's own pydantic models.
+#: Note: Recursive aliases are intentionally avoided—pydantic 2.14 causes stack overflow with implicit recursive aliases during schema construction,
+#: and PEP 695's ``type`` syntax requires Python 3.12+ (project minimum is 3.11).
 JsonValue: TypeAlias = dict[str, Any] | list[Any] | str | int | float | bool | None
 
 
 class ErrorCode(StrEnum):
-    """错误码闭集（H9）。"""
+    """Closed set of error codes (H9)."""
 
     BAD_ARGS = "BAD_ARGS"
     NOT_FOUND = "NOT_FOUND"
@@ -48,7 +48,7 @@ class ErrorBody(BaseModel):
 
 
 class Envelope(BaseModel):
-    """工具调用的统一返回。"""
+    """Unified return type for tool calls."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -105,7 +105,7 @@ class Envelope(BaseModel):
 
 
 class ToolError(Exception):
-    """handler 内部用于表达业务失败；由 registry 统一转信封。"""
+    """Internal to handlers for expressing business failures; converted to envelope by the registry."""
 
     def __init__(
         self,
@@ -130,8 +130,8 @@ class ToolError(Exception):
         )
 
 
-def as_json_value(value: Any) -> JsonValue:  # noqa: ANN401 - 边界归一化
-    """把 handler 的返回值收敛成 JSON 可序列化结构。"""
+def as_json_value(value: Any) -> JsonValue:  # noqa: ANN401 - boundary normalization
+    """Converges handler return values into JSON-serializable structures."""
     if isinstance(value, BaseModel):
         return as_json_value(value.model_dump(mode="json"))
     if isinstance(value, dict):

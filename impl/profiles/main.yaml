@@ -1,5 +1,5 @@
 profile: main
-# 主 agent 不写库（G1 不注册 db_write），这里留空仅为配置完整性。
+# The main agent does not write to the database (G1 does not register db_write); this is left empty only for configuration completeness.
 write_allow_tables: []
 write_deny_columns: []
 max_rows_per_write: 0

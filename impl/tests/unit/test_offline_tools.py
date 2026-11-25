@@ -1,6 +1,6 @@
-"""离线工具（form_parse/context_classify/budget_solve/trace_diff/flow_lookup/artifact_save）。
+"""Offline tools (form_parse/context_classify/budget_solve/trace_diff/flow_lookup/artifact_save).
 
-这些工具不碰网络、不碰目标库，测试也完全离线；同时覆盖"输入是数据不是命令"的边界。
+These tools do not touch the network or the target database, and tests are fully offline; they also cover the boundary where "input is data, not commands."
 """
 
 from __future__ import annotations

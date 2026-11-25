@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# 用 root（容器内默认空密码）为目标库建一个只读/写单库的账号。
-# 用法：./scripts/setup-db.sh xvwa
-# 产物：账号 tia_<db>，只授予该库 SELECT/INSERT/UPDATE/DELETE。
+# Create a read-only/write single-database account for the target DB using root (default empty password in container).
+# Usage: ./scripts/setup-db.sh xvwa
+# Output: Account tia_<db>, granted SELECT/INSERT/UPDATE/DELETE on that DB only.
 set -euo pipefail
 
-DB="${1:?用法: setup-db.sh <数据库名>}"
+DB="${1:?Usage: setup-db.sh <database_name>}"
 APP_USER="tia_${DB}"
 APP_PASS="${TIA_DB_PASSWORD:-tia-dev-pass}"
 ROOT_PASS="${TIA_ROOT_PASSWORD:-}"
@@ -21,5 +21,5 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON \`${DB}\`.* TO '${APP_USER}'@'127.0.0.1'
 FLUSH PRIVILEGES;
 SQL
 
-echo "已创建 ${APP_USER}（只授权 ${DB}.* 的 SELECT/INSERT/UPDATE/DELETE）"
-echo "使用：export TIA_DB_NAME=${DB} TIA_DB_USER=${APP_USER} TIA_DB_PASSWORD=${APP_PASS}"
+echo "Created ${APP_USER} (granted SELECT/INSERT/UPDATE/DELETE on ${DB}.* only)"
+echo "Usage: export TIA_DB_NAME=${DB} TIA_DB_USER=${APP_USER} TIA_DB_PASSWORD=${APP_PASS}"

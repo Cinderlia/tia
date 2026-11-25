@@ -1,7 +1,7 @@
-"""HTTP 适配器：显式 Cookie、默认不跟随重定向、有界 body。
+"""HTTP adapter: explicit cookies, no redirect following by default, bounded body.
 
-跟随重定向时由本适配器手动逐跳请求并记录 ``redirect_chain``（H10 需要的是
-"到底被带到了哪里"，而不是 httpx 的隐式行为）。
+When following redirects, this adapter manually requests hop-by-hop and records ``redirect_chain`` (H10 requires
+"where it ultimately landed", not httpx's implicit behavior).
 """
 
 from __future__ import annotations
@@ -87,14 +87,14 @@ class HttpClient:
         except httpx.HTTPError as exc:
             raise ToolError(
                 ErrorCode.ENV_ERROR,
-                f"HTTP 请求失败: {type(exc).__name__}: {exc}",
+                f"HTTP request failed: {type(exc).__name__}: {exc}",
                 retryable=True,
-                hint="确认目标服务可达（容器内用 127.0.0.1）",
+                hint="Verify target service is reachable (use 127.0.0.1 inside container)",
             ) from exc
         raise ToolError(
             ErrorCode.RATE_LIMITED,
-            f"超过 {max_redirects} 次重定向",
-            hint="检查登录跳转或 base_url 是否正确",
+            f"Exceeded {max_redirects} redirects",
+            hint="Check login redirect or base_url correctness",
         )
 
 

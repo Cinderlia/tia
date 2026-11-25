@@ -1,4 +1,4 @@
-"""信封的字段契约（T03 的骨架，后续逐工具补全）。"""
+"""Field contract for the envelope (T03 skeleton, to be completed per tool)."""
 
 from __future__ import annotations
 
@@ -59,10 +59,10 @@ def test_error_codes_are_closed_set() -> None:
 
 def test_tool_error_to_body() -> None:
     body = ToolError(
-        ErrorCode.BAD_ARGS, "missing tag", retryable=False, hint="提供 tag"
+        ErrorCode.BAD_ARGS, "missing tag", retryable=False, hint="provide tag"
     ).to_body()
     assert body.code is ErrorCode.BAD_ARGS
-    assert body.hint == "提供 tag"
+    assert body.hint == "provide tag"
 
 
 def test_as_json_value_normalizes_nested_models() -> None:

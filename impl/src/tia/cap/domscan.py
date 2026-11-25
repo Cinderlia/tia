@@ -1,13 +1,13 @@
-"""轻量 HTML 结构扫描（纯函数，无网络）。
+"""Lightweight HTML structure scan (pure function, no network).
 
-只做 `verify_tag` / `context_classify` 需要的那部分：
+Only implements what `verify_tag` / `context_classify` require:
 
-* 元素树与兄弟顺序（用于 ``node_path``）；
-* 原始偏移 -> 所在元素 / 属性 / 注释；
-* 文本、属性值、``<script>``、``<textarea>`` 等上下文判定。
+* Element tree and sibling order (for ``node_path``);
+* Raw offset -> containing element / attribute / comment;
+* Context determination for text, attribute values, ``<script>``, ``<textarea>``, etc.
 
-刻意不实现完整 HTML5 解析——不纠正畸形结构，不做实体解码；
-解码在 verify 的规则层按需做，避免两处不一致。
+Deliberately avoids full HTML5 parsing—no malformed structure correction, no entity decoding;
+Decoding is done on-demand in the verify rule layer to avoid inconsistencies.
 """
 
 from __future__ import annotations
@@ -55,7 +55,7 @@ class Attr:
     name: str
     value: str
     quote: str  # "double" | "single" | "none"
-    start: int  # 值在原文中的起点
+    start: int  # Start position of the value in the original text
     end: int
 
 
@@ -100,7 +100,7 @@ class Document:
     _starts: list[int] = field(default_factory=list)
 
     def segment_at(self, pos: int) -> Segment | None:
-        """返回包含 ``pos`` 的最内层片段；越界返回 None。"""
+        """Returns the innermost fragment containing ``pos``; returns None if out of bounds."""
         idx = bisect_right(self._starts, pos) - 1
         if idx < 0:
             return None
@@ -115,7 +115,7 @@ class Document:
             return None
         if segment.node is not None:
             return segment.node
-        # 文本/属性片段之间（标签内部）落点时，退回最近一个已开启的元素。
+        # When the landing point is between text/attribute fragments (inside a tag), fall back to the nearest opened element.
         best: Node | None = None
         for node in self.nodes:
             if node.start <= pos < node.end and (best is None or node.start >= best.start):
@@ -154,7 +154,7 @@ def _flush_text(
 
 
 def parse(html: str) -> Document:
-    """把 HTML 扫成元素树 + 片段表。畸形输入不报错，按遇到的结构尽力而为。"""
+    """Scans HTML into an element tree + fragment table. Malformed input does not raise errors; best-effort based on encountered structure."""
     nodes: list[Node] = []
     segments: list[Segment] = []
     stack: list[Node] = []
@@ -269,7 +269,7 @@ def parse(html: str) -> Document:
 
 
 # ---------------------------------------------------------------------------
-# 选择器与证据片段
+# Selectors and evidence fragments
 # ---------------------------------------------------------------------------
 
 
@@ -318,7 +318,7 @@ CHAIN_LIMIT = 4096
 
 
 def chain_html(html: str, node: Node, marker_start: int, marker_end: int) -> tuple[str, bool]:
-    """返回祖先元素的完整片段；超过 4KB 时保留 marker 附近 ±800 字节。"""
+    """Returns the full fragment of ancestor elements; retains ±800 bytes around the marker if exceeding 4KB."""
     snippet = html[node.start : node.end]
     if len(snippet) <= CHAIN_LIMIT:
         return snippet, False
@@ -328,14 +328,14 @@ def chain_html(html: str, node: Node, marker_start: int, marker_end: int) -> tup
 
 
 # ---------------------------------------------------------------------------
-# 上下文判定
+# Context determination
 # ---------------------------------------------------------------------------
 
 
 def js_string_state(code: str, offset: int) -> tuple[str, str]:
-    """判断 ``<script>`` 里 offset 处是否位于字符串字面量。
+    """Determines if the offset in ``<script>`` is located within a string literal.
 
-    返回 ``(state, quote)``，state ∈ code|string|line_comment|block_comment。
+    Returns ``(state, quote)``, state ∈ code|string|line_comment|block_comment.
     """
     state = "code"
     quote = ""
@@ -378,12 +378,12 @@ class Context:
 
 
 def classify(document: Document, pos: int, *, content_type: str = "text/html") -> Context:
-    """从内到外判定 ``pos`` 的 context_kind（验收规范 §5）。"""
+    """Determines the context_kind of ``pos`` from inner to outer (Acceptance Spec §5)."""
     html = document.html
     segment = document.segment_at(pos)
     node = document.node_at(pos)
 
-    # text/plain 优先级最高：即使响应体里是完整 HTML，浏览器也不解析。
+    # text/plain has highest priority: even if the response body is complete HTML, the browser does not parse it.
     if not is_html_content_type(content_type):
         return Context(kind="plain_text", quoting="none", node=node)
 
@@ -432,7 +432,7 @@ def classify(document: Document, pos: int, *, content_type: str = "text/html") -
 
 
 def _owner_for_position(document: Document, pos: int) -> Node | None:
-    """返回原始偏移处最内层的、内容包含该偏移的元素。"""
+    """Returns the innermost element at the raw offset whose content includes that offset."""
     best: Node | None = None
     for node in document.nodes:
         if node.start_tag_end <= pos < node.end and (

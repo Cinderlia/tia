@@ -1,4 +1,4 @@
-"""`verify_tag` 判定回归：fixtures 是最小可复现证据集。"""
+"""`verify_tag` regression check: fixtures are the minimal reproducible evidence set."""
 
 from __future__ import annotations
 

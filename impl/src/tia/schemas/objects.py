@@ -1,11 +1,11 @@
-"""共享对象（wire format）。
+"""Shared objects (wire format).
 
-对应《工具接口文档》§2。这些对象同时是 agent 之间的契约与 MCP 工具的输入输出，
-因此放在 schemas 层，不放业务判断。
+Corresponds to §2 of the Tool Interface Document. These objects serve as both the contract between agents and the input/output for MCP tools,
+so they are placed in the schemas layer, without business logic.
 
-说明：``Occurrence``（verify_tag 命中项）当前定义在 :mod:`tia.cap.verify`，
-因为它的构造依赖 DOM 扫描的 ``ContextKind``；字段与文档 §2 一致，
-后续若需要跨工具复用再上移，见 docs/decisions.md D7。
+Note: ``Occurrence`` (verify_tag hit) is currently defined in :mod:`tia.cap.verify`,
+because its construction depends on the ``ContextKind`` from DOM scanning; fields match §2 of the document,
+and will be moved up later if cross-tool reuse is needed, see docs/decisions.md D7.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 # ---------------------------------------------------------------------------
-# Slice：主 agent 交给 trigger 的切片（输入）
+# Slice: The slice handed by the main agent to the trigger (input)
 # ---------------------------------------------------------------------------
 
 
@@ -28,9 +28,9 @@ class SliceSink(BaseModel):
 
 
 class Slice(BaseModel):
-    """一个待验证的"读点 → sink"切片。
+    """A "read point → sink" slice to be verified.
 
-    ``nodes``/``edges``/``guards`` 是静态分析产物，原样透传，不做业务解释。
+    ``nodes``/``edges``/``guards`` are static analysis artifacts, passed through as-is without business interpretation.
     """
 
     model_config = ConfigDict(extra="allow")
@@ -41,13 +41,13 @@ class Slice(BaseModel):
     edges: list[dict[str, Any]] = Field(default_factory=list)
     guards: list[dict[str, Any]] = Field(default_factory=list)
     guards_complete: bool = False
-    #: sink 关联的请求参数名（taint 图的 ``params``）。
+    #: Request parameter name associated with the sink (``params`` in the taint graph).
     params: list[str] = Field(default_factory=list)
     slice_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
-# WriteTarget：写哪一行
+# WriteTarget: Which line to write
 # ---------------------------------------------------------------------------
 
 
@@ -61,7 +61,7 @@ class WriteTarget(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# FlowRecord：一次合法流程（可重放）
+# FlowRecord: A legal flow (replayable)
 # ---------------------------------------------------------------------------
 
 
@@ -110,7 +110,7 @@ class ReadSelector(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Change：一次写库的凭据
+# Change: Credential for a database write
 # ---------------------------------------------------------------------------
 
 
@@ -130,7 +130,7 @@ class Change(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# ProbeResult：探针返回（T14 实现采集器后使用）
+# ProbeResult: Probe return value (used after T14 implements the collector)
 # ---------------------------------------------------------------------------
 
 
@@ -176,7 +176,7 @@ class ProbeResult(BaseModel):
 
 
 class CaseOutcome(BaseModel):
-    """主 agent 归档单元：一个切片从 trigger 到 inject 的最终结果。"""
+    """Main agent archival unit: The final result of a slice from trigger to inject."""
 
     slice_id: str
     case_id: str = ""

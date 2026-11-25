@@ -1,4 +1,4 @@
-"""CLI 骨架的冒烟测试。"""
+"""Smoke test for the CLI skeleton."""
 
 from __future__ import annotations
 

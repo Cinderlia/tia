@@ -1,7 +1,7 @@
-"""编排内核：工具调用、证据落库、预算与 trace。
+"""Orchestration kernel: tool invocation, evidence persistence, budget, and trace.
 
-agent 不直接 import handler；它只通过 ``LocalToolClient`` 按 profile 调用工具，
-与真实 MCP stdio 路径共用同一套 ``registry.dispatch`` 语义（含 G1 不注册即不可见）。
+The agent does not directly import handlers; it only invokes tools via ``LocalToolClient`` according to the profile,
+sharing the same ``registry.dispatch`` semantics as the real MCP stdio path (including G1: unregistered tools are invisible).
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from tia.inf.runtime import get_runtime
 from tia.inf.store import now_iso
 from tia.schemas.envelope import Envelope, ErrorCode
 
-#: 工具 → 证据种类（evidence_ref 的 kind 段）。
+#: Tool → evidence type (the kind segment of evidence_ref).
 EVIDENCE_KIND = {
     "source_read": "source",
     "source_grep": "source",
@@ -44,7 +44,7 @@ EVIDENCE_KIND = {
     "guard_harvest": "trace",
 }
 
-#: 不占预算的工具（§1.6 主 agent 预算口径，对 trigger/inject 同样适用）。
+#: Tools that do not consume budget (§1.6 main agent budget scope, also applies to trigger/inject).
 UNCOUNTED = frozenset({"case_open", "case_note", "case_report", "slice_next", "slice_archive",
                        "slice_skip", "human_ask", "artifact_save"})
 
@@ -97,7 +97,7 @@ class Kernel:
         *,
         strict: bool = True,
     ) -> Any:
-        """调用一次工具；成功返回 data，失败抛 :class:`ToolCallError`（strict 时）。"""
+        """Invoke a tool once; returns data on success, raises :class:`ToolCallError` on failure (in strict mode)."""
         args = dict(arguments or {})
         if self.case_id and "case_id" not in args and tool in {"db_read", "db_write", "db_undo"}:
             args["case_id"] = self.case_id
@@ -140,7 +140,7 @@ class Kernel:
         )
         return envelope.data
 
-    # -- 证据 -------------------------------------------------------------
+    # -- Evidence -------------------------------------------------------------
 
     def _record(self, tool: str, data: Any) -> str | None:
         if not self.case_id:
@@ -170,9 +170,9 @@ def _budget_error(budget: int) -> Any:
 
     return ErrorBody(
         code=ErrorCode.BUDGET_EXCEEDED,
-        message=f"工具调用预算 {budget} 已用尽",
+        message=f"Tool call budget {budget} exhausted",
         retryable=False,
-        hint="直接分派下一步，或跳过该切片",
+        hint="Dispatch the next step directly, or skip this slice",
     )
 
 

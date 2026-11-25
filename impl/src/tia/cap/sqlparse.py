@@ -1,10 +1,10 @@
-"""SQL 语法闸门（纯函数）。
+"""SQL syntax gate (pure function).
 
-只做"结构判断"，不连库、不解释语义：
-- 单条语句、无注释绕过、无 DDL/多语句；
-- 提取 op / 表名 / 列名 / 是否带 WHERE / VALUES 行数。
+Performs only "structural checks"; no DB connection, no semantic interpretation:
+- Single statement, no comment bypass, no DDL/multi-statement;
+- Extracts op / table name / column names / presence of WHERE / VALUES row count.
 
-服务端的所有写库限制都必须在这里或 ``cap.policy`` 里拒绝（硬约束，不靠提示词）。
+All server-side write restrictions must be rejected here or in ``cap.policy`` (hard constraints, not relying on prompts).
 """
 
 from __future__ import annotations
@@ -43,38 +43,38 @@ def _bad(message: str, hint: str = "") -> ToolError:
 
 
 def _strip_user_sql(sql: str) -> str:
-    """去掉尾部空白与单个结尾分号；拒绝多语句。"""
+    """Strip trailing whitespace and a single trailing semicolon; reject multi-statements."""
     stripped = sql.strip()
     while stripped.endswith(";"):
         stripped = stripped[:-1].rstrip()
     if not stripped:
-        raise _bad("空 SQL")
+        raise _bad("Empty SQL")
     if ";" in stripped:
-        raise _bad("只允许单条语句", "多语句、注释分隔都不允许")
+        raise _bad("Only single statements allowed", "Multi-statements and comment separators are not allowed")
     if "--" in stripped or "/*" in stripped or "#" in stripped:
-        raise _bad("SQL 中不允许注释", "注释会被用于绕过语句检查")
+        raise _bad("Comments are not allowed in SQL", "Comments can be used to bypass statement checks")
     return stripped
 
 
 def parse_read(sql: str) -> str:
-    """校验只读 SQL 并返回原语句。"""
+    """Validate read-only SQL and return the original statement."""
     body = _strip_user_sql(sql)
     op = body.split(None, 1)[0].lower()
     if op not in _READ_OPS:
-        raise _bad(f"只允许 SELECT/SHOW/EXPLAIN/DESCRIBE，收到 {op.upper()!r}")
+        raise _bad(f"Only SELECT/SHOW/EXPLAIN/DESCRIBE allowed, received {op.upper()!r}")
     if _FORBIDDEN.search(body):
-        raise _bad("SQL 含被禁止的关键字", "不允许 DDL、文件写出与系统库访问")
+        raise _bad("SQL contains forbidden keywords", "DDL, file writes, and system database access are not allowed")
     return body
 
 
 def parse_write(sql: str) -> WriteStatement:
-    """校验写库 SQL，返回结构化描述。"""
+    """Validate write SQL and return a structured description."""
     body = _strip_user_sql(sql)
     op = body.split(None, 1)[0].lower()
     if op not in _WRITE_OPS:
-        raise _bad(f"只允许 INSERT/UPDATE/DELETE，收到 {op.upper()!r}")
+        raise _bad(f"Only INSERT/UPDATE/DELETE allowed, received {op.upper()!r}")
     if _FORBIDDEN.search(body):
-        raise _bad("SQL 含被禁止的关键字", "不允许 DDL、文件写出与系统库访问")
+        raise _bad("SQL contains forbidden keywords", "DDL, file writes, and system database access are not allowed")
 
     if op == "insert":
         match = re.match(
@@ -83,7 +83,7 @@ def parse_write(sql: str) -> WriteStatement:
             re.IGNORECASE,
         )
         if not match:
-            raise _bad("无法解析 INSERT 目标表", "形如 INSERT INTO t (a,b) VALUES (1,2)")
+            raise _bad("Cannot parse INSERT target table", "Format: INSERT INTO t (a,b) VALUES (1,2)")
         table = _unquote(match.group("table"))
         columns = []
         if match.group("cols"):
@@ -98,11 +98,11 @@ def parse_write(sql: str) -> WriteStatement:
             re.IGNORECASE | re.DOTALL,
         )
         if not match:
-            raise _bad("无法解析 UPDATE", "形如 UPDATE t SET a=1 WHERE id=2")
+            raise _bad("Cannot parse UPDATE", "Format: UPDATE t SET a=1 WHERE id=2")
         table = _unquote(match.group("table"))
         rest = match.group("rest")
         if not re.search(r"\bwhere\b", rest, re.IGNORECASE):
-            raise _bad("UPDATE 必须带 WHERE", "禁止全表更新")
+            raise _bad("UPDATE must include WHERE", "Full-table updates are prohibited")
         set_part = re.split(r"\bwhere\b", rest, maxsplit=1, flags=re.IGNORECASE)[0]
         columns = []
         for assignment in _split_top_level(set_part):
@@ -119,17 +119,17 @@ def parse_write(sql: str) -> WriteStatement:
         re.IGNORECASE | re.DOTALL,
     )
     if not match:
-        raise _bad("无法解析 DELETE", "形如 DELETE FROM t WHERE id=2")
+        raise _bad("Cannot parse DELETE", "Format: DELETE FROM t WHERE id=2")
     rest = match.group("rest")
     if not re.search(r"\bwhere\b", rest, re.IGNORECASE):
-        raise _bad("DELETE 必须带 WHERE", "禁止全表删除")
+        raise _bad("DELETE must include WHERE", "Full-table deletes are prohibited")
     return WriteStatement(
         sql=body, op="delete", table=_unquote(match.group("table")), has_where=True, value_rows=1
     )
 
 
 def _unquote(table: str) -> str:
-    """``db.t`` / ``t`` / ``` t ``` → 表名（去掉库名与反引号）。"""
+    """``db.t`` / ``t`` / ``` t ``` → table name (strip database name and backticks)."""
     return table.split(".")[-1].strip().strip("`")
 
 
@@ -164,7 +164,7 @@ def _split_top_level(text: str) -> list[str]:
 
 
 def _count_value_groups(body: str) -> int:
-    """数 ``VALUES`` 后面的顶层括号组数量（一行 = 1 组）。"""
+    """Count the number of top-level parenthesized groups after ``VALUES`` (one line = one group)."""
     match = re.search(r"\bvalues\b", body, re.IGNORECASE)
     if not match:
         return 1

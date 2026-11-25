@@ -1,6 +1,6 @@
-"""文件系统适配器：只读源码。
+"""Filesystem adapter: read-only source code.
 
-所有路径限定在 ``app_root``（默认 /app）下；不做写操作。
+All paths are confined to ``app_root`` (default /app); no write operations are performed.
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ class FsAdapter:
         if not resolved.is_relative_to(self.app_root):
             raise _error(
                 ErrorCode.POLICY_DENIED,
-                f"路径不在 app_root 内: {path}",
+                f"Path is not within app_root: {path}",
                 f"app_root={self.app_root}",
             )
         return resolved
@@ -46,7 +46,7 @@ class FsAdapter:
     def read(self, path: str, line_from: int, line_to: int) -> FileSlice:
         resolved = self.resolve(path)
         if not resolved.is_file():
-            raise _error(ErrorCode.NOT_FOUND, f"文件不存在: {path}")
+            raise _error(ErrorCode.NOT_FOUND, f"File not found: {path}")
         raw = resolved.read_bytes()
         text = raw.decode("utf-8", errors="replace")
         all_lines = text.splitlines()
@@ -76,7 +76,7 @@ class FsAdapter:
         try:
             regex = re.compile(re.escape(pattern) if fixed else pattern, flags)
         except re.error as exc:
-            raise _error(ErrorCode.BAD_ARGS, f"正则不合法: {exc}") from exc
+            raise _error(ErrorCode.BAD_ARGS, f"Invalid regex: {exc}") from exc
 
         files: list[Path] = []
         if root.is_file():
@@ -84,7 +84,7 @@ class FsAdapter:
         elif root.is_dir():
             files = sorted(p for p in root.rglob("*") if p.is_file() and fnmatch(p.name, glob))
         else:
-            raise _error(ErrorCode.NOT_FOUND, f"路径不存在: {path}")
+            raise _error(ErrorCode.NOT_FOUND, f"Path does not exist: {path}")
 
         hits: list[dict[str, object]] = []
         truncated = False

@@ -1,4 +1,4 @@
-"""inject（I0–I7）与主调度（M0–M6）的编排测试：用假 client，不依赖网络与 MySQL。"""
+"""Orchestration tests for inject (I0–I7) and main scheduling (M0–M6): uses a mock client, no network or MySQL dependency."""
 
 from __future__ import annotations
 
@@ -136,7 +136,7 @@ async def test_inject_no_form(runtime: Any) -> None:
 
 
 class FakeTriggerClient(FakeInjectClient):
-    """trigger 只需要 case_open/source_read/http_request/db_schema/db_write/verify_tag/db_undo。"""
+    """trigger only requires case_open/source_read/http_request/db_schema/db_write/verify_tag/db_undo."""
 
     async def call(self, tool: str, arguments: dict[str, Any] | None = None) -> Envelope:
         self.calls.append(tool)
@@ -175,4 +175,4 @@ async def test_main_runs_trigger_then_inject(runtime: Any) -> None:
     assert outcome.notes["trigger"] == "EXECUTED"
     assert outcome.verdict == "EXECUTABLE"
     assert outcome.evidence_refs
-    assert "调度报告" in result.report
+    assert "# TIA Scheduling Report" in result.report

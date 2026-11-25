@@ -1,7 +1,7 @@
-"""契约层：每个 profile 下每个工具都必须回统一信封。
+"""Contract layer: every tool under each profile must return a unified envelope.
 
-这一层不关心工具做什么，只钉住《工具接口文档》§1 的字段与错误码闭集：
-无论成功、参数错、还是 profile 不可见，调用方拿到的形状都一样（H9）。
+This layer does not care what the tool does; it only pins down the fields and closed set of error codes from §1 of the Tool Interface Document:
+Whether success, parameter error, or profile invisible, the shape received by the caller is identical (H9).
 """
 
 from __future__ import annotations

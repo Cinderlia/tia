@@ -1,6 +1,6 @@
-"""``tia-agent`` 入口：trigger / inject / main。
+"""``tia-agent`` entry point: trigger / inject / main.
 
-三个子命令共享同一套 profile / 配置加载；stage 打到 stderr，结果 JSON 打到 stdout。
+The three subcommands share the same profile / config loading; stage logs go to stderr, result JSON goes to stdout.
 """
 
 from __future__ import annotations
@@ -24,16 +24,16 @@ PROFILES = ("trigger", "inject", "main")
 
 
 def _add_common(parser: argparse.ArgumentParser, *, base_url_required: bool) -> None:
-    parser.add_argument("--slice", required=True, help="切片 JSON 文件（navi sink/slice 或 Slice）")
-    parser.add_argument("--index", type=int, default=0, help="文件里是数组/多个 sink 时的下标")
-    parser.add_argument("--base-url", required=base_url_required, help="目标页面 URL（容器内用 127.0.0.1）")
-    parser.add_argument("--payload", default="<script>alert(1)</script>", help="基础 payload")
+    parser.add_argument("--slice", required=True, help="Slice JSON file (navi sink/slice or Slice)")
+    parser.add_argument("--index", type=int, default=0, help="Index when the file is an array/multiple sinks")
+    parser.add_argument("--base-url", required=base_url_required, help="Target page URL (use 127.0.0.1 inside container)")
+    parser.add_argument("--payload", default="<script>alert(1)</script>", help="Base payload")
     parser.add_argument("--budget", type=int, default=40)
-    parser.add_argument("--db-name", default=None, help="目标库名（默认读 TIA_DB_NAME）")
+    parser.add_argument("--db-name", default=None, help="Target database name (defaults to reading TIA_DB_NAME)")
     parser.add_argument("--db-user", default=None)
     parser.add_argument("--db-password", default=None)
-    parser.add_argument("--store", default=None, help="sqlite 路径（默认 impl/var/tia.db）")
-    parser.add_argument("--json", action="store_true", help="stdout 只输出结果 JSON")
+    parser.add_argument("--store", default=None, help="sqlite path (defaults to impl/var/tia.db)")
+    parser.add_argument("--json", action="store_true", help="stdout outputs only result JSON")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -41,17 +41,17 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="store_true")
     sub = parser.add_subparsers(dest="command")
 
-    trigger = sub.add_parser("trigger", help="对切片执行 P0–P6 触发取证")
+    trigger = sub.add_parser("trigger", help="Execute P0–P6 trigger forensics on the slice")
     _add_common(trigger, base_url_required=True)
 
-    inject = sub.add_parser("inject", help="对切片执行 I0–I7 注入取证")
+    inject = sub.add_parser("inject", help="Execute I0–I7 injection forensics on the slice")
     _add_common(inject, base_url_required=True)
-    inject.add_argument("--no-cleanup", action="store_true", help="保留写入的数据，不删除")
+    inject.add_argument("--no-cleanup", action="store_true", help="Retain written data, do not delete")
 
-    main_cmd = sub.add_parser("main", help="调度多个切片：trigger → inject → archive")
-    main_cmd.add_argument("--slices", required=True, help="切片 JSON 文件（数组/含 sinks|slices 的对象）")
+    main_cmd = sub.add_parser("main", help="Schedule multiple slices: trigger → inject → archive")
+    main_cmd.add_argument("--slices", required=True, help="Slice JSON file (array/object containing sinks|slices)")
     main_cmd.add_argument("--base-url", required=True)
-    main_cmd.add_argument("--limit", type=int, default=1, help="本轮最多调度几个切片")
+    main_cmd.add_argument("--limit", type=int, default=1, help="Max number of slices to schedule this round")
     main_cmd.add_argument("--payload", default="<script>alert(1)</script>")
     main_cmd.add_argument("--budget", type=int, default=120)
     main_cmd.add_argument("--db-name", default=None)
@@ -72,11 +72,11 @@ def _load_slice(path: str, index: int) -> dict[str, Any]:
                 break
     if isinstance(candidates, list):
         if not candidates:
-            raise SystemExit("切片文件里没有条目")
+            raise SystemExit("No entries in slice file")
         return dict(candidates[index])
     if isinstance(raw, dict):
         return raw
-    raise SystemExit("切片文件必须是对象或数组")
+    raise SystemExit("Slice file must be an object or array")
 
 
 def _load_slices(path: str) -> list[dict[str, Any]]:
@@ -88,7 +88,7 @@ def _load_slices(path: str) -> list[dict[str, Any]]:
             if isinstance(raw.get(key), list):
                 return [dict(item) for item in raw[key]]
         return [dict(raw)]
-    raise SystemExit("切片文件必须是对象或数组")
+    raise SystemExit("Slice file must be an object or array")
 
 
 def _print_stages(stages: list[Any]) -> None:
@@ -221,6 +221,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"tia-agent {__version__}")
         return 0
     if args.command is None:
-        parser.error("需要子命令: trigger | inject | main")
+        parser.error("Subcommand required: trigger | inject | main")
     handlers = {"trigger": _run_trigger, "inject": _run_inject, "main": _run_main}
     return handlers[args.command](args)

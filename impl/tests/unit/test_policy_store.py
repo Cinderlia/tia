@@ -1,4 +1,4 @@
-"""写闸门与本地存储的单元测试。"""
+"""Unit tests for the write gate and local storage."""
 
 from __future__ import annotations
 

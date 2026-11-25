@@ -1,7 +1,7 @@
-"""主 agent：切片队列 → trigger → inject → 归档（M0–M6 的确定性版本）。
+"""Main agent: slice queue → trigger → inject → archive (deterministic version of M0–M6).
 
-先跑通"调度 + 归档"这条主干：队列排序、预算、连续失败熔断、DONE 判定。
-LLM planner（选择切片的理由）后接，替换 :func:`pick` 即可，工具语义不变。
+First get the "scheduling + archiving" main path working: queue ordering, budget, consecutive failure circuit breaker, DONE determination.
+LLM planner (reasoning for slice selection) can be added later, simply replacing :func:`pick`; tool semantics remain unchanged.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ def slice_id(raw: dict[str, Any], index: int) -> str:
 
 
 def pick(slices: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """候选排序：先没试过的，再按 sink kind、文件路径聚簇，最后字典序稳定。"""
+    """Candidate ranking: untried first, then cluster by sink kind and file path, finally stable lexicographic order."""
 
     def key(item: tuple[int, dict[str, Any]]) -> tuple[int, str, str]:
         index, raw = item
@@ -108,12 +108,12 @@ async def run_main(
 
 def _report(result: MainResult) -> str:
     lines = [
-        "# TIA 调度报告",
+        "# TIA Scheduling Report",
         "",
-        f"- 尝试切片：{len(result.outcomes)}",
-        f"- 停止原因：{result.stop_reason}",
+        f"- Attempted slices: {len(result.outcomes)}",
+        f"- Stop reason: {result.stop_reason}",
         "",
-        "| 切片 | 结论 | residue | 说明 |",
+        "| Slice | Conclusion | residue | Description |",
         "| --- | --- | --- | --- |",
     ]
     for item in result.outcomes:

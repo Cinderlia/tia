@@ -1,7 +1,7 @@
-"""进程级运行时：Settings + Store + MysqlAdapter。
+"""Process-level runtime: Settings + Store + MysqlAdapter.
 
-由入口（``tia-server`` / ``tia-agent``）在启动时调用 :func:`configure` 注入一次；
-handler 通过 :func:`get_runtime` 取用。运行期不可变，避免各 handler 自行读环境变量。
+Injected once at startup by the entry point (``tia-server`` / ``tia-agent``) via :func:`configure`;
+handlers access it via :func:`get_runtime`. Immutable at runtime to prevent handlers from reading environment variables directly.
 """
 
 from __future__ import annotations
@@ -37,6 +37,6 @@ def get_runtime() -> Runtime:
 
 
 def reset_runtime() -> None:
-    """仅供测试：清空注入的运行时。"""
+    """For testing only: clear the injected runtime."""
     global _runtime
     _runtime = None

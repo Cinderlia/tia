@@ -1,4 +1,4 @@
-"""注册表不变量：工具数量、profile 过滤、dispatch 的错误收敛。"""
+"""Registry invariants: tool count, profile filtering, and error convergence in dispatch."""
 
 from __future__ import annotations
 

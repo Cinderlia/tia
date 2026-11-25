@@ -1,9 +1,9 @@
-"""不需要外部环境的工具：纯函数解析 + 本地存储查询。
+"""Tools requiring no external environment: pure function parsing + local storage queries.
 
-安全约定（见 docs/security.md）：
-- 输入一律当**数据**：不拼接 shell、不 ``eval``、不做动态 import；
-- 解析有上界（长度/条目数），超限返回 BAD_ARGS，不无限展开；
-- 落盘路径只允许在 ``impl/var/artifacts/<case_id>/`` 下，文件名白名单。
+Security conventions (see docs/security.md):
+- Treat all input as **data**: no shell concatenation, no ``eval``, no dynamic import;
+- Parsing has upper bounds (length/entry count); return BAD_ARGS on excess, no infinite expansion;
+- Write paths restricted to ``impl/var/artifacts/<case_id>/`` only, with filename whitelist.
 """
 
 from __future__ import annotations
@@ -34,11 +34,11 @@ def _validate(model: type[BaseModel], arguments: dict[str, Any]) -> Any:
     try:
         return model.model_validate(arguments)
     except ValidationError as exc:
-        raise _bad(f"参数不合法: {exc.errors()[0]['msg']}") from exc
+        raise _bad(f"Invalid parameters: {exc.errors()[0]['msg']}") from exc
 
 
 # ---------------------------------------------------------------------------
-# form_parse：静态解析 HTML 里的表单（不发请求、不执行 JS）
+# form_parse: Statically parse forms in HTML (no requests, no JS execution)
 # ---------------------------------------------------------------------------
 class FormParseInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -146,14 +146,14 @@ async def form_parse(arguments: dict[str, Any]) -> ToolOutput:
             "forms": forms,
             "form_count": len(forms),
             "base_url": params.base_url,
-            "note": "仅静态解析；渲染后的 DOM 请先用 http_request 取页面",
+            "note": "Static parsing only; use http_request to fetch rendered DOM first",
         },
         warnings=warnings,
     )
 
 
 # ---------------------------------------------------------------------------
-# context_classify：给定 HTML 与 tag，判定命中点的上下文（离线、纯函数）
+# context_classify: Given HTML and tag, determine context of hit point (offline, pure function)
 # ---------------------------------------------------------------------------
 class ContextClassifyInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -189,7 +189,7 @@ async def context_classify(arguments: dict[str, Any]) -> ToolOutput:
 
 
 # ---------------------------------------------------------------------------
-# budget_solve：长度预算，纯算术
+# budget_solve: Length budget, pure arithmetic
 # ---------------------------------------------------------------------------
 class BudgetSolveInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -213,7 +213,7 @@ async def budget_solve(arguments: dict[str, Any]) -> ToolOutput:
     }
     present = {key: value for key, value in limits.items() if value is not None}
     if not present:
-        raise _bad("至少给一个长度上限：column_length / maxlength / validation_limit")
+        raise _bad("Provide at least one length limit: column_length / maxlength / validation_limit")
     limiting, limit = min(present.items(), key=lambda item: item[1])
     overhead = len(params.prefix) + len(params.suffix) + len(params.skeleton) + params.tag_len
     budget = int(limit) - overhead
@@ -230,14 +230,14 @@ async def budget_solve(arguments: dict[str, Any]) -> ToolOutput:
     warnings: list[str] = []
     if not fits:
         warnings.append("LENGTH_EXCEEDED")
-        data["hint"] = "减小前缀/骨架，或把 tag 移到后缀"
+        data["hint"] = "Reduce prefix/skeleton, or move tag to suffix"
     if params.encoding != "none":
-        data["note"] = "编码后长度会膨胀，投递前用实际编码再算一次"
+        data["note"] = "Length expands after encoding; recalculate with actual encoding before submission"
     return ToolOutput(data=data, warnings=warnings)
 
 
 # ---------------------------------------------------------------------------
-# trace_diff：比较两次 trace（纯函数）
+# trace_diff: Compare two traces (pure function)
 # ---------------------------------------------------------------------------
 class TraceDiffInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -293,7 +293,7 @@ async def trace_diff(arguments: dict[str, Any]) -> ToolOutput:
 
 
 # ---------------------------------------------------------------------------
-# flow_lookup：查本地流程库（sqlite，不发网络）
+# flow_lookup: Query local flow library (sqlite, no network)
 # ---------------------------------------------------------------------------
 class FlowLookupInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -311,14 +311,14 @@ async def flow_lookup(arguments: dict[str, Any]) -> ToolOutput:
         data={
             "flows": flows,
             "count": len(flows),
-            "note": "流程库只由 harness 钩子写入；模型只读摘要",
+            "note": "Flow library written only by harness hooks; model reads summaries only",
         },
         warnings=["FLOWS_EMPTY"] if not flows else [],
     )
 
 
 # ---------------------------------------------------------------------------
-# artifact_save：把产物写进项目目录（路径受限、大小受限）
+# artifact_save: Write artifacts to project directory (path restricted, size restricted)
 # ---------------------------------------------------------------------------
 class ArtifactSaveInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -332,17 +332,17 @@ class ArtifactSaveInput(BaseModel):
 async def artifact_save(arguments: dict[str, Any]) -> ToolOutput:
     params = _validate(ArtifactSaveInput, arguments)
     if not _SAFE_NAME.match(params.name):
-        raise _bad("name 只允许字母数字与 . _ -，且不能以 . 开头", "例如 report.md")
+        raise _bad("name allows only alphanumerics and . _ -, and cannot start with .", "e.g. report.md")
     rt = get_runtime()
     if rt.store.get_case(params.case_id) is None:
-        raise ToolError(ErrorCode.NOT_FOUND, f"case 不存在: {params.case_id}")
+        raise ToolError(ErrorCode.NOT_FOUND, f"case not found: {params.case_id}")
     raw = params.content.encode("utf-8")
     if len(raw) > MAX_ARTIFACT_BYTES:
-        raise _bad(f"content 超过 {MAX_ARTIFACT_BYTES} 字节")
+        raise _bad(f"content exceeds {MAX_ARTIFACT_BYTES} bytes")
     root = (rt.settings.store_path.parent / "artifacts" / params.case_id).resolve()
     target = (root / params.name).resolve()
     if not target.is_relative_to(root):
-        raise ToolError(ErrorCode.POLICY_DENIED, "artifact 路径越界")
+        raise ToolError(ErrorCode.POLICY_DENIED, "artifact path out of bounds")
     root.mkdir(parents=True, exist_ok=True)
     target.write_bytes(raw)
     digest = hashlib.sha256(raw).hexdigest()

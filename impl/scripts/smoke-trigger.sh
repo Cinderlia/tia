@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# 对 xvwa stored_xss 跑一遍 trigger P0–P6（容器内执行）。
-# 依赖：MariaDB 已启动、xvwa 库存在、scripts/setup-db.sh 已跑过（本脚本会再跑一次，幂等）。
+# Run trigger P0–P6 against xvwa stored_xss (executed inside the container).
+# Dependencies: MariaDB is running, the xvwa database exists, and scripts/setup-db.sh has been executed (this script will run it again, idempotently).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

@@ -1,11 +1,11 @@
-"""工具注册表：唯一的事实来源是设计文档《工具接口文档》。
+"""Tool registry: the single source of truth is the design document "Tool Interface Documentation".
 
-两个职责：
-1. 声明 36 个工具的元信息与 schema（``TOOLS``）；
-2. 按 profile 过滤并把 handler 的返回/异常统一成信封（``dispatch``）。
+Two responsibilities:
+1. Declare metadata and schema for 36 tools (``TOOLS``);
+2. Filter by profile and unify handler returns/exceptions into an envelope (``dispatch``).
 
-handler 只写 ``tia.cap.*`` / ``tia.ad.*``，通过点分路径延迟加载，
-避免注册表反向依赖能力实现（也避免 import 环）。
+Handlers only write ``tia.cap.*`` / ``tia.ad.*``, loaded lazily via dot-separated paths,
+avoiding reverse dependencies from the registry to capability implementations (and import cycles).
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from tia.schemas.envelope import Envelope, ErrorBody, ErrorCode, JsonValue, Tool
 
 PROFILES = ("main", "trigger", "inject")
 
-#: main profile 不注册的 22 个工具（G1：不注册即不可用）。
+#: 22 tools not registered in the main profile (G1: unregistered means unavailable).
 MAIN_EXCLUDED: frozenset[str] = frozenset(
     {
         "probe_arm",
@@ -48,7 +48,7 @@ MAIN_EXCLUDED: frozenset[str] = frozenset(
     }
 )
 
-#: handler 的返回：data + 证据引用 + 警告。信封由 registry 统一包装。
+#: Handler return: data + evidence references + warnings. The envelope is uniformly wrapped by the registry.
 Handler = Callable[[dict[str, Any]], Awaitable["ToolOutput"]]
 
 
@@ -65,9 +65,9 @@ class ToolSpec:
     description: str
     category: str
     mutating: bool = False
-    #: JSON Schema（MCP tools/list 原样下发）。详细约束随各工具实现收紧。
+    #: JSON Schema (delivered as-is via MCP tools/list). Detailed constraints are tightened with each tool implementation.
     input_schema: dict[str, Any] = field(default_factory=lambda: {"type": "object"})
-    #: 形如 ``tia.cap.verify:verify_tag``；None 表示尚未实现。
+    #: Formatted like ``tia.cap.verify:verify_tag``; None indicates not yet implemented.
     handler_path: str | None = None
 
 
@@ -96,9 +96,9 @@ def _t(
 _VERIFY_TAG_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "url": {"type": "string", "description": "在线页面 URL（与 html 二选一）"},
-        "html": {"type": "string", "description": "离线 HTML（与 url 二选一）"},
-        "tag": {"type": "string", "description": "4 字符 tag"},
+        "url": {"type": "string", "description": "Online page URL (choose one of url or html)"},
+        "html": {"type": "string", "description": "Offline HTML (choose one of url or html)"},
+        "tag": {"type": "string", "description": "4-character tag"},
     },
     "required": ["tag"],
     "additionalProperties": False,
@@ -108,8 +108,8 @@ _VERIFY_TAG_SCHEMA: dict[str, Any] = {
 _FORM_PARSE_SCHEMA = {
     "type": "object",
     "properties": {
-        "html": {"type": "string", "description": "页面 HTML（静态解析，不发请求）"},
-        "base_url": {"type": "string", "description": "用于把相对 action 拼成绝对地址"},
+        "html": {"type": "string", "description": "Page HTML (static parsing, no requests sent)"},
+        "base_url": {"type": "string", "description": "Used to resolve relative actions into absolute addresses"},
         "max_forms": {"type": "integer", "minimum": 1, "maximum": 100},
     },
     "required": ["html"],
@@ -121,7 +121,7 @@ _CONTEXT_CLASSIFY_SCHEMA = {
     "properties": {
         "html": {"type": "string"},
         "tag": {"type": "string"},
-        "payload": {"type": "string", "description": "可选：实际注入内容，用于判闭合/承载"},
+        "payload": {"type": "string", "description": "Optional: actual injected content, used for closure/capacity determination"},
         "content_type": {"type": "string"},
         "max_occurrences": {"type": "integer", "minimum": 1, "maximum": 50},
     },
@@ -170,7 +170,7 @@ _ARTIFACT_SAVE_SCHEMA = {
     "type": "object",
     "properties": {
         "case_id": {"type": "string"},
-        "name": {"type": "string", "description": "文件名，白名单字母数字._-"},
+        "name": {"type": "string", "description": "Filename, whitelist alphanumeric._-"},
         "content": {"type": "string"},
         "content_type": {"type": "string"},
     },
@@ -178,69 +178,69 @@ _ARTIFACT_SAVE_SCHEMA = {
     "additionalProperties": False,
 }
 
-#: 36 个工具，顺序与《工具接口文档》一致。
+#: 36 tools, order consistent with "Tool Interface Documentation".
 TOOLS: tuple[ToolSpec, ...] = (
-    # 1. 源码与入口（7）
-    _t("source_read", "读取源码片段（带上下文行号）", "source", handler_path="tia.cap.source:source_read"),
-    _t("source_grep", "按正则搜索源码，返回命中位置与一行上下文", "source", handler_path="tia.cap.source:source_grep"),
-    _t("taint_trace", "从 sink 回溯到请求变量的赋值链（有界）", "source"),
-    _t("form_parse", "解析页面或源码中的表单字段与 HTML5 约束", "source",
+    # 1. Source code and entry points (7)
+    _t("source_read", "Read source code snippet (with context line numbers)", "source", handler_path="tia.cap.source:source_read"),
+    _t("source_grep", "Grep source code by regex, returning hit locations and one line of context", "source", handler_path="tia.cap.source:source_grep"),
+    _t("taint_trace", "Trace assignment chain from sink back to request variables (bounded)", "source"),
+    _t("form_parse", "Parse form fields and HTML5 constraints from page or source code", "source",
        input_schema=_FORM_PARSE_SCHEMA, handler_path="tia.cap.offline:form_parse"),
-    _t("endpoint_search", "按 sink 文件搜索可达的 HTTP 入口", "source"),
-    _t("includer_trace", "追踪 include/require 链", "source"),
-    _t("filter_analyze", "分析输入/输出侧的过滤与编码", "source"),
-    # 2. 数据与探针（8）
-    _t("db_schema", "读取库表结构", "data", handler_path="tia.cap.db:db_schema"),
-    _t("db_read", "只读 SQL 查询，返回行与列元信息", "data", handler_path="tia.cap.db:db_read"),
-    _t("db_write", "写库（必须返回 change_id 与 undo_sql）", "data", mutating=True, handler_path="tia.cap.db:db_write"),
-    _t("db_undo", "回滚自己的写入，必须 residue==0", "data", mutating=True, handler_path="tia.cap.db:db_undo"),
-    _t("probe_arm", "在读点/写点挂采集探针", "probe", mutating=True),
-    _t("probe_run", "运行探针请求并取回命中的 SQL 与绑定参数", "probe", mutating=True),
-    _t("probe_disarm", "摘除探针", "probe", mutating=True),
-    _t("write_probe", "对目标表做 before/after 差分", "probe", mutating=True),
-    # 3. 投递与验收（7）
-    _t("http_request", "发起单次 HTTP 请求（显式 Cookie，不跟随重定向）", "http", handler_path="tia.cap.http:http_request"),
-    _t("form_fill", "按表单模板填充并生成请求链", "http", mutating=True, handler_path="tia.cap.http:form_fill"),
-    _t("http_replay", "在指定会话下重放请求链", "http", mutating=True),
+    _t("endpoint_search", "Search for reachable HTTP entry points by sink file", "source"),
+    _t("includer_trace", "Trace include/require chains", "source"),
+    _t("filter_analyze", "Analyze filtering and encoding on input/output sides", "source"),
+    # 2. Data and Probes (8)
+    _t("db_schema", "Read database table schema", "data", handler_path="tia.cap.db:db_schema"),
+    _t("db_read", "Read-only SQL query, returning rows and column metadata", "data", handler_path="tia.cap.db:db_read"),
+    _t("db_write", "Write to database (must return change_id and undo_sql)", "data", mutating=True, handler_path="tia.cap.db:db_write"),
+    _t("db_undo", "Rollback own writes, must have residue==0", "data", mutating=True, handler_path="tia.cap.db:db_undo"),
+    _t("probe_arm", "Attach collection probes at read/write points", "probe", mutating=True),
+    _t("probe_run", "Run probe request and retrieve hit SQL and bound parameters", "probe", mutating=True),
+    _t("probe_disarm", "Remove probes", "probe", mutating=True),
+    _t("write_probe", "Perform before/after diff on target table", "probe", mutating=True),
+    # 3. Delivery and Acceptance (7)
+    _t("http_request", "Issue single HTTP request (explicit Cookie, no redirect following)", "http", handler_path="tia.cap.http:http_request"),
+    _t("form_fill", "Fill form template and generate request chain", "http", mutating=True, handler_path="tia.cap.http:form_fill"),
+    _t("http_replay", "Replay request chain under specified session", "http", mutating=True),
     _t("verify_tag",
-       "在页面/HTML 中定位 tag，返回出现位置、上下文与可执行性上限",
+       "Locate tag in page/HTML, returning occurrence locations, context, and executability limit",
        "verify",
        handler_path="tia.cap.verify:verify_tag",
        input_schema=_VERIFY_TAG_SCHEMA),
-    _t("context_classify", "把命中上下文归类为 8 类之一", "verify",
+    _t("context_classify", "Classify hit context into one of 8 categories", "verify",
        input_schema=_CONTEXT_CLASSIFY_SCHEMA, handler_path="tia.cap.offline:context_classify"),
-    _t("canary_calibrate", "用 canary 实测写/读变换 F=O(W(x))", "verify", mutating=True),
-    _t("budget_solve", "求解可写长度预算与候选骨架", "verify",
+    _t("canary_calibrate", "Measure write/read transform F=O(W(x)) with canary", "verify", mutating=True),
+    _t("budget_solve", "Solve writable length budget and candidate skeletons", "verify",
        input_schema=_BUDGET_SOLVE_SCHEMA, handler_path="tia.cap.offline:budget_solve"),
-    # 4. 轨迹（3）
-    _t("trace_run", "带 filter 的定向 trace（禁止全量）", "trace", mutating=True),
-    _t("trace_diff", "比较两次 trace 的分支差异", "trace",
+    # 4. Trace (3)
+    _t("trace_run", "Targeted trace with filter (full trace forbidden)", "trace", mutating=True),
+    _t("trace_diff", "Compare branch differences between two traces", "trace",
        input_schema=_TRACE_DIFF_SCHEMA, handler_path="tia.cap.offline:trace_diff"),
-    _t("guard_harvest", "从入口文件收割拒绝点候选", "trace"),
-    # 5. 控制与人机（8）
-    _t("case_open", "建立 case", "control", mutating=True, handler_path="tia.cap.case:case_open"),
-    _t("case_note", "给 case 追加证据笔记", "control", mutating=True, handler_path="tia.cap.case:case_note"),
-    _t("case_report", "生成 case 的 Markdown 报告", "control", handler_path="tia.cap.case:case_report"),
-    _t("session_bind", "绑定合法登录态到 case", "control", mutating=True),
-    _t("human_ask", "向人类提问（登录、授权、二选一）", "control"),
-    _t("artifact_save", "保存产物到项目目录", "control",
+    _t("guard_harvest", "Harvest rejection point candidates from entry files", "trace"),
+    # 5. Control and Human Interaction (8)
+    _t("case_open", "Create case", "control", mutating=True, handler_path="tia.cap.case:case_open"),
+    _t("case_note", "Append evidence note to case", "control", mutating=True, handler_path="tia.cap.case:case_note"),
+    _t("case_report", "Generate Markdown report for case", "control", handler_path="tia.cap.case:case_report"),
+    _t("session_bind", "Bind valid login session to case", "control", mutating=True),
+    _t("human_ask", "Ask human (login, authorization, binary choice)", "control"),
+    _t("artifact_save", "Save artifact to project directory", "control",
        input_schema=_ARTIFACT_SAVE_SCHEMA, handler_path="tia.cap.offline:artifact_save"),
-    _t("flow_lookup", "查询流程库中的 form 模板与已知 guard", "control",
+    _t("flow_lookup", "Query form templates and known guards in flow library", "control",
        input_schema=_FLOW_LOOKUP_SCHEMA, handler_path="tia.cap.offline:flow_lookup"),
-    _t("rate_guard", "限流退避", "control", mutating=True),
-    # 6. 切片（3）
-    _t("slice_next", "取下一个待处理切片", "slice"),
-    _t("slice_archive", "归档切片结果", "slice", mutating=True),
-    _t("slice_skip", "跳过切片并记录原因", "slice", mutating=True),
+    _t("rate_guard", "Rate limit backoff", "control", mutating=True),
+    # 6. Slice (3)
+    _t("slice_next", "Get next pending slice", "slice"),
+    _t("slice_archive", "Archive slice results", "slice", mutating=True),
+    _t("slice_skip", "Skip slice and record reason", "slice", mutating=True),
 )
 
 _BY_NAME: dict[str, ToolSpec] = {spec.name: spec for spec in TOOLS}
-if len(_BY_NAME) != 36:  # pragma: no cover - 设计不变量
-    raise RuntimeError(f"工具数量应为 36，实际 {len(_BY_NAME)}")
+if len(_BY_NAME) != 36:  # pragma: no cover - design invariant
+    raise RuntimeError(f"Tool count should be 36, actual {len(_BY_NAME)}")
 
 
 def tools_for_profile(profile: str) -> tuple[ToolSpec, ...]:
-    """按 profile 返回可下发的工具；未知 profile 直接拒绝。"""
+    """Return tools distributable by profile; reject unknown profiles directly."""
     if profile not in PROFILES:
         raise ValueError(f"unknown profile: {profile}")
     if profile == "main":
@@ -280,7 +280,7 @@ async def dispatch(
     name: str,
     arguments: dict[str, Any] | None,
 ) -> Envelope:
-    """执行一次工具调用；任何失败都收敛为信封（H9）。"""
+    """Execute a tool call; any failure converges to an envelope (H9)."""
     started = time.perf_counter()
     spec = _BY_NAME.get(name)
     if spec is None or spec.name not in {s.name for s in tools_for_profile(profile)}:
@@ -290,7 +290,7 @@ async def dispatch(
             ErrorBody(
                 code=ErrorCode.NOT_FOUND,
                 message=f"tool {name!r} is not available in profile {profile!r}",
-                hint="检查工具名，或确认该工具是否在当前 profile 注册",
+                hint="Check tool name, or confirm if the tool is registered in the current profile",
             ),
             _elapsed_ms(started),
         )
@@ -300,9 +300,9 @@ async def dispatch(
             name,
             ErrorBody(
                 code=ErrorCode.UNSUPPORTED,
-                message=f"tool {name!r} 尚未实现",
+                message=f"tool {name!r} not yet implemented",
                 retryable=False,
-                hint="见 tia-design-kit/TASKS.md 的实现顺序",
+                hint="See implementation order in tia-design-kit/TASKS.md",
             ),
             _elapsed_ms(started),
         )
@@ -312,7 +312,7 @@ async def dispatch(
         output = await handler(arguments or {})
     except ToolError as exc:
         return _failure(profile, name, exc.to_body(), _elapsed_ms(started))
-    except Exception as exc:  # noqa: BLE001 - 边界：协议要求不抛
+    except Exception as exc:  # noqa: BLE001 - boundary: protocol requires no raise
         return _failure(
             profile,
             name,
@@ -320,7 +320,7 @@ async def dispatch(
                 code=ErrorCode.ENV_ERROR,
                 message=f"{type(exc).__name__}: {exc}",
                 retryable=True,
-                hint="这是未预期异常，查看 server stderr 日志",
+                hint="This is an unexpected exception, check server stderr logs",
             ),
             _elapsed_ms(started),
         )

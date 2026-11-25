@@ -1,11 +1,11 @@
-"""本项目自己的存储（sqlite）。
+"""Project-local storage (sqlite).
 
-表：case / change / evidence / flow / probe / session（T04 的六张表），
-外加 slice 表给主 agent 的队列用。所有写入都带 ``case_id`` 与 ``observed_at``，
-供报告重建（H10）。
+Tables: case / change / evidence / flow / probe / session (the six tables from T04),
+plus a slice table for the main agent's queue. All writes include ``case_id`` and ``observed_at``,
+for report reconstruction (H10).
 
-连接不跨线程共享：``Store`` 每次操作开一条短连接（sqlite 很小，够快），
-也避免 async handler 之间互相踩连接。
+Connections are not shared across threads: ``Store`` opens a short-lived connection per operation (sqlite is small, fast enough),
+also avoiding connection conflicts between async handlers.
 """
 
 from __future__ import annotations
@@ -267,7 +267,7 @@ class Store:
     def list_flows(
         self, kind: str | None = None, base_url: str | None = None, limit: int = 50
     ) -> list[dict[str, Any]]:
-        """读流程库摘要；base_url 过滤在 Python 层做，扫描上界 500 行。"""
+        """Read flow library summary; base_url filtering is done at the Python layer, with a scan limit of 500 rows."""
         sql = "SELECT case_id, seq, kind, body, code_ver, observed_at FROM flow"
         args: list[Any] = []
         if kind:

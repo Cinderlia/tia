@@ -1,7 +1,7 @@
-"""离线分析：filter_analyze / guard_harvest / endpoint_search / includer_trace。
+"""Offline analysis: filter_analyze / guard_harvest / endpoint_search / includer_trace.
 
-四个工具都只接受调用方给的文本或结构（源码片段、HTML、端点索引、包含关系边），
-不读文件、不发请求、不查库；同样的输入永远得到同样的输出（可复现的归因依据）。
+All four tools only accept text or structures provided by the caller (source code snippets, HTML, endpoint index, inclusion edges),
+do not read files, send requests, or query databases; the same input always yields the same output (reproducible attribution basis).
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ def _validate(model: type[BaseModel], arguments: dict[str, Any]) -> Any:
     try:
         return model.model_validate(arguments)
     except ValidationError as exc:
-        raise _bad(f"参数不合法: {exc.errors()[0]['msg']}") from exc
+        raise _bad(f"Invalid parameter: {exc.errors()[0]['msg']}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -36,33 +36,33 @@ def _validate(model: type[BaseModel], arguments: dict[str, Any]) -> Any:
 
 _FILTERS: dict[str, tuple[str, bool, str]] = {
     # name -> (category, reversible, note)
-    "htmlspecialchars": ("encode", True, "HTML 实体编码；默认 ENT_QUOTES 时引号也被编码"),
-    "htmlentities": ("encode", True, "HTML 实体编码，可被浏览器解码"),
-    "strip_tags": ("sanitize", True, "剥离标签；属性里的恶意字符可能保留"),
-    "addslashes": ("escape", True, "反斜杠转义，可被 stripslashes 逆变换"),
-    "stripslashes": ("escape", True, "去掉反斜杠"),
-    "urlencode": ("encode", True, "URL 编码，可逆"),
-    "rawurlencode": ("encode", True, "URL 编码，可逆"),
-    "urldecode": ("encode", True, "URL 解码"),
-    "base64_encode": ("encode", True, "Base64，可逆"),
-    "base64_decode": ("encode", True, "Base64 解码"),
-    "str_rot13": ("encode", True, "ROT13，可逆"),
-    "json_encode": ("encode", True, "JSON 编码，可逆"),
-    "serialize": ("encode", True, "PHP 序列化，可逆"),
-    "mysqli_real_escape_string": ("escape", True, "SQL 转义，可逆（但只对 SQL 有意义）"),
-    "mysql_real_escape_string": ("escape", True, "SQL 转义，可逆"),
-    "intval": ("cast", False, "强制转整数，信息不可恢复"),
-    "floatval": ("cast", False, "强制转浮点，信息不可恢复"),
-    "trim": ("normalize", False, "去首尾空白，信息不可恢复"),
-    "substr": ("truncate", False, "截断，超出部分不可恢复"),
-    "mb_substr": ("truncate", False, "截断，超出部分不可恢复"),
-    "md5": ("hash", False, "单向散列"),
-    "sha1": ("hash", False, "单向散列"),
-    "hash": ("hash", False, "单向散列"),
-    "preg_replace": ("blackbox", False, "结果取决于正则，需人工确认是否可逆"),
-    "filter_var": ("blackbox", False, "结果取决于 FILTER_* 常量"),
-    "str_replace": ("blackbox", False, "结果取决于替换规则"),
-    "htmlspecialchars_decode": ("decode", True, "实体解码"),
+    "htmlspecialchars": ("encode", True, "HTML entity encoding; quotes are also encoded by default with ENT_QUOTES"),
+    "htmlentities": ("encode", True, "HTML entity encoding, decodable by browsers"),
+    "strip_tags": ("sanitize", True, "Strips tags; malicious characters in attributes may remain"),
+    "addslashes": ("escape", True, "Backslash escaping, reversible via stripslashes"),
+    "stripslashes": ("escape", True, "Removes backslashes"),
+    "urlencode": ("encode", True, "URL encoding, reversible"),
+    "rawurlencode": ("encode", True, "URL encoding, reversible"),
+    "urldecode": ("encode", True, "URL decoding"),
+    "base64_encode": ("encode", True, "Base64, reversible"),
+    "base64_decode": ("encode", True, "Base64 decoding"),
+    "str_rot13": ("encode", True, "ROT13, reversible"),
+    "json_encode": ("encode", True, "JSON encoding, reversible"),
+    "serialize": ("encode", True, "PHP serialization, reversible"),
+    "mysqli_real_escape_string": ("escape", True, "SQL escaping, reversible (but only meaningful for SQL)"),
+    "mysql_real_escape_string": ("escape", True, "SQL escaping, reversible"),
+    "intval": ("cast", False, "Forces integer cast, information is unrecoverable"),
+    "floatval": ("cast", False, "Force cast to float, information is irreversible"),
+    "trim": ("normalize", False, "Trim leading/trailing whitespace, information is irreversible"),
+    "substr": ("truncate", False, "Truncate, excess portion is irreversible"),
+    "mb_substr": ("truncate", False, "Truncate, excess portion is irreversible"),
+    "md5": ("hash", False, "One-way hash"),
+    "sha1": ("hash", False, "One-way hash"),
+    "hash": ("hash", False, "One-way hash"),
+    "preg_replace": ("blackbox", False, "Result depends on regex, manual confirmation required for reversibility"),
+    "filter_var": ("blackbox", False, "Result depends on FILTER_* constants"),
+    "str_replace": ("blackbox", False, "Result depends on replacement rules"),
+    "htmlspecialchars_decode": ("decode", True, "Entity decoding"),
 }
 
 _CALL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
@@ -112,7 +112,7 @@ async def filter_analyze(arguments: dict[str, Any]) -> ToolOutput:
                 "column": column,
                 "category": "cast",
                 "reversible": False,
-                "note": "强制类型转换，信息不可恢复",
+                "note": "Force type cast, information is irreversible",
             }
         )
     filters.sort(key=lambda f: (f["line"], f["column"]))
@@ -173,7 +173,7 @@ class GuardHarvestInput(BaseModel):
 async def guard_harvest(arguments: dict[str, Any]) -> ToolOutput:
     params = _validate(GuardHarvestInput, arguments)
     if not params.html and not params.source and not params.headers:
-        raise _bad("至少提供 html / source / headers 之一")
+        raise _bad("Provide at least one of html / source / headers")
 
     guards: list[dict[str, Any]] = []
     html = params.html or ""

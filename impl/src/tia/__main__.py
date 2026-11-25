@@ -1,4 +1,4 @@
-"""`python -m tia` 入口。"""
+"""`python -m tia` entry point."""
 
 from __future__ import annotations
 

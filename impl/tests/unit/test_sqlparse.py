@@ -1,4 +1,4 @@
-"""SQL 语法闸门的单元测试（安全边界，任何放松都要先改这里）。"""
+"""Unit tests for the SQL syntax gate (security boundary; any relaxation must be made here first)."""
 
 from __future__ import annotations
 

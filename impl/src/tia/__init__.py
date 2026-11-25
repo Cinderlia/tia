@@ -1,6 +1,6 @@
 """TIA —— Trace-based Injection Agent。
 
-只交付证据与可归因的 verdict，不伪造会话、不修改目标应用源码。
+Deliver only evidence and attributable verdicts; do not fabricate sessions or modify the target application's source code.
 """
 
 __version__ = "0.1.0"

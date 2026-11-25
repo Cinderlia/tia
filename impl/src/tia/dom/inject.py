@@ -1,7 +1,7 @@
-"""inject agent：证明"用户能从 HTTP 入口把内容写进去"（I0–I7）。
+"""inject agent: proves "user can write content via HTTP entry" (I0–I7).
 
-与 trigger 的分工：trigger 直写数据库证明 sink 可达；inject 只走应用自己的表单，
-数据库写入由应用完成，最后用 ``db_read`` / ``verify_tag`` 做三态验收。
+Division of labor with trigger: trigger writes directly to DB to prove sink reachability; inject only uses the app's own forms,
+DB writes are performed by the app, finally using ``db_read`` / ``verify_tag`` for tri-state acceptance.
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ class _Form:
 
 
 def _tag() -> str:
-    """4 字符小写字母数字：既能当证据，又能过常见长度限制。"""
+    """4-char lowercase alphanumeric: serves as evidence and passes common length limits."""
     alphabet = string.ascii_lowercase + string.digits
     return "".join(secrets.choice(alphabet) for _ in range(4))
 
@@ -75,7 +75,7 @@ def _forms(document: Document, page_url: str) -> list[_Form]:
 
 
 def _infer_target(source_text: str, sink_code: str, params: list[str]) -> dict[str, Any] | None:
-    """从源码里推断 INSERT 目标表与列；拿不到就回 None。"""
+    """Infer INSERT target table and columns from source; return None if unavailable."""
     insert = re.search(r"insert\s+(?:ignore\s+)?into\s+([`\"]?)([A-Za-z_][\w]*)\1\s*\(([^)]*)\)", source_text, re.I)
     if insert is None:
         return None
@@ -84,7 +84,7 @@ def _infer_target(source_text: str, sink_code: str, params: list[str]) -> dict[s
     bind = re.search(r'bind(?:Param|Value)\(\s*[\'"]:([A-Za-z_][\w]*)[\'"]', sink_code)
     column = bind.group(1) if bind else (params[0] if params else columns[-1] if columns else "")
     if column not in columns:
-        # 冒号名与列名不完全一致时，按参数名再试一次
+        # If colon name and column name do not match exactly, retry by parameter name
         candidate = params[0] if params and params[0] in columns else ""
         column = candidate or (columns[0] if columns else "")
     return {"table": table, "columns": columns, "column": column}
@@ -124,7 +124,7 @@ async def run_inject(
         data = await kernel.call(tool, arguments)
         return data if isinstance(data, dict) else {}
 
-    # ---- I0 基线：页面不含新 tag，且库里没有残留 ----
+    # ---- I0 Baseline: page does not contain new tag, and no residue in DB ----
     try:
         case = await call(
             "case_open",
@@ -135,47 +135,47 @@ async def run_inject(
             },
         )
     except ToolCallError as exc:
-        stage("I0", False, f"case_open 失败: {exc}")
+        stage("I0", False, f"case_open failed: {exc}")
         result.verdict = "ENV_ERROR"
         return result
     result.case_id = str(case.get("case_id", ""))
     kernel.case_id = result.case_id
     baseline = await call("verify_tag", {"url": base_url, "tag": tag})
     if baseline.get("found"):
-        stage("I0", False, "BASELINE_DIRTY: 页面已存在该 tag")
+        stage("I0", False, "BASELINE_DIRTY: tag already exists on page")
         result.verdict = "BASELINE_DIRTY"
         return await _finish(kernel, result, cleanup=False)
-    stage("I0", True, f"基线干净 tag={tag}")
+    stage("I0", True, f"baseline clean tag={tag}")
 
-    # ---- I1 写路径符号化：源码里找 INSERT 目标 ----
+    # ---- I1 Write path symbolic: find INSERT target in source ----
     try:
         source = await call(
             "source_read",
             {"file": sink_file, "line_from": max(1, sink_line - 40), "line_to": sink_line + 10},
         )
     except ToolCallError as exc:
-        stage("I1", False, f"source_read 失败: {exc}")
+        stage("I1", False, f"source_read failed: {exc}")
         result.verdict = "PATH_UNREACHABLE"
         return await _finish(kernel, result)
     text = "\n".join(str(item.get("text", "")) for item in source.get("lines") or [])
     target = _infer_target(text, str(raw_slice.get("sinkCode") or sink), params)
     if target is None:
-        stage("I1", False, "找不到 INSERT 目标表")
+        stage("I1", False, "INSERT target table not found")
         result.verdict = "WRITE_NOT_REACHED"
         return await _finish(kernel, result)
     notes["target"] = target
     kernel.set_write_targets([{"table": target["table"], "column": target["column"], "mode": "delete"}])
     stage("I1", True, f"target={target['table']}.{target['column']} columns={target['columns']}")
 
-    # ---- I2 入口重建：拉页面找表单 ----
+    # ---- I2 Entry reconstruction: fetch page to find form ----
     try:
         page = await call("http_request", {"method": "GET", "url": base_url})
     except ToolCallError as exc:
-        stage("I2", False, f"GET 失败: {exc}")
+        stage("I2", False, f"GET failed: {exc}")
         result.verdict = "ENV_ERROR"
         return await _finish(kernel, result)
     if int(page.get("status", 0)) >= 400:
-        stage("I2", False, f"入口 HTTP {page.get('status')}")
+        stage("I2", False, f"entry HTTP {page.get('status')}")
         result.verdict = "PATH_UNREACHABLE"
         return await _finish(kernel, result)
     document = parse(str(page.get("body") or ""))
@@ -185,18 +185,18 @@ async def run_inject(
         "",
     )
     if not forms:
-        stage("I2", False, "页面上没有 POST 表单")
+        stage("I2", False, "No POST form on page")
         result.verdict = "NO_HTTP_ENTRY"
         return await _finish(kernel, result)
     if not field_name:
-        stage("I2", False, f"表单字段 {sorted(set().union(*[set(f.fields) for f in forms]))} 与 params {params} 不匹配")
+        stage("I2", False, f"form fields {sorted(set().union(*[set(f.fields) for f in forms]))} do not match params {params}")
         result.verdict = "ENTRY_AMBIGUOUS"
         return await _finish(kernel, result)
     form = next(f for f in forms if field_name in f.fields)
     notes["entry"] = {"url": form.action, "method": form.method, "field": field_name, "fields": form.fields}
     stage("I2", True, f"form {form.action} field={field_name}")
 
-    # ---- I3 长度预算：列宽决定 payload 能不能放 ----
+    # ---- I3 Length budget: column width determines if payload fits ----
     schema = await call("db_schema", {"table": target["table"]})
     length = None
     for table_item in schema.get("tables") or []:
@@ -206,14 +206,14 @@ async def run_inject(
                     length = column.get("length")
     payload = f"{payload_base}<tia-{tag}>"
     if length is not None and len(payload) > int(length):
-        stage("I3", False, f"payload {len(payload)} > 列宽 {length}")
+        stage("I3", False, f"payload {len(payload)} > column width {length}")
         result.verdict = "LENGTH_EXCEEDED"
         return await _finish(kernel, result)
     notes["payload"] = payload
-    stage("I3", True, f"payload {len(payload)} 字符，列宽 {length}")
-    stage("I4", True, f"求交：field={field_name}，payload {len(payload)} 字符")
+    stage("I3", True, f"payload {len(payload)} chars, column width {length}")
+    stage("I4", True, f"intersect: field={field_name}, payload {len(payload)} chars")
 
-    # ---- I4/I5 投递：走应用自己的表单 ----
+    # ---- I4/I5 delivery: use the application's own form ----
     values = dict(form.fields)
     values[field_name] = payload
     for param in params:
@@ -231,7 +231,7 @@ async def run_inject(
             },
         )
     except ToolCallError as exc:
-        stage("I5", False, f"POST 失败: {exc}")
+        stage("I5", False, f"POST failed: {exc}")
         result.verdict = "WRITE_NOT_REACHED"
         return await _finish(kernel, result)
     stage("I5", True, f"POST {form.action} → {submitted.get('status')}")
@@ -239,7 +239,7 @@ async def run_inject(
         result.verdict = "WRITE_NOT_REACHED"
         return await _finish(kernel, result)
 
-    # ---- I6 三态验收：库里有没有 / 页面有没有 / 能不能执行 ----
+    # ---- I6 tri-state acceptance: in DB / on page / executable ----
     table = target["table"]
     column = target["column"]
     probe = await call(
@@ -263,7 +263,7 @@ async def run_inject(
     verdict, explanation = judge_inject(in_db, found, executable)
     notes["explanation"] = explanation
 
-    # ---- I7 收尾：删除自己造的数据，保留 change 记录可回滚 ----
+    # ---- I7 cleanup: delete self-generated data, keep change record for rollback ----
     if cleanup and in_db:
         try:
             deleted = await call(
@@ -286,9 +286,9 @@ async def run_inject(
             notes["cleanup"] = {"change_id": change, "residue": result.residue}
             stage("I7", result.residue == 0, f"cleanup change={change} residue={result.residue}")
         except ToolCallError as exc:
-            stage("I7", False, f"cleanup 失败: {exc.envelope.error.message if exc.envelope.error else exc}")
+            stage("I7", False, f"cleanup failed: {exc.envelope.error.message if exc.envelope.error else exc}")
     else:
-        stage("I7", True, "无可清理数据")
+        stage("I7", True, "no data to clean")
 
     result.verdict = verdict
     return await _finish(kernel, result)

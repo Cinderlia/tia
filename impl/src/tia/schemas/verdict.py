@@ -1,7 +1,7 @@
-"""verdict 枚举：各 agent 的判定词表（闭集）。
+"""verdict enum: the closed-set vocabulary of verdicts for each agent.
 
-注意：``verify_tag`` **不**返回 verdict，只返回 ``verdict_ceiling``；verdict 由
-各 agent 的 judge 计算（H5）。三个词表互不混用，报告里会标明来源 agent。
+Note: ``verify_tag`` **does not** return a verdict, only ``verdict_ceiling``; the verdict is
+computed by each agent's judge (H5). The three vocabularies are mutually exclusive, and the report specifies the source agent.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from enum import StrEnum
 
 
 class TriggerVerdict(StrEnum):
-    """触发 agent 的判定（《触发 Agent 文档》§verdict）。"""
+    """The verdict of the trigger agent (Trigger Agent Doc §verdict)."""
 
     NOT_EXECUTED = "NOT_EXECUTED"
     SQL_ERROR = "SQL_ERROR"
@@ -24,7 +24,7 @@ class TriggerVerdict(StrEnum):
 
 
 class InjectVerdict(StrEnum):
-    """注入 agent 的判定（《注入 Agent 文档》§I6 三态矩阵）。"""
+    """The verdict of the injection agent (Injection Agent Doc §I6 tri-state matrix)."""
 
     BASELINE_DIRTY = "BASELINE_DIRTY"
     PATH_UNREACHABLE = "PATH_UNREACHABLE"
@@ -44,7 +44,7 @@ class InjectVerdict(StrEnum):
 
 
 class MainVerdict(StrEnum):
-    """主 agent 的调度结论；只进调度统计，永不进报告安全结论。"""
+    """The scheduling conclusion of the main agent; used only for scheduling statistics, never for report security conclusions."""
 
     ARCHIVED_EXECUTABLE = "ARCHIVED_EXECUTABLE"
     ARCHIVED_FAILED = "ARCHIVED_FAILED"
@@ -56,6 +56,6 @@ class MainVerdict(StrEnum):
 
 
 class VerdictCeiling(StrEnum):
-    """verify_tag 能证明的上限，不是安全结论。"""
+    """The upper bound provable by verify_tag, not a security conclusion."""
 
     EXECUTABLE = "EXECUTABLE"

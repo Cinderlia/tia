@@ -1,4 +1,4 @@
-"""离线分析工具：filter_analyze / guard_harvest / endpoint_search / includer_trace。"""
+"""Offline analysis tools: filter_analyze / guard_harvest / endpoint_search / includer_trace."""
 
 from __future__ import annotations
 

@@ -1,7 +1,7 @@
-"""投递与验收：http_request / form_fill。
+"""Delivery and acceptance: http_request / form_fill.
 
-``form_fill`` 是纯函数（不发网络），只按 FlowRecord 的字段顺序合成请求；
-缺值的字段进 ``missing``，不替调用方猜默认值。
+``form_fill`` is a pure function (no network calls); it only composes the request based on the field order in FlowRecord;
+Fields with missing values go into ``missing``; no default values are guessed for the caller.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ def _validate(model: type[BaseModel], arguments: dict[str, Any]) -> Any:
     try:
         return model.model_validate(arguments)
     except ValidationError as exc:
-        raise _bad(f"参数不合法: {exc.errors()[0]['msg']}") from exc
+        raise _bad(f"Invalid parameter: {exc.errors()[0]['msg']}") from exc
 
 
 class HttpRequestInput(BaseModel):
@@ -46,10 +46,10 @@ async def http_request(arguments: dict[str, Any]) -> ToolOutput:
     params = _validate(HttpRequestInput, arguments)
     rt = get_runtime()
     if not params.url.startswith(("http://", "https://")):
-        raise _bad("url 必须是绝对 http(s) 地址", "容器内用 http://127.0.0.1/...")
+        raise _bad("url must be an absolute http(s) address", "Use http://127.0.0.1/... inside the container")
     method = params.method.upper()
     if method not in {"GET", "POST", "PUT", "PATCH", "HEAD"}:
-        raise _bad(f"不支持的 method: {method}")
+        raise _bad(f"Unsupported method: {method}")
 
     capture = params.capture or {}
     marker = capture.get("marker")

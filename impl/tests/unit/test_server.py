@@ -1,4 +1,4 @@
-"""端到端：真实 stdio 握手，验证 profile 下发的工具集合与调用信封。"""
+"""End-to-end: real stdio handshake, verifying the tool set and invocation envelope delivered by the profile."""
 
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ async def test_tool_count_per_profile(profile: str, expected: int) -> None:
 
 async def test_main_profile_has_no_verification_tools() -> None:
     names = {tool.name for tool in await _list_tools("main")}
-    # G4 静态断言：main 不得出现任何验证/写类工具。
+    # G4 static assertion: main must not contain any validation/write tools.
     forbidden = {
         "verify_tag",
         "probe_arm",

@@ -1,11 +1,11 @@
-"""写闸门：任何副作用之前必须过这一层。
+"""Write gate: must pass this layer before any side effect.
 
-规则来自三处：
+Rules come from three sources:
 1. profile yaml（``write_allow_tables`` / ``write_deny_columns`` / ``max_rows_per_write``）；
-2. case 登记的写目标（``case_open`` 的 ``write_targets``）——每个 case 只允许写它声明的表；
-3. SQL 结构（由 :mod:`tia.cap.sqlparse` 保证）。
+2. Write targets registered by the case (``write_targets`` of ``case_open``) — each case may only write to tables it declares;
+3. SQL structure (guaranteed by :mod:`tia.cap.sqlparse`).
 
-结论只有"放行"或 ``POLICY_DENIED``，没有灰色地带。
+The verdict is either "allow" or ``POLICY_DENIED``; there is no gray area.
 """
 
 from __future__ import annotations
@@ -24,10 +24,10 @@ def _deny(message: str, hint: str = "") -> ToolError:
 
 def require_case(store: Store, case_id: str) -> dict[str, Any]:
     if not case_id:
-        raise _deny("写库必须绑定 case_id", "先在 case 中登记写目标，再写库")
+        raise _deny("DB writes must be bound to a case_id", "Register write targets in the case before writing to the DB")
     case = store.get_case(case_id)
     if case is None:
-        raise ToolError(ErrorCode.NOT_FOUND, f"case 不存在: {case_id}", hint="先调用 case_open")
+        raise ToolError(ErrorCode.NOT_FOUND, f"case not found: {case_id}", hint="Call case_open first")
     return case
 
 
@@ -39,7 +39,7 @@ def check_write(
     statement: WriteStatement,
     rows: int,
 ) -> None:
-    """写库前的全部检查；不通过直接抛 ``ToolError``。"""
+    """All checks before DB writes; raises ``ToolError`` directly if failed."""
     require_case(store, case_id)
 
     targets = store.write_targets(case_id)
@@ -47,16 +47,16 @@ def check_write(
     allowed = set(profile.write_allow_tables) | declared
     if statement.table not in allowed:
         raise _deny(
-            f"表 {statement.table!r} 不在可写清单内",
-            "在 case_open 的 write_targets 里登记该表，或由 profile 白名单放行",
+            f"Table {statement.table!r} is not in the writable list",
+            "Register the table in case_open's write_targets, or allow it via the profile whitelist",
         )
 
     denied = set(profile.write_deny_columns)
     hit = denied.intersection(statement.columns)
     if hit:
-        raise _deny(f"列 {sorted(hit)!r} 在写法黑名单内")
+        raise _deny(f"Columns {sorted(hit)!r} are in the write blacklist")
 
-    # 只写 case 声明过的列（INSERT 时）；表级目标（column 为空）不限列。
+    # Only write columns declared by the case (for INSERT); table-level targets (empty column) have no column restrictions.
     declared_columns = {
         str(t.get("column")) for t in targets if t.get("table") == statement.table and t.get("column")
     }
@@ -64,13 +64,13 @@ def check_write(
         outside = set(statement.columns) - declared_columns
         if outside:
             raise _deny(
-                f"列 {sorted(outside)!r} 未被 case 登记",
-                f"case 允许的列: {sorted(declared_columns)}",
+                f"Columns {sorted(outside)!r} are not registered by the case",
+                f"Columns allowed by the case: {sorted(declared_columns)}",
             )
 
     limit = profile.max_rows_per_write
     if rows > limit:
         raise _deny(
-            f"一次写 {rows} 行，超过上限 {limit}",
-            "多行写入需要 allow_multi 并在 case 里登记；当前实现一律拒绝",
+            f"Writing {rows} rows in one go, exceeding the limit of {limit}",
+            "Multi-row writes require allow_multi and registration in the case; the current implementation rejects all",
         )

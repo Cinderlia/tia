@@ -1,7 +1,7 @@
-"""trigger 主流程（P0–P6）的编排测试。
+"""Orchestration tests for the trigger main flow (P0–P6).
 
-工具由假 client 提供，不连真实靶场；真实靶场的验证放在 scripts/smoke-trigger.sh。
-这样 CI 能跑，且流程决策（stage 顺序、verdict、undo）与网络/数据库解耦。
+Tools are provided by a mock client; no real range is connected. Real range validation is in scripts/smoke-trigger.sh.
+This allows CI to run, decoupling flow decisions (stage order, verdict, undo) from network/database.
 """
 
 from __future__ import annotations
@@ -118,9 +118,9 @@ async def test_trigger_stage_order_and_verdict(runtime: Any) -> None:
     assert [stage.stage for stage in result.stages] == ["P0", "P1", "P2", "P3", "P4", "P5", "P6", "P6"]
     assert result.notes["table"] == "comments"
     assert result.notes["tag"] in result.notes["payload"]
-    # 写库与验收都必须真实发生
+    # DB writes and acceptance must actually occur
     assert "db_write" in client.calls and "verify_tag" in client.calls and "db_undo" in client.calls
-    # 证据全部挂在 case 上
+    # All evidence is attached to the case
     assert result.report == "# report"
 
 
