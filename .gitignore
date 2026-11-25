@@ -1,0 +1,59 @@
+# ---- 设计资料与本机工作区：不入版本库 ----
+tia-design-kit/
+dsh-workdir/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.python-version
+
+# ---- 测试与类型检查 ----
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.hypothesis/
+
+# ---- 运行时产物 ----
+*.log
+logs/
+.runtime/
+runs/
+cases/
+out/
+tmp/
+!docs/**/tmp/
+
+# ---- 本地配置与密钥 ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+profiles.local.yaml
+secrets.yaml
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# ---- 采集器编译产物 ----
+impl/probe-php/vendor/
+*.phar
