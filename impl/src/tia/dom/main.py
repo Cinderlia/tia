@@ -13,6 +13,7 @@ from typing import Any
 from tia.dom.inject import run_inject
 from tia.dom.trigger import normalize_slice, run_trigger
 from tia.orch.kernel import ToolClient
+from tia.orch.slicing import pair_files, score_slice
 from tia.schemas.objects import CaseOutcome
 
 
@@ -131,6 +132,25 @@ def _report(result: MainResult) -> str:
     return "\n".join(lines)
 
 
+def seed_queue(queue_store: Any, run_id: str, slices: list[dict[str, Any]]) -> list[str]:
+    """Seed the queue and attach heuristic scores/digests (M1 prior)."""
+    ids: list[str] = queue_store.seed_slices(run_id, slices)
+    paired_files = pair_files(slices)
+    history: dict[str, list[str]] = queue_store.verdict_history()
+    for slice_id_, raw in zip(ids, slices, strict=False):
+        sink_value = raw.get("sink")
+        sink: dict[str, Any] = sink_value if isinstance(sink_value, dict) else {}
+        file_ = str(sink.get("file") or raw.get("sinkFile") or "")
+        line = int(sink.get("line") or raw.get("sinkLine") or 0)
+        scored = score_slice(
+            raw,
+            paired=file_ in paired_files,
+            history=history.get(f"{file_}:{line}", []),
+        )
+        queue_store.set_slice_score(slice_id_, scored.score, scored.reasons, scored.digest)
+    return ids
+
+
 async def run_queue(
     queue_store: Any,
     base_url: str,
@@ -187,6 +207,9 @@ async def run_queue(
                 duration_ms=int((time.monotonic() - started) * 1000),
             )
         queue_store.archive_slice(sid, outcome.verdict, case_id=outcome.case_id)
+        if outcome.verdict not in {"EXECUTED", "EXECUTABLE", "NOT_EXECUTABLE", "WRITTEN_NOT_VISIBLE"}:
+            # Demote failures so lower-quality slices fall behind on the next read.
+            queue_store.bump_slice_score(sid, -15)
         result.outcomes.append(outcome)
         if outcome.verdict in {"EXECUTED", "EXECUTABLE", "NOT_EXECUTABLE", "WRITTEN_NOT_VISIBLE"}:
             failures = 0

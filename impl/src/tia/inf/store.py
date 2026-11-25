@@ -102,6 +102,9 @@ CREATE TABLE IF NOT EXISTS slice (
     attempts    INTEGER NOT NULL DEFAULT 0,
     verdict     TEXT,
     notes       TEXT NOT NULL DEFAULT '',
+    score       INTEGER NOT NULL DEFAULT 0,
+    reasons     TEXT NOT NULL DEFAULT '[]',
+    digest      TEXT NOT NULL DEFAULT '{}',
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
@@ -121,6 +124,14 @@ class Store:
     def migrate(self) -> None:
         with self._conn() as conn:
             conn.executescript(_SCHEMA)
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(slice)")}
+            for name, ddl in (
+                ("score", "ALTER TABLE slice ADD COLUMN score INTEGER NOT NULL DEFAULT 0"),
+                ("reasons", "ALTER TABLE slice ADD COLUMN reasons TEXT NOT NULL DEFAULT '[]'"),
+                ("digest", "ALTER TABLE slice ADD COLUMN digest TEXT NOT NULL DEFAULT '{}'"),
+            ):
+                if name not in columns:
+                    conn.execute(ddl)
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
@@ -390,7 +401,7 @@ class Store:
         if run_id:
             sql += " AND run_id=?"
             args = (run_id,)
-        sql += " ORDER BY attempts, kind, sink_file, sink_line LIMIT 1"
+        sql += " ORDER BY score DESC, attempts, kind, sink_file, sink_line LIMIT 1"
         with self._conn() as conn:
             row = conn.execute(sql, args).fetchone()
             if row is None:
@@ -440,13 +451,81 @@ class Store:
             return cursor.rowcount > 0
 
     def list_slices(self, status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
-        sql = "SELECT id, run_id, kind, sink_file, sink_line, status, attempts, verdict, notes FROM slice"
+        sql = "SELECT id, run_id, kind, sink_file, sink_line, status, attempts, verdict, notes, score FROM slice"
         args: tuple[Any, ...] = ()
         if status:
             sql += " WHERE status=?"
             args = (status,)
-        sql += " ORDER BY created_at, sink_file, sink_line, id LIMIT ?"
+        sql += " ORDER BY score DESC, created_at, sink_file, sink_line, id LIMIT ?"
         args += (limit,)
         with self._conn() as conn:
             rows = conn.execute(sql, args).fetchall()
         return [dict(r) for r in rows]
+
+    def set_slice_score(
+        self, slice_id: str, score: int, reasons: list[str], digest: dict[str, Any]
+    ) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE slice SET score=?, reasons=?, digest=?, updated_at=? WHERE id=?",
+                (score, json.dumps(reasons, ensure_ascii=False),
+                 json.dumps(digest, ensure_ascii=False), now_iso(), slice_id),
+            )
+
+    def bump_slice_score(self, slice_id: str, delta: int) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE slice SET score=MAX(0, score + ?), updated_at=? WHERE id=?",
+                (delta, now_iso(), slice_id),
+            )
+
+    def peek_slices(self, limit: int = 5, run_id: str | None = None) -> list[dict[str, Any]]:
+        """Pending slices in queue order, digest only (no lease, no attempt bump)."""
+        sql = "SELECT id, run_id, kind, sink_file, sink_line, attempts, score, reasons, digest FROM slice WHERE status='pending'"
+        args: tuple[Any, ...] = ()
+        if run_id:
+            sql += " AND run_id=?"
+            args = (run_id,)
+        sql += " ORDER BY score DESC, attempts, kind, sink_file, sink_line LIMIT ?"
+        args += (max(1, min(limit, 50)),)
+        with self._conn() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        return [
+            {
+                "slice_id": row["id"],
+                "run_id": row["run_id"],
+                "attempts": row["attempts"],
+                "score": row["score"],
+                "reasons": json.loads(row["reasons"] or "[]"),
+                "digest": json.loads(row["digest"] or "{}"),
+            }
+            for row in rows
+        ]
+
+    def lease_slice(self, slice_id: str) -> dict[str, Any] | None:
+        """Lease one specific slice (planner choice); None when it is not pending."""
+        with self._conn() as conn:
+            cursor = conn.execute(
+                "UPDATE slice SET status='running', attempts=attempts+1, updated_at=?"
+                " WHERE id=? AND status='pending'",
+                (now_iso(), slice_id),
+            )
+            if cursor.rowcount == 0:
+                return None
+            row = conn.execute("SELECT * FROM slice WHERE id=?", (slice_id,)).fetchone()
+        loaded = dict(row)
+        loaded["slice"] = json.loads(loaded.pop("slice_json"))
+        return loaded
+
+    def verdict_history(self) -> dict[str, list[str]]:
+        """Archived verdicts keyed by ``file:line`` so scoring can reuse earlier outcomes."""
+        history: dict[str, list[str]] = {}
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT sink_file, sink_line, verdict FROM slice"
+                " WHERE verdict IS NOT NULL ORDER BY updated_at DESC LIMIT 2000"
+            ).fetchall()
+        for row in rows:
+            key = f"{row['sink_file']}:{row['sink_line']}"
+            history.setdefault(key, []).append(str(row["verdict"]))
+        return history

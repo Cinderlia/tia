@@ -226,6 +226,12 @@ _SLICE_NEXT_SCHEMA = {
     "properties": {
         "run_id": {"type": "string", "description": "Only lease slices seeded for this run"},
         "ttl_minutes": {"type": "integer", "minimum": 1, "maximum": 1440},
+        "peek": {
+            "type": "boolean",
+            "description": "Return ranked slice digests without leasing (planner view)",
+        },
+        "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+        "slice_id": {"type": "string", "description": "Lease exactly this slice (planner choice)"},
     },
     "additionalProperties": False,
 }

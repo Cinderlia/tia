@@ -18,6 +18,9 @@ from tia.schemas.envelope import ErrorCode, ToolError
 class SliceNextInput(BaseModel):
     run_id: str | None = None
     ttl_minutes: int = Field(default=30, ge=1, le=1440)
+    peek: bool = False
+    limit: int = Field(default=5, ge=1, le=50)
+    slice_id: str | None = None
 
 
 class SliceArchiveInput(BaseModel):
@@ -51,6 +54,8 @@ def _slice_public(item: dict[str, Any]) -> dict[str, Any]:
         "sink_file": item["sink_file"],
         "sink_line": item["sink_line"],
         "attempts": item["attempts"],
+        "score": item.get("score", 0),
+        "digest": item.get("digest", {}),
         "slice": payload,
     }
 
@@ -61,8 +66,28 @@ async def slice_next(arguments: dict[str, Any]) -> ToolOutput:
     except ValidationError as exc:
         raise _bad_args(exc) from exc
     store = get_runtime().store
+    if params.peek:
+        # Planner view: ranked digests, nothing leased.
+        candidates = store.peek_slices(params.limit, run_id=params.run_id)
+        return ToolOutput(
+            data={
+                "found": bool(candidates),
+                "candidates": candidates,
+                "total_pending": len(store.list_slices(status="pending", limit=200)),
+            }
+        )
+    if params.slice_id:
+        # Planner choice: lease exactly the slice it asked for.
+        leased = store.lease_slice(params.slice_id)
+        if leased is None:
+            raise ToolError(
+                code=ErrorCode.CONFLICT,
+                message=f"slice {params.slice_id!r} is not pending",
+                hint="Call slice_next with peek=true to see pending slices",
+            )
+        return ToolOutput(data={"found": True, **_slice_public(leased)})
     while True:
-        item = store.next_slice(ttl_minutes=params.ttl_minutes)
+        item = store.next_slice(ttl_minutes=params.ttl_minutes, run_id=params.run_id)
         if item is None:
             return ToolOutput(
                 data={"found": False, "slice": None, "queue": store.list_slices(status="pending", limit=5)}

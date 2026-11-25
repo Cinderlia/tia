@@ -225,3 +225,79 @@ async def test_run_queue_leases_and_archives(monkeypatch: pytest.MonkeyPatch, tm
     rows = queue.list_slices()
     assert {row["status"] for row in rows} == {"executed"}
     assert {row["verdict"] for row in rows} == {"EXECUTABLE"}
+
+
+def test_score_prefers_reflection_and_pairs() -> None:
+    from tia.orch.slicing import pair_files, score_slice
+
+    read_slice = {
+        "kind": "Xss",
+        "sinkFile": "vulnerabilities/stored_xss/home.php",
+        "sinkLine": 61,
+        "sinkCode": "echo ucfirst($rows[0])",
+        "sources": [{"file": "x", "line": 55, "param": "msg"}],
+        "sqlProbe": {"extensionConfig": {"file": "x", "line": "55", "output": "r.json"}},
+    }
+    exec_slice = {
+        "kind": "Xss",
+        "sinkFile": "vulnerabilities/cmd/home.php",
+        "sinkLine": 9,
+        "sinkCode": "system($_GET['cmd'])",
+        "sources": [{"file": "x", "line": 8, "param": None}],
+    }
+    high = score_slice(read_slice, paired=True, history=["EXECUTABLE"])
+    low = score_slice(exec_slice)
+    assert high.score > low.score + 20
+    assert any("reflection" in reason for reason in high.reasons)
+    write_slice = {
+        "kind": "Xss",
+        "sinkFile": "vulnerabilities/stored_xss/home.php",
+        "sinkLine": 48,
+        "sinkCode": '$stmt->bindParam(":user", $user);',
+    }
+    assert pair_files([read_slice, write_slice, exec_slice]) == {
+        "vulnerabilities/stored_xss/home.php"
+    }
+
+
+def test_score_penalises_guards() -> None:
+    from tia.orch.slicing import score_slice
+
+    raw = {"kind": "Xss", "sinkFile": "a/b.php", "sinkLine": 3, "sinkCode": "echo $x"}
+    guarded = dict(raw, optionalGuards=["htmlspecialchars"])
+    assert score_slice(guarded).score < score_slice(raw).score
+
+
+def test_queue_orders_by_score_and_leases_choice(store: Store) -> None:
+
+    ids = store.seed_slices("run-s", [SLICE_A, SLICE_B])
+    store.set_slice_score(ids[0], 20, ["low"], {"sink": "a"})
+    store.set_slice_score(ids[1], 80, ["high"], {"sink": "b"})
+    candidates = store.peek_slices(limit=5, run_id="run-s")
+    assert [row["slice_id"] for row in candidates] == [ids[1], ids[0]]
+    leased = store.lease_slice(ids[0])
+    assert leased is not None
+    assert leased["attempts"] == 1
+    assert store.lease_slice(ids[0]) is None
+    assert store.next_slice(run_id="run-s")["id"] == ids[1]  # type: ignore[index]
+
+
+async def test_slice_next_peek_then_lease_choice(configured: Store) -> None:
+    from tia.dom.main import seed_queue
+
+    seed_queue(configured, "run-p", [SLICE_A, SLICE_B])
+    peek = await slice_next({"peek": True, "run_id": "run-p", "limit": 5})
+    candidates = peek.data["candidates"]
+    assert len(candidates) == 2
+    assert all("score" in item and "reasons" in item for item in candidates)
+    chosen = candidates[-1]["slice_id"]
+    leased = await slice_next({"slice_id": chosen})
+    assert leased.data["slice_id"] == chosen
+    again = await slice_next({"peek": True, "run_id": "run-p"})
+    assert chosen not in [item["slice_id"] for item in again.data["candidates"]]
+
+
+async def test_slice_next_lease_conflict(configured: Store) -> None:
+    with pytest.raises(ToolError) as conflict:
+        await slice_next({"slice_id": "missing"})
+    assert conflict.value.code == ErrorCode.CONFLICT

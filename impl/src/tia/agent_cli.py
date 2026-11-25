@@ -15,7 +15,7 @@ from typing import Any
 
 from tia import __version__
 from tia.dom.inject import InjectResult, run_inject
-from tia.dom.main import MainResult, run_main, run_queue
+from tia.dom.main import MainResult, run_main, run_queue, seed_queue
 from tia.dom.trigger import TriggerResult, run_trigger
 from tia.inf.config import Settings
 from tia.inf.runtime import configure, get_runtime
@@ -198,7 +198,7 @@ def _run_main(args: argparse.Namespace) -> int:
     try:
         if args.queue:
             store = get_runtime().store
-            store.seed_slices(run_id, slices)
+            seed_queue(store, run_id, slices)
             result: MainResult = asyncio.run(
                 run_queue(
                     store,
