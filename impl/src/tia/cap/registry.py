@@ -178,6 +178,48 @@ _ARTIFACT_SAVE_SCHEMA = {
     "additionalProperties": False,
 }
 
+_PROBE_ARM_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "case_id": {"type": "string"},
+        "file": {"type": "string", "description": "Target PHP file, relative to the application root or absolute"},
+        "line": {"type": "integer", "minimum": 1, "description": "Line that issues, sources or reads the query"},
+        "output": {"type": "string", "description": "Plain .json file name; defaults to <case_id>-<line>.json"},
+        "match": {
+            "type": "string",
+            "enum": ["line", "origin", "fetch", "prepare"],
+            "description": "Recorded as the caller's expectation; the probe itself reports how it matched",
+        },
+    },
+    "required": ["case_id", "file", "line"],
+    "additionalProperties": False,
+}
+
+_PROBE_RUN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "case_id": {"type": "string"},
+        "url": {"type": "string"},
+        "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "HEAD"]},
+        "params": {"type": "object"},
+        "body": {"type": "string", "description": "Raw request body, e.g. a form-encoded POST"},
+        "headers": {"type": "object"},
+        "output": {"type": "string", "description": "Read this capture instead of the armed one"},
+        "wait_ms": {"type": "integer", "minimum": 0, "maximum": 2000},
+    },
+    "required": ["case_id", "url"],
+    "additionalProperties": False,
+}
+
+_PROBE_DISARM_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "case_id": {"type": "string"},
+        "remove_output": {"type": "boolean"},
+    },
+    "additionalProperties": False,
+}
+
 #: 36 tools, order consistent with "Tool Interface Documentation".
 TOOLS: tuple[ToolSpec, ...] = (
     # 1. Source code and entry points (7)
@@ -194,9 +236,30 @@ TOOLS: tuple[ToolSpec, ...] = (
     _t("db_read", "Read-only SQL query, returning rows and column metadata", "data", handler_path="tia.cap.db:db_read"),
     _t("db_write", "Write to database (must return change_id and undo_sql)", "data", mutating=True, handler_path="tia.cap.db:db_write"),
     _t("db_undo", "Rollback own writes, must have residue==0", "data", mutating=True, handler_path="tia.cap.db:db_undo"),
-    _t("probe_arm", "Attach collection probes at read/write points", "probe", mutating=True),
-    _t("probe_run", "Run probe request and retrieve hit SQL and bound parameters", "probe", mutating=True),
-    _t("probe_disarm", "Remove probes", "probe", mutating=True),
+    _t(
+        "probe_arm",
+        "Attach collection probes at read/write points",
+        "probe",
+        mutating=True,
+        handler_path="tia.cap.probe:probe_arm",
+        input_schema=_PROBE_ARM_SCHEMA,
+    ),
+    _t(
+        "probe_run",
+        "Run probe request and retrieve hit SQL and bound parameters",
+        "probe",
+        mutating=True,
+        handler_path="tia.cap.probe:probe_run",
+        input_schema=_PROBE_RUN_SCHEMA,
+    ),
+    _t(
+        "probe_disarm",
+        "Remove probes",
+        "probe",
+        mutating=True,
+        handler_path="tia.cap.probe:probe_disarm",
+        input_schema=_PROBE_DISARM_SCHEMA,
+    ),
     _t("write_probe", "Perform before/after diff on target table", "probe", mutating=True),
     # 3. Delivery and Acceptance (7)
     _t("http_request", "Issue single HTTP request (explicit Cookie, no redirect following)", "http", handler_path="tia.cap.http:http_request"),

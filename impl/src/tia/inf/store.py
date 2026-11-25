@@ -299,6 +299,37 @@ class Store:
                 break
         return result
 
+    def add_probe(
+        self,
+        case_id: str,
+        *,
+        probe_id: str,
+        mode: str,
+        target: dict[str, Any],
+        status: str,
+        body: dict[str, Any],
+    ) -> int:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) AS s FROM probe WHERE case_id=?", (case_id,)
+            ).fetchone()
+            seq = int(row["s"]) + 1
+            conn.execute(
+                "INSERT INTO probe (case_id, seq, probe_id, mode, target, status, body, observed_at)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    case_id,
+                    seq,
+                    probe_id,
+                    mode,
+                    json.dumps(target, ensure_ascii=False),
+                    status,
+                    json.dumps(body, ensure_ascii=False),
+                    now_iso(),
+                ),
+            )
+        return seq
+
     def add_flow(self, case_id: str, kind: str, body: dict[str, Any], code_ver: str = "") -> int:
         with self._conn() as conn:
             row = conn.execute(
