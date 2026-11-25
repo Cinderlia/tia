@@ -23,6 +23,7 @@ from tia.orch.kernel import Kernel, LocalToolClient, ToolCallError, ToolClient
 
 DEFAULT_PAYLOAD = "<script>alert(1)</script>"
 _TAG_RE = re.compile(r"<tia-([a-z0-9]{4})>")
+_POST_VAR_RE = re.compile(r"\$_POST\[\s*[\'\"]([A-Za-z_][\w]*)[\'\"]\s*\]")
 
 
 @dataclass
@@ -78,6 +79,32 @@ def _forms(document: Document, page_url: str) -> list[_Form]:
 _INSERT_RE = re.compile(
     r"insert\s+(?:ignore\s+)?into\s+([`\"]?)([A-Za-z_][\w]*)\1\s*\(([^)]*)\)", re.I
 )
+
+
+_ASSIGN_RE = re.compile(r"^\s*\$(\w+)\s*=")
+_POST_READ_RE = re.compile(r"\$_POST\[\s*[\'\"](\w+)[\'\"]\s*\]")
+_BIND_RE = re.compile(r"bind(?:Param|Value)\(\s*[\'\"]:(\w+)[\'\"]\s*,\s*\$(\w+)")
+
+
+def _column_params(text: str) -> dict[str, str]:
+    """Map INSERT column -> POST parameter via assignments and bindParam calls.
+
+    Assignments are matched per line so that direct reads and guard forms such as
+    ``$user = isset($_POST['name']) ? $_POST['name'] : ''`` both resolve.
+    """
+    variables: dict[str, str] = {}
+    for line in text.splitlines():
+        assigned = _ASSIGN_RE.match(line)
+        if assigned is None:
+            continue
+        reads = _POST_READ_RE.findall(line)
+        if reads:
+            variables[assigned.group(1)] = reads[0]
+    mapping: dict[str, str] = {}
+    for column, variable in _BIND_RE.findall(text):
+        if variable in variables:
+            mapping[column] = variables[variable]
+    return mapping
 
 
 def _insert_line(lines: list[dict[str, Any]]) -> int | None:
@@ -174,6 +201,10 @@ async def run_inject(
         result.verdict = "PATH_UNREACHABLE"
         return await _finish(kernel, result)
     text = "\n".join(str(item.get("text", "")) for item in source.get("lines") or [])
+    if not params:
+        # The trigger slice carries no source parameters; recover POST fields from the write path itself.
+        params = sorted(set(_POST_VAR_RE.findall(text)))
+        notes["params_from_source"] = params
     target = _infer_target(text, str(raw_slice.get("sinkCode") or sink), params)
     if target is None:
         stage("I1", False, "INSERT target table not found")
@@ -203,38 +234,52 @@ async def run_inject(
         return await _finish(kernel, result)
     document = parse(str(page.get("body") or ""))
     forms = [f for f in _forms(document, base_url) if f.method == "post"]
-    field_name = next(
-        (name for name in params if any(name in form.fields for form in forms)),
-        "",
-    )
     if not forms:
         stage("I2", False, "No POST form on page")
         result.verdict = "NO_HTTP_ENTRY"
         return await _finish(kernel, result)
-    if not field_name:
+    column_params = _column_params(text)
+    notes["column_params"] = column_params
+    candidates = [
+        parameter
+        for column, parameter in column_params.items()
+        if any(parameter in form.fields for form in forms)
+    ] or [name for name in params if any(name in form.fields for form in forms)]
+    if not candidates:
         stage("I2", False, f"form fields {sorted(set().union(*[set(f.fields) for f in forms]))} do not match params {params}")
         result.verdict = "ENTRY_AMBIGUOUS"
         return await _finish(kernel, result)
-    form = next(f for f in forms if field_name in f.fields)
-    notes["entry"] = {"url": form.action, "method": form.method, "field": field_name, "fields": form.fields}
-    stage("I2", True, f"form {form.action} field={field_name}")
+    notes["candidates"] = candidates
+    stage("I2", True, f"form {forms[0].action} candidate fields={candidates}")
 
-    # ---- I3 Length budget: column width determines if payload fits ----
+    # ---- I3 Length budget: pick the widest writable column that fits the payload ----
     schema = await call("db_schema", {"table": target["table"]})
-    length = None
+    widths: dict[str, int | None] = {}
     for table_item in schema.get("tables") or []:
         if table_item.get("name") == target["table"]:
             for column in table_item.get("columns") or []:
-                if column.get("name") == target["column"]:
-                    length = column.get("length")
+                widths[str(column.get("name"))] = column.get("length")
     payload = f"{payload_base}<tia-{tag}>"
-    if length is not None and len(payload) > int(length):
-        stage("I3", False, f"payload {len(payload)} > column width {length}")
+    fitting: list[tuple[int, str, str]] = []
+    param_columns = {parameter: column for column, parameter in column_params.items()}
+    for candidate in candidates:
+        column = param_columns.get(candidate) or (
+            candidate if candidate in target["columns"] else target["column"]
+        )
+        width = widths.get(column)
+        if width is None or len(payload) <= int(width):
+            fitting.append((int(width or 0), candidate, column))
+    if not fitting:
+        stage("I3", False, f"payload {len(payload)} exceeds every candidate column: {widths}")
         result.verdict = "LENGTH_EXCEEDED"
         return await _finish(kernel, result)
+    _, field_name, chosen_column = max(fitting)
+    form = next(f for f in forms if field_name in f.fields)
+    target["column"] = chosen_column
+    notes["entry"] = {"url": form.action, "method": form.method, "field": field_name, "fields": form.fields}
     notes["payload"] = payload
-    stage("I3", True, f"payload {len(payload)} chars, column width {length}")
-    stage("I4", True, f"intersect: field={field_name}, payload {len(payload)} chars")
+    stage("I3", True, f"payload {len(payload)} chars, column {chosen_column} width={widths.get(chosen_column)}")
+    stage("I4", True, f"intersect: field={field_name}, column={chosen_column}, payload {len(payload)} chars")
 
     # ---- I4/I5 delivery: use the application's own form ----
     values = dict(form.fields)

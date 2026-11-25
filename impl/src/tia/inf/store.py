@@ -341,3 +341,112 @@ class Store:
                 (case_id, seq, kind, json.dumps(body, ensure_ascii=False), code_ver, now_iso()),
             )
         return seq
+
+    # -- slice queue -------------------------------------------------------
+
+    def seed_slices(self, run_id: str, slices: list[dict[str, Any]]) -> list[str]:
+        """Insert slices, de-duplicating on (sink_file, sink_line); returns the pending ids."""
+        seeded: list[str] = []
+        ts = now_iso()
+        for raw in slices:
+            raw_sink = raw.get("sink")
+            sink: dict[str, Any] = raw_sink if isinstance(raw_sink, dict) else {}
+            sink_file = str(sink.get("file") or raw.get("sinkFile") or "")
+            sink_line = int(sink.get("line") or raw.get("sinkLine") or 0)
+            if not sink_file:
+                continue
+            slice_id = str(raw.get("slice_id") or f"slice-{uuid.uuid4().hex[:8]}")
+            with self._conn() as conn:
+                exists = conn.execute(
+                    "SELECT id FROM slice WHERE run_id=? AND sink_file=? AND sink_line=?"
+                    " AND status IN ('pending','running')",
+                    (run_id, sink_file, sink_line),
+                ).fetchone()
+                if exists is not None:
+                    seeded.append(str(exists["id"]))
+                    continue
+                conn.execute(
+                    "INSERT INTO slice (id, run_id, kind, sink_file, sink_line, slice_json, created_at, updated_at)"
+                    " VALUES (?,?,?,?,?,?,?,?)",
+                    (
+                        slice_id,
+                        run_id,
+                        str(raw.get("kind") or "unknown"),
+                        sink_file,
+                        sink_line,
+                        json.dumps(raw, ensure_ascii=False),
+                        ts,
+                        ts,
+                    ),
+                )
+            seeded.append(slice_id)
+        return seeded
+
+    def next_slice(self, ttl_minutes: int = 30, run_id: str | None = None) -> dict[str, Any] | None:
+        """Lease the next pending slice; running slices older than the TTL return to pending."""
+        self.requeue_expired(ttl_minutes)
+        sql = "SELECT id FROM slice WHERE status='pending'"
+        args: tuple[Any, ...] = ()
+        if run_id:
+            sql += " AND run_id=?"
+            args = (run_id,)
+        sql += " ORDER BY attempts, kind, sink_file, sink_line LIMIT 1"
+        with self._conn() as conn:
+            row = conn.execute(sql, args).fetchone()
+            if row is None:
+                return None
+            slice_id = str(row["id"])
+            conn.execute(
+                "UPDATE slice SET status='running', attempts=attempts+1, updated_at=? WHERE id=?",
+                (now_iso(), slice_id),
+            )
+            fresh = conn.execute("SELECT * FROM slice WHERE id=?", (slice_id,)).fetchone()
+        loaded = dict(fresh)
+        loaded["slice"] = json.loads(loaded.pop("slice_json"))
+        return loaded
+
+    def requeue_expired(self, ttl_minutes: int = 30) -> int:
+        cutoff = datetime.now().astimezone().timestamp() - ttl_minutes * 60
+        requeued = 0
+        with self._conn() as conn:
+            rows = conn.execute("SELECT id, updated_at FROM slice WHERE status='running'").fetchall()
+            for row in rows:
+                try:
+                    updated = datetime.fromisoformat(str(row["updated_at"]))
+                except ValueError:
+                    continue
+                if updated.timestamp() < cutoff:
+                    conn.execute(
+                        "UPDATE slice SET status='pending', updated_at=? WHERE id=?",
+                        (now_iso(), row["id"]),
+                    )
+                    requeued += 1
+        return requeued
+
+    def archive_slice(self, slice_id: str, verdict: str, *, case_id: str = "", notes: str = "") -> bool:
+        with self._conn() as conn:
+            cursor = conn.execute(
+                "UPDATE slice SET status='executed', verdict=?, notes=?, updated_at=? WHERE id=?",
+                (verdict, notes or case_id, now_iso(), slice_id),
+            )
+            return cursor.rowcount > 0
+
+    def skip_slice(self, slice_id: str, reason: str, *, status: str = "skipped") -> bool:
+        with self._conn() as conn:
+            cursor = conn.execute(
+                "UPDATE slice SET status=?, notes=?, updated_at=? WHERE id=?",
+                (status, reason, now_iso(), slice_id),
+            )
+            return cursor.rowcount > 0
+
+    def list_slices(self, status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        sql = "SELECT id, run_id, kind, sink_file, sink_line, status, attempts, verdict, notes FROM slice"
+        args: tuple[Any, ...] = ()
+        if status:
+            sql += " WHERE status=?"
+            args = (status,)
+        sql += " ORDER BY created_at, sink_file, sink_line, id LIMIT ?"
+        args += (limit,)
+        with self._conn() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        return [dict(r) for r in rows]

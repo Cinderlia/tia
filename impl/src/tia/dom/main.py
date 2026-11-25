@@ -54,7 +54,9 @@ async def run_main(
 ) -> MainResult:
     result = MainResult()
     failures = 0
-    for order, raw in enumerate(pick(raw_slices)[: max(limit, 0)]):
+    ordered = pick(raw_slices)
+    attempted = ordered[: max(limit, 0)]
+    for order, raw in enumerate(attempted):
         started = time.monotonic()
         sid = slice_id(raw, order)
         trigger = await run_trigger(
@@ -95,13 +97,20 @@ async def run_main(
                 duration_ms=int((time.monotonic() - started) * 1000),
             )
         result.outcomes.append(outcome)
-        if outcome.verdict in {"EXECUTED", "NOT_EXECUTABLE", "WRITTEN_NOT_VISIBLE"}:
+        if outcome.verdict in {
+            "EXECUTED",
+            "EXECUTABLE",
+            "NOT_EXECUTABLE",
+            "WRITTEN_NOT_VISIBLE",
+        }:
             failures = 0
         else:
             failures += 1
             if failures >= max_consecutive_failures:
                 result.stop_reason = "BLOCKED_NEEDS_HUMAN"
                 break
+    if result.stop_reason == "DONE" and len(ordered) > len(attempted):
+        result.stop_reason = "LIMIT_REACHED"
     result.report = _report(result)
     return result
 
@@ -120,3 +129,74 @@ def _report(result: MainResult) -> str:
         detail = ", ".join(f"{key}={value}" for key, value in item.notes.items())
         lines.append(f"| {item.slice_id} | {item.verdict} | {item.residue} | {detail} |")
     return "\n".join(lines)
+
+
+async def run_queue(
+    queue_store: Any,
+    base_url: str,
+    run_id: str | None = None,
+    limit: int = 10,
+    payload_base: str = "<script>alert(1)</script>",
+    budget: int = 120,
+    trigger_client: ToolClient | None = None,
+    inject_client: ToolClient | None = None,
+    max_consecutive_failures: int = 3,
+) -> MainResult:
+    """M0→M6 over the persisted queue: lease, run, archive; the queue is the source of truth."""
+    result = MainResult()
+    failures = 0
+    for _ in range(max(limit, 0)):
+        item = queue_store.next_slice(run_id=run_id)
+        if item is None:
+            result.stop_reason = "DONE"
+            break
+        raw = item["slice"]
+        sid = str(item["id"])
+        started = time.monotonic()
+        trigger = await run_trigger(
+            normalize_slice(raw),
+            base_url=base_url,
+            payload_base=payload_base,
+            budget=min(budget, 40),
+            client=trigger_client,
+        )
+        notes = {"trigger": trigger.verdict, "trigger_case": trigger.case_id}
+        if trigger.verdict == "EXECUTED" and trigger.residue == 0:
+            inject = await run_inject(
+                raw, base_url=base_url, payload_base=payload_base, budget=min(budget, 40), client=inject_client
+            )
+            refs = [step.evidence_ref for step in inject.trace if step.evidence_ref]
+            outcome = CaseOutcome(
+                slice_id=sid,
+                case_id=inject.case_id,
+                verdict=inject.verdict,
+                evidence_refs=refs,
+                residue=inject.residue or 0,
+                notes={**notes, "inject": inject.verdict, "inject_case": inject.case_id},
+                duration_ms=int((time.monotonic() - started) * 1000),
+            )
+        else:
+            refs = [step.evidence_ref for step in trigger.trace if step.evidence_ref]
+            outcome = CaseOutcome(
+                slice_id=sid,
+                case_id=trigger.case_id,
+                verdict=trigger.verdict,
+                evidence_refs=refs,
+                residue=trigger.residue or 0,
+                notes=notes,
+                duration_ms=int((time.monotonic() - started) * 1000),
+            )
+        queue_store.archive_slice(sid, outcome.verdict, case_id=outcome.case_id)
+        result.outcomes.append(outcome)
+        if outcome.verdict in {"EXECUTED", "EXECUTABLE", "NOT_EXECUTABLE", "WRITTEN_NOT_VISIBLE"}:
+            failures = 0
+        else:
+            failures += 1
+            if failures >= max_consecutive_failures:
+                result.stop_reason = "BLOCKED_NEEDS_HUMAN"
+                break
+    else:
+        if queue_store.next_slice(run_id=run_id) is not None:
+            result.stop_reason = "LIMIT_REACHED"
+    result.report = _report(result)
+    return result

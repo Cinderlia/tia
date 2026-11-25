@@ -221,6 +221,36 @@ _PROBE_DISARM_SCHEMA = {
 }
 
 #: 36 tools, order consistent with "Tool Interface Documentation".
+_SLICE_NEXT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "run_id": {"type": "string", "description": "Only lease slices seeded for this run"},
+        "ttl_minutes": {"type": "integer", "minimum": 1, "maximum": 1440},
+    },
+    "additionalProperties": False,
+}
+_SLICE_ARCHIVE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "slice_id": {"type": "string"},
+        "verdict": {"type": "string"},
+        "case_id": {"type": "string"},
+        "notes": {"type": "string"},
+    },
+    "required": ["slice_id", "verdict"],
+    "additionalProperties": False,
+}
+_SLICE_SKIP_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "slice_id": {"type": "string"},
+        "reason": {"type": "string"},
+        "status": {"type": "string", "enum": ["skipped", "blocked"]},
+    },
+    "required": ["slice_id", "reason"],
+    "additionalProperties": False,
+}
+
 TOOLS: tuple[ToolSpec, ...] = (
     # 1. Source code and entry points (7)
     _t("source_read", "Read source code snippet (with context line numbers)", "source", handler_path="tia.cap.source:source_read"),
@@ -292,9 +322,12 @@ TOOLS: tuple[ToolSpec, ...] = (
        input_schema=_FLOW_LOOKUP_SCHEMA, handler_path="tia.cap.offline:flow_lookup"),
     _t("rate_guard", "Rate limit backoff", "control", mutating=True),
     # 6. Slice (3)
-    _t("slice_next", "Get next pending slice", "slice"),
-    _t("slice_archive", "Archive slice results", "slice", mutating=True),
-    _t("slice_skip", "Skip slice and record reason", "slice", mutating=True),
+    _t("slice_next", "Lease the next pending slice from the queue", "slice",
+       input_schema=_SLICE_NEXT_SCHEMA, handler_path="tia.cap.slice:slice_next"),
+    _t("slice_archive", "Archive a finished slice with its verdict", "slice", mutating=True,
+       input_schema=_SLICE_ARCHIVE_SCHEMA, handler_path="tia.cap.slice:slice_archive"),
+    _t("slice_skip", "Skip a slice and record the reason", "slice", mutating=True,
+       input_schema=_SLICE_SKIP_SCHEMA, handler_path="tia.cap.slice:slice_skip"),
 )
 
 _BY_NAME: dict[str, ToolSpec] = {spec.name: spec for spec in TOOLS}

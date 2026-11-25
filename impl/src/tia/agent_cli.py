@@ -9,15 +9,16 @@ import argparse
 import asyncio
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
 from tia import __version__
 from tia.dom.inject import InjectResult, run_inject
-from tia.dom.main import MainResult, run_main
+from tia.dom.main import MainResult, run_main, run_queue
 from tia.dom.trigger import TriggerResult, run_trigger
 from tia.inf.config import Settings
-from tia.inf.runtime import configure
+from tia.inf.runtime import configure, get_runtime
 from tia.orch.kernel import ToolCallError
 
 PROFILES = ("trigger", "inject", "main")
@@ -58,6 +59,12 @@ def _parser() -> argparse.ArgumentParser:
     main_cmd.add_argument("--db-user", default=None)
     main_cmd.add_argument("--db-password", default=None)
     main_cmd.add_argument("--store", default=None)
+    main_cmd.add_argument("--run-id", default=None, help="Queue run id; slices are seeded under it")
+    main_cmd.add_argument(
+        "--queue",
+        action="store_true",
+        help="Seed the slices into the persistent queue and schedule from it (M0-M6)",
+    )
     main_cmd.add_argument("--json", action="store_true")
     return parser
 
@@ -187,16 +194,31 @@ def _run_inject(args: argparse.Namespace) -> int:
 def _run_main(args: argparse.Namespace) -> int:
     _configure(args, "main")
     slices = _load_slices(args.slices)
+    run_id = args.run_id or f"run-{int(time.time())}"
     try:
-        result: MainResult = asyncio.run(
-            run_main(
-                slices,
-                base_url=args.base_url,
-                limit=args.limit,
-                payload_base=args.payload,
-                budget=args.budget,
+        if args.queue:
+            store = get_runtime().store
+            store.seed_slices(run_id, slices)
+            result: MainResult = asyncio.run(
+                run_queue(
+                    store,
+                    base_url=args.base_url,
+                    run_id=run_id,
+                    limit=args.limit,
+                    payload_base=args.payload,
+                    budget=args.budget,
+                )
             )
-        )
+        else:
+            result = asyncio.run(
+                run_main(
+                    slices,
+                    base_url=args.base_url,
+                    limit=args.limit,
+                    payload_base=args.payload,
+                    budget=args.budget,
+                )
+            )
     except ToolCallError as exc:
         return _fail(exc)
     for item in result.outcomes:
@@ -206,6 +228,7 @@ def _run_main(args: argparse.Namespace) -> int:
         "agent": "main",
         "attempted": len(result.outcomes),
         "stop_reason": result.stop_reason,
+        "run_id": run_id if args.queue else None,
         "outcomes": [item.model_dump() for item in result.outcomes],
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))

@@ -108,6 +108,11 @@ def normalize_slice(raw: dict[str, Any]) -> dict[str, Any]:
     sink: Any = doc.get("sink")
     if isinstance(sink, dict) and "file" in sink and "line" in sink:
         file_, line_, code_ = str(sink["file"]), int(sink["line"]), str(sink.get("code", ""))
+    elif doc.get("sinkFile"):
+        # navi slice form: sinkFile / sinkLine / sinkCode
+        file_ = str(doc["sinkFile"])
+        line_ = int(doc.get("sinkLine") or 0)
+        code_ = str(doc.get("sinkCode") or "")
     else:
         file_, line_, code_ = parse_sink(sink)
     doc["sink"] = {"file": file_, "line": line_, "code": code_}
