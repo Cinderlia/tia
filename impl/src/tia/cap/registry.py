@@ -104,13 +104,88 @@ _VERIFY_TAG_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+
+_FORM_PARSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "html": {"type": "string", "description": "页面 HTML（静态解析，不发请求）"},
+        "base_url": {"type": "string", "description": "用于把相对 action 拼成绝对地址"},
+        "max_forms": {"type": "integer", "minimum": 1, "maximum": 100},
+    },
+    "required": ["html"],
+    "additionalProperties": False,
+}
+
+_CONTEXT_CLASSIFY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "html": {"type": "string"},
+        "tag": {"type": "string"},
+        "payload": {"type": "string", "description": "可选：实际注入内容，用于判闭合/承载"},
+        "content_type": {"type": "string"},
+        "max_occurrences": {"type": "integer", "minimum": 1, "maximum": 50},
+    },
+    "required": ["html", "tag"],
+    "additionalProperties": False,
+}
+
+_BUDGET_SOLVE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "column_length": {"type": "integer", "minimum": 1},
+        "maxlength": {"type": "integer", "minimum": 1},
+        "validation_limit": {"type": "integer", "minimum": 1},
+        "prefix": {"type": "string"},
+        "suffix": {"type": "string"},
+        "skeleton": {"type": "string"},
+        "tag_len": {"type": "integer", "minimum": 0},
+        "encoding": {"type": "string", "enum": ["none", "url", "html"]},
+    },
+    "additionalProperties": False,
+}
+
+_TRACE_DIFF_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "before": {"type": "array", "items": {"type": "object"}},
+        "after": {"type": "array", "items": {"type": "object"}},
+        "key": {"type": "string"},
+        "max_items": {"type": "integer", "minimum": 1, "maximum": 200},
+    },
+    "required": ["before", "after"],
+    "additionalProperties": False,
+}
+
+_FLOW_LOOKUP_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "kind": {"type": "string"},
+        "base_url": {"type": "string"},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+    },
+    "additionalProperties": False,
+}
+
+_ARTIFACT_SAVE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "case_id": {"type": "string"},
+        "name": {"type": "string", "description": "文件名，白名单字母数字._-"},
+        "content": {"type": "string"},
+        "content_type": {"type": "string"},
+    },
+    "required": ["case_id", "name", "content"],
+    "additionalProperties": False,
+}
+
 #: 36 个工具，顺序与《工具接口文档》一致。
 TOOLS: tuple[ToolSpec, ...] = (
     # 1. 源码与入口（7）
     _t("source_read", "读取源码片段（带上下文行号）", "source", handler_path="tia.cap.source:source_read"),
     _t("source_grep", "按正则搜索源码，返回命中位置与一行上下文", "source", handler_path="tia.cap.source:source_grep"),
     _t("taint_trace", "从 sink 回溯到请求变量的赋值链（有界）", "source"),
-    _t("form_parse", "解析页面或源码中的表单字段与 HTML5 约束", "source"),
+    _t("form_parse", "解析页面或源码中的表单字段与 HTML5 约束", "source",
+       input_schema=_FORM_PARSE_SCHEMA, handler_path="tia.cap.offline:form_parse"),
     _t("endpoint_search", "按 sink 文件搜索可达的 HTTP 入口", "source"),
     _t("includer_trace", "追踪 include/require 链", "source"),
     _t("filter_analyze", "分析输入/输出侧的过滤与编码", "source"),
@@ -132,12 +207,15 @@ TOOLS: tuple[ToolSpec, ...] = (
        "verify",
        handler_path="tia.cap.verify:verify_tag",
        input_schema=_VERIFY_TAG_SCHEMA),
-    _t("context_classify", "把命中上下文归类为 8 类之一", "verify"),
+    _t("context_classify", "把命中上下文归类为 8 类之一", "verify",
+       input_schema=_CONTEXT_CLASSIFY_SCHEMA, handler_path="tia.cap.offline:context_classify"),
     _t("canary_calibrate", "用 canary 实测写/读变换 F=O(W(x))", "verify", mutating=True),
-    _t("budget_solve", "求解可写长度预算与候选骨架", "verify"),
+    _t("budget_solve", "求解可写长度预算与候选骨架", "verify",
+       input_schema=_BUDGET_SOLVE_SCHEMA, handler_path="tia.cap.offline:budget_solve"),
     # 4. 轨迹（3）
     _t("trace_run", "带 filter 的定向 trace（禁止全量）", "trace", mutating=True),
-    _t("trace_diff", "比较两次 trace 的分支差异", "trace"),
+    _t("trace_diff", "比较两次 trace 的分支差异", "trace",
+       input_schema=_TRACE_DIFF_SCHEMA, handler_path="tia.cap.offline:trace_diff"),
     _t("guard_harvest", "从入口文件收割拒绝点候选", "trace"),
     # 5. 控制与人机（8）
     _t("case_open", "建立 case", "control", mutating=True, handler_path="tia.cap.case:case_open"),
@@ -145,8 +223,10 @@ TOOLS: tuple[ToolSpec, ...] = (
     _t("case_report", "生成 case 的 Markdown 报告", "control", handler_path="tia.cap.case:case_report"),
     _t("session_bind", "绑定合法登录态到 case", "control", mutating=True),
     _t("human_ask", "向人类提问（登录、授权、二选一）", "control"),
-    _t("artifact_save", "保存产物到项目目录", "control"),
-    _t("flow_lookup", "查询流程库中的 form 模板与已知 guard", "control"),
+    _t("artifact_save", "保存产物到项目目录", "control",
+       input_schema=_ARTIFACT_SAVE_SCHEMA, handler_path="tia.cap.offline:artifact_save"),
+    _t("flow_lookup", "查询流程库中的 form 模板与已知 guard", "control",
+       input_schema=_FLOW_LOOKUP_SCHEMA, handler_path="tia.cap.offline:flow_lookup"),
     _t("rate_guard", "限流退避", "control", mutating=True),
     # 6. 切片（3）
     _t("slice_next", "取下一个待处理切片", "slice"),

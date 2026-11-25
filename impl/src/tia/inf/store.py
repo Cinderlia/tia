@@ -264,6 +264,41 @@ class Store:
 
     # -- flow -------------------------------------------------------------
 
+    def list_flows(
+        self, kind: str | None = None, base_url: str | None = None, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """读流程库摘要；base_url 过滤在 Python 层做，扫描上界 500 行。"""
+        sql = "SELECT case_id, seq, kind, body, code_ver, observed_at FROM flow"
+        args: list[Any] = []
+        if kind:
+            sql += " WHERE kind=?"
+            args.append(kind)
+        sql += " ORDER BY id DESC LIMIT 500"
+        with self._conn() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                body = json.loads(row["body"])
+            except json.JSONDecodeError:
+                continue
+            if base_url and body.get("base_url") not in (None, base_url):
+                continue
+            result.append(
+                {
+                    "case_id": row["case_id"],
+                    "seq": row["seq"],
+                    "kind": row["kind"],
+                    "base_url": body.get("base_url"),
+                    "steps": body.get("steps", []),
+                    "code_ver": row["code_ver"],
+                    "observed_at": row["observed_at"],
+                }
+            )
+            if len(result) >= limit:
+                break
+        return result
+
     def add_flow(self, case_id: str, kind: str, body: dict[str, Any], code_ver: str = "") -> int:
         with self._conn() as conn:
             row = conn.execute(

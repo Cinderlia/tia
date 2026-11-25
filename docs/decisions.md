@@ -112,3 +112,19 @@
   熔断 `BLOCKED_NEEDS_HUMAN`。`pick()` 是替换点，接 planner 时只改这里。
 - 原因：先保证调度骨架、证据链与报告闭环，模型只影响"选哪个切片"。
 - 需回写文档：是（M4 实现顺序）。
+
+## D15 先做不依赖外部环境的工具
+
+- 文档：36 工具按里程碑铺开。
+- 实现：本轮先落地 `form_parse` / `context_classify` / `budget_solve` / `trace_diff` /
+  `flow_lookup` / `artifact_save`——纯函数或只读本地 sqlite，不碰网络与目标库。
+- 原因：先把"输入是数据不是命令"的解析面和长度预算打磨好，再挂探针/轨迹这类有状态工具。
+- 需回写文档：否（实现顺序）。
+
+## D16 `form_parse` 只做静态解析
+
+- 文档：`form_parse` 支持静态与渲染两种。
+- 实现：只接受 `html`；需要渲染后的 DOM 时由 agent 先 `http_request` 再传 `html`
+  （H7：工具之间不互相调用）。
+- 原因：渲染要浏览器，属于真实环境交互，放到 e2e 阶段。
+- 需回写文档：是（§4.3 form_parse 输入）。
