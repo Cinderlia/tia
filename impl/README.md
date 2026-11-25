@@ -1,16 +1,18 @@
 # impl
 
-TIA 的实现包。设计口径见仓库根目录的上游设计资料（`tia-design-kit/`，不纳入版本库）与 [`docs/environment.md`](../docs/environment.md)。
+TIA 的实现包。设计口径见上游设计资料（`tia-design-kit/`，不纳入版本库）
+与 [`docs/decisions.md`](../docs/decisions.md)。
 
 ```bash
 uv sync
 uv run pytest -q
-uv run ruff check src tests && uv run mypy src tests
+uv run ruff check src tests && uv run mypy src
 uv run tia-server --profile trigger
 ```
 
-进程只在 `php84-dev` 容器内运行：
+进程在测试容器的项目目录内运行（容器与挂载路径属于本地环境，不写进仓库）：
 
 ```bash
-docker exec --user root -w /home/so/tia/impl php84-dev bash
+cd <repo>/impl
+uv sync
 ```

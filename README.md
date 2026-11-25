@@ -13,8 +13,10 @@ TIA 不做 payload 生成器，也不做漏洞扫描器。它把「漏洞存在�
 
 ## 仓库状态
 
-当前处于**骨架搭建阶段**：仓库初始化完成，实现代码（`impl/`）尚未落地。
-设计与任务拆解在本地 `tia-design-kit/` 中（该目录不纳入版本库，见 `.gitignore`），实现以其中的《模块化设计》《工具接口文档》《验收判定规范》为准。
+M0–M2 已跑通：MCP 服务、36 工具注册与授权、`verify_tag` 验收、数据层与写回滚、
+trigger / inject / main 三个 agent 的可执行主流程，以及一批纯离线分析工具。
+设计与任务拆解保存在本地 `tia-design-kit/`（不纳入版本库），实现以其中的
+《模块化设计》《工具接口文档》《验收判定规范》为准。
 
 ## 目录结构
 
@@ -23,12 +25,13 @@ TIA 不做 payload 生成器，也不做漏洞扫描器。它把「漏洞存在�
 ├── .gitignore          # 忽略设计资料、工作区与各类构建产物
 ├── README.md
 ├── docs/
-│   └── environment.md  # 开发/测试环境事实与依赖安装规约
-├── impl/               # 实现（规划中）
+│   ├── decisions.md    # 设计偏差与本地决策记录
+│   └── security.md     # 安全边界：工具输入是数据不是命令
+├── impl/               # 实现
 │   ├── pyproject.toml
 │   ├── src/tia/        # server / orch / dom / cap / ad / inf
 │   ├── profiles/       # main / trigger / inject 三份 profile
-│   ├── probe-php/      # PHP 写点/读点采集器
+│   ├── examples/       # 切片示例
 │   ├── tests/          # unit / contract / e2e / fixtures
 │   └── scripts/
 ├── tia-design-kit/     # 设计资料（本地，不提交）
@@ -79,9 +82,9 @@ tia-agent main     调度队列，切分切片，转发交付物，不做验证
 Python 3.11+ · uv · 官方 `mcp` SDK（stdio）· pydantic v2 ·
 `pydantic-graph` + `pydantic-ai`（仅 planner）· httpx · selectolax/lxml ·
 PyMySQL / sqlite3 · structlog JSONL · pytest + pytest-asyncio · ruff + mypy strict。
-PHP 8 采集器单独放在 `impl/probe-php/`。
+SQL 读写采集复用宿主环境已有的 PHP 扩展（mysqlnd hook），不随本仓库分发。
 
-## 快速开始（骨架落地后）
+## 快速开始
 
 ```bash
 cd impl
@@ -100,14 +103,12 @@ uv run tia-report c001
 
 三个 profile 的授权范围不同：`main` 只有 14 个只读/调度工具；`trigger` 与 `inject` 按需开放写与验证能力，写域由 profile 的 `write_allow_tables` / `write_deny_columns` 收口。
 
-## 开发与测试环境
+## 本地开发环境
 
-- **开发机 / 仓库**：`jmliang@172.28.8.69:/home/jmliang/tia`，远程 `git@github.com:Cinderlia/tia.git`。
-- **测试容器**：`docker exec -it --user root -w /app php84-dev bash`。容器为 Debian 13 + PHP 8.4.25 + Apache + MariaDB；`/home/jmliang/tia` 挂载到 `/home/so/tia`；端口 `8008→80`、`3006→3306`；目标应用（bWAPP / DVWA / WeGIA 等）位于 `/app`。
-- **本地模型**：OpenAI 兼容，`http://172.28.8.100:8000/v1`，模型 `Qwen3.8-27B`，Key `sk-a-strong-key`；不计量，供 planner / judge 使用。
-- **依赖规约**：Python 包与 apt 包一律装在容器内，并同步登记到 `impl/pyproject.toml` / `impl/requirements-extra.txt` / `impl/deploy/apt-packages.txt`，换环境可一键还原。
-
-完整事实与变更记录见 [`docs/environment.md`](docs/environment.md)。
+具体的开发机、测试容器、目标应用与模型端点只存在于本地，不写入仓库。
+可复现的部分在版本库内：`impl/pyproject.toml`（Python 依赖）、
+`impl/deploy/apt-packages.txt`（系统包）与 `impl/scripts/bootstrap-container.sh`（一键安装）。
+凭据一律走环境变量，不落盘、不进提交。
 
 ## 里程碑
 

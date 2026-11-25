@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# 在 php84-dev 容器内以 root 执行：一次装好 Python 3.13 工具链与项目依赖。
-#   docker exec --user root php84-dev bash /home/so/tia/impl/scripts/bootstrap-container.sh
+# 在测试容器内以 root 执行：一次装好 Python 3.13 工具链与项目依赖。
+#   bash impl/scripts/bootstrap-container.sh
+# 容器名与挂载路径由本地环境决定，不写进仓库。
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
