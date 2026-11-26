@@ -157,6 +157,25 @@ CREATE TABLE IF NOT EXISTS tool_trace (
 );
 CREATE INDEX IF NOT EXISTS idx_tool_trace_case ON tool_trace(case_id, seq);
 CREATE INDEX IF NOT EXISTS idx_tool_trace_slice ON tool_trace(slice_id, id);
+CREATE TABLE IF NOT EXISTS trace (
+    id           TEXT PRIMARY KEY,
+    case_id      TEXT NOT NULL,
+    file         TEXT NOT NULL,
+    line_from    INTEGER NOT NULL DEFAULT 0,
+    line_to      INTEGER NOT NULL DEFAULT 0,
+    function     TEXT NOT NULL DEFAULT '',
+    method       TEXT NOT NULL DEFAULT 'GET',
+    url          TEXT NOT NULL DEFAULT '',
+    output       TEXT NOT NULL,
+    raw_path     TEXT NOT NULL DEFAULT '',
+    sha256       TEXT NOT NULL DEFAULT '',
+    total_lines  INTEGER NOT NULL DEFAULT 0,
+    unique_lines INTEGER NOT NULL DEFAULT 0,
+    truncated    INTEGER NOT NULL DEFAULT 0,
+    summary      TEXT NOT NULL DEFAULT '{}',
+    observed_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_trace_case ON trace(case_id, observed_at);
 CREATE TABLE IF NOT EXISTS learning (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     signature  TEXT NOT NULL,
@@ -440,6 +459,70 @@ class Store:
                 ),
             )
         return seq
+
+    def add_trace(
+        self,
+        *,
+        trace_id: str,
+        case_id: str,
+        file: str,
+        line_from: int,
+        line_to: int,
+        function: str,
+        method: str,
+        url: str,
+        output: str,
+        raw_path: str,
+        sha256: str,
+        total_lines: int,
+        unique_lines: int,
+        truncated: bool,
+        summary: dict[str, Any],
+        observed_at: str,
+    ) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO trace (id, case_id, file, line_from, line_to, function,"
+                " method, url, output, raw_path, sha256, total_lines, unique_lines, truncated,"
+                " summary, observed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    trace_id,
+                    case_id,
+                    file,
+                    line_from,
+                    line_to,
+                    function,
+                    method,
+                    url,
+                    output,
+                    raw_path,
+                    sha256,
+                    total_lines,
+                    unique_lines,
+                    1 if truncated else 0,
+                    json.dumps(summary, ensure_ascii=False),
+                    observed_at,
+                ),
+            )
+
+    def get_trace(self, trace_id: str) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            row = conn.execute("SELECT * FROM trace WHERE id=?", (trace_id,)).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        item["summary"] = json.loads(item["summary"] or "{}")
+        item["truncated"] = bool(item["truncated"])
+        return item
+
+    def list_traces(self, case_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT id, case_id, file, line_from, line_to, total_lines, unique_lines,"
+                " observed_at FROM trace WHERE case_id=? ORDER BY observed_at DESC LIMIT ?",
+                (case_id, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def set_tool_trace_raw(self, *, case_id: str, seq: int, raw_path: str) -> None:
         with self._conn() as conn:

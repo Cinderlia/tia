@@ -144,15 +144,38 @@ _BUDGET_SOLVE_SCHEMA = {
     "additionalProperties": False,
 }
 
+_TRACE_RUN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "case_id": {"type": "string"},
+        "url": {"type": "string", "description": "Absolute http(s) URL to request"},
+        "file": {"type": "string", "description": "Traced source file (path or suffix)"},
+        "line_from": {"type": "integer", "minimum": 0},
+        "line_to": {"type": "integer", "minimum": 0},
+        "function": {"type": "string", "description": "Keep frames whose function contains it"},
+        "max_depth": {"type": "integer", "minimum": 0},
+        "max_lines": {"type": "integer", "minimum": 1, "maximum": 200000},
+        "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"]},
+        "params": {"type": "object", "additionalProperties": {"type": "string"}},
+        "body": {"type": "string"},
+        "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+        "output": {"type": "string"},
+        "max_entries": {"type": "integer", "minimum": 1, "maximum": 300},
+        "dedupe": {"type": "boolean"},
+    },
+    "required": ["case_id", "url", "file"],
+    "additionalProperties": False,
+}
+
 _TRACE_DIFF_SCHEMA = {
     "type": "object",
     "properties": {
-        "before": {"type": "array", "items": {"type": "object"}},
-        "after": {"type": "array", "items": {"type": "object"}},
-        "key": {"type": "string"},
-        "max_items": {"type": "integer", "minimum": 1, "maximum": 200},
+        "case_id": {"type": "string"},
+        "trace_a": {"type": "string", "description": "Trace id returned by trace_run"},
+        "trace_b": {"type": "string", "description": "Trace id returned by trace_run"},
+        "max_regions": {"type": "integer", "minimum": 1, "maximum": 100},
     },
-    "required": ["before", "after"],
+    "required": ["case_id", "trace_a", "trace_b"],
     "additionalProperties": False,
 }
 
@@ -312,9 +335,10 @@ TOOLS: tuple[ToolSpec, ...] = (
     _t("budget_solve", "Solve writable length budget and candidate skeletons", "verify",
        input_schema=_BUDGET_SOLVE_SCHEMA, handler_path="tia.cap.offline:budget_solve"),
     # 4. Trace (3)
-    _t("trace_run", "Targeted trace with filter (full trace forbidden)", "trace", mutating=True),
+    _t("trace_run", "Targeted trace with filter (full trace forbidden)", "trace",
+       mutating=True, input_schema=_TRACE_RUN_SCHEMA, handler_path="tia.cap.trace:trace_run"),
     _t("trace_diff", "Compare branch differences between two traces", "trace",
-       input_schema=_TRACE_DIFF_SCHEMA, handler_path="tia.cap.offline:trace_diff"),
+       input_schema=_TRACE_DIFF_SCHEMA, handler_path="tia.cap.trace:trace_diff"),
     _t("guard_harvest", "Harvest rejection point candidates from entry files", "trace"),
     # 5. Control and Human Interaction (8)
     _t("case_open", "Create case", "control", mutating=True, handler_path="tia.cap.case:case_open"),
