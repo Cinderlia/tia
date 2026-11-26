@@ -34,6 +34,7 @@ from tia.ad.opcode_trace import (
 )
 from tia.cap.policy import require_case
 from tia.cap.registry import ToolOutput
+from tia.cap.session import looks_like_login, renew_session, session_cookies
 from tia.inf.runtime import get_runtime
 from tia.inf.store import now_iso
 from tia.schemas.envelope import ErrorCode, ToolError
@@ -337,19 +338,18 @@ async def trace_run(arguments: dict[str, Any]) -> ToolOutput:
         request_body = urlencode(request_params)
         request_params = {}
         request_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
-    cookies: dict[str, str] = {}
-    if params.session_id:
-        session = rt.store.get_session(params.session_id)
-        if session is None or not session.get("valid"):
-            raise ToolError(
-                ErrorCode.SESSION_INVALID,
-                f"unknown or expired session: {params.session_id}",
-                hint="call session_bind first",
-            )
-        cookies = dict(session.get("cookies") or {})
+    session_id = params.session_id
+    cookies: dict[str, str] = session_cookies(session_id) if session_id else {}
+    warnings: list[str] = []
     started = time.monotonic()
     try:
         http = _fetch(url, method, request_params, request_body, request_headers, cookies)
+        if session_id and looks_like_login(
+            http.status, http.headers.get("location", ""), http.body
+        ):
+            session_id, cookies = renew_session(session_id)
+            warnings.append("SESSION_RENEWED")
+            http = _fetch(url, method, request_params, request_body, request_headers, cookies)
         text = adapter.read_output(canonical)
     finally:
         adapter.disarm()
@@ -397,7 +397,6 @@ async def trace_run(arguments: dict[str, Any]) -> ToolOutput:
         summary=summary,
         observed_at=observed_at,
     )
-    warnings: list[str] = []
     if truncated:
         warnings.append("TRACE_TRUNCATED")
     seen_targets = {entry.target for entry in entries if entry.target is not None}
@@ -407,6 +406,7 @@ async def trace_run(arguments: dict[str, Any]) -> ToolOutput:
         warnings.append(f"HTTP_STATUS_{http.status}")
     data = {
         "trace_id": trace_id,
+        "session_id": session_id,
         "targets": [item.to_config() for item in resolved],
         "target_count": len(resolved),
         "file": target,

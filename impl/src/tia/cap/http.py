@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from tia.ad.http import HttpClient
 from tia.cap.registry import ToolOutput
+from tia.cap.session import looks_like_login, renew_session, session_cookies
 from tia.inf.runtime import get_runtime
 from tia.schemas.envelope import ErrorCode, ToolError
 from tia.schemas.objects import FlowRecord
@@ -42,30 +43,17 @@ class HttpRequestInput(BaseModel):
     capture: dict[str, Any] | None = None
 
 
-async def http_request(arguments: dict[str, Any]) -> ToolOutput:
-    params = _validate(HttpRequestInput, arguments)
-    rt = get_runtime()
-    if not params.url.startswith(("http://", "https://")):
-        raise _bad("url must be an absolute http(s) address", "Use http://127.0.0.1/... inside the container")
-    method = params.method.upper()
-    if method not in {"GET", "POST", "PUT", "PATCH", "HEAD"}:
-        raise _bad(f"Unsupported method: {method}")
-
-    cookies: dict[str, str] = {}
-    if params.session_id:
-        session = rt.store.get_session(params.session_id)
-        if session is None or not session.get("valid"):
-            raise ToolError(
-                ErrorCode.SESSION_INVALID,
-                f"unknown or expired session: {params.session_id}",
-                hint="call session_bind first",
-            )
-        cookies = dict(session.get("cookies") or {})
-
+def _fetch(
+    params: HttpRequestInput,
+    rt: Any,
+    cookies: dict[str, str],
+    *,
+    around: int,
+) -> Any:
     capture = params.capture or {}
     marker = capture.get("marker")
-    result = HttpClient().fetch(
-        method,
+    return HttpClient().fetch(
+        params.method.upper(),
         params.url,
         params=params.params or None,
         body=params.body,
@@ -75,9 +63,31 @@ async def http_request(arguments: dict[str, Any]) -> ToolOutput:
         max_redirects=params.max_redirects,
         max_bytes=rt.settings.profile.max_http_bytes,
         marker=str(marker) if marker else None,
-        around=int(capture.get("around", 800)),
+        around=around,
     )
+
+
+async def http_request(arguments: dict[str, Any]) -> ToolOutput:
+    params = _validate(HttpRequestInput, arguments)
+    rt = get_runtime()
+    if not params.url.startswith(("http://", "https://")):
+        raise _bad("url must be an absolute http(s) address", "Use http://127.0.0.1/... inside the container")
+    method = params.method.upper()
+    if method not in {"GET", "POST", "PUT", "PATCH", "HEAD"}:
+        raise _bad(f"Unsupported method: {method}")
+
+    session_id = params.session_id
+    cookies: dict[str, str] = session_cookies(session_id) if session_id else {}
+
+    capture = params.capture or {}
     warnings: list[str] = []
+    result = _fetch(params, rt, cookies, around=int(capture.get("around", 800)))
+    if session_id and looks_like_login(
+        result.status, result.headers.get("location", ""), result.body
+    ):
+        session_id, cookies = renew_session(session_id)
+        warnings.append("SESSION_RENEWED")
+        result = _fetch(params, rt, cookies, around=int(capture.get("around", 800)))
     if result.truncated:
         warnings.append("TRUNCATED")
     data = {
@@ -89,7 +99,8 @@ async def http_request(arguments: dict[str, Any]) -> ToolOutput:
         "body_bytes": result.body_bytes,
         "body": result.body,
         "truncated": result.truncated,
-        "session_after": {"valid": bool(params.session_id), "set_cookie": 0},
+        "session_id": session_id,
+        "session_after": {"valid": bool(session_id), "renewed": "SESSION_RENEWED" in warnings},
         "observed_at": _now(),
     }
     return ToolOutput(data=data, warnings=warnings)

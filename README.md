@@ -86,6 +86,8 @@ uv run tia-agent accounts                # list labels, roles and descriptions
 uv run tia-agent login --label site-user  # log in over HTTP, store the cookies
 ```
 
-The agent binds by account label or by required roles and always picks the
-least-privileged account that covers them. Passwords are only read at login and
-are never written to tool output, evidence or reports.
+`session_bind` without arguments lists the login targets (label, login URL,
+roles and description) so the model can choose the identity it needs; passing an
+`account_label` binds that one. Passwords are only read at login and are never
+written to tool output, evidence or reports. When a bound session expires, the
+HTTP-based tools log the same account in again once and replay the request.

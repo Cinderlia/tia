@@ -21,6 +21,7 @@ from tia.ad.http import HttpClient
 from tia.ad.sqlprobe import ProbeConfigError, SqlProbeAdapter
 from tia.cap.policy import require_case
 from tia.cap.registry import ToolOutput
+from tia.cap.session import looks_like_login, renew_session
 from tia.inf.runtime import get_runtime
 from tia.inf.store import now_iso
 from tia.schemas.envelope import ErrorCode, ToolError
@@ -238,16 +239,11 @@ async def probe_run(arguments: dict[str, Any]) -> ToolOutput:
         key.lower() == "content-type" for key in headers
     ):
         headers["Content-Type"] = "application/x-www-form-urlencoded"
-    cookies: dict[str, str] = {}
-    if params.session_id:
-        session = rt.store.get_session(params.session_id)
-        if session is None or not session.get("valid"):
-            raise ToolError(
-                ErrorCode.SESSION_INVALID,
-                f"unknown or expired session: {params.session_id}",
-                hint="call session_bind first",
-            )
-        cookies = dict(session.get("cookies") or {})
+    from tia.cap.session import session_cookies
+
+    session_id = params.session_id
+    cookies: dict[str, str] = session_cookies(session_id) if session_id else {}
+    warnings: list[str] = []
     result = HttpClient().fetch(
         params.method,
         params.url,
@@ -257,6 +253,20 @@ async def probe_run(arguments: dict[str, Any]) -> ToolOutput:
         cookies=cookies,
         max_bytes=rt.settings.profile.max_http_bytes,
     )
+    if session_id and looks_like_login(
+        result.status, result.headers.get("location", ""), result.body
+    ):
+        session_id, cookies = renew_session(session_id)
+        warnings.append("SESSION_RENEWED")
+        result = HttpClient().fetch(
+            params.method,
+            params.url,
+            params=params.params or None,
+            body=params.body,
+            headers=headers,
+            cookies=cookies,
+            max_bytes=rt.settings.profile.max_http_bytes,
+        )
     if params.wait_ms:
         time.sleep(params.wait_ms / 1000)
 
@@ -284,7 +294,6 @@ async def probe_run(arguments: dict[str, Any]) -> ToolOutput:
     first_line = config_targets[0]["line"] if config_targets else 0
 
     mode = "write" if any(query.get("affected_rows") or query.get("write") for query in queries) else "read"
-    warnings: list[str] = []
     if not queries:
         warnings.append("PROBE_NO_MATCH")
     elif len(config_targets) > 1:
@@ -298,6 +307,7 @@ async def probe_run(arguments: dict[str, Any]) -> ToolOutput:
     return ToolOutput(
         data={
             "probe_id": f"probe-{params.case_id}-{first_line}",
+            "session_id": session_id,
             "mode": mode,
             "targets": config_targets,
             "target": config_targets[0] if config_targets else {"file": "", "line": 0},

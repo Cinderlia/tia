@@ -6,6 +6,7 @@ only ever returns the public account fields and the resulting session id.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -82,6 +83,20 @@ async def session_bind(arguments: dict[str, Any]) -> ToolOutput:
         return ToolOutput(
             data={
                 "bound": False,
+                "how_to_bind": (
+                    "Choose one label from login_targets (description explains its privileges),"
+                    " then call session_bind again with account_label set."
+                ),
+                "login_targets": [
+                    {
+                        "label": account.label,
+                        "login_url": account.login_url,
+                        "username": account.username,
+                        "roles": list(account.roles),
+                        "description": account.description,
+                    }
+                    for account in accounts
+                ],
                 "accounts": [_public_account(account) for account in accounts],
                 "sessions": [
                     {
@@ -150,3 +165,75 @@ async def session_bind(arguments: dict[str, Any]) -> ToolOutput:
         "fields": result.fields,
     }
     return ToolOutput(data=data)
+
+
+_LOGIN_REDIRECT_HINTS = ("login", "signin", "sign-in", "auth")
+
+
+def session_cookies(session_id: str) -> dict[str, str]:
+    """Cookies of a bound session; SESSION_INVALID when the id is unknown."""
+
+    runtime = get_runtime()
+    session = runtime.store.get_session(session_id)
+    if session is None or not session.get("valid"):
+        raise ToolError(
+            ErrorCode.SESSION_INVALID,
+            f"unknown or expired session: {session_id}",
+            hint="call session_bind first",
+        )
+    return dict(session.get("cookies") or {})
+
+
+def looks_like_login(status: int, location: str, body: str) -> bool:
+    """Cheap heuristic: a redirect to a login page or a page that only offers a login form."""
+
+    lowered = (location or "").lower()
+    if status in {301, 302, 303, 307, 308} and any(hint in lowered for hint in _LOGIN_REDIRECT_HINTS):
+        return True
+    if "logout" in body.lower():
+        return False
+    return re.search(r"""type\s*=\s*["']?password""", body, re.IGNORECASE) is not None
+
+
+def renew_session(session_id: str) -> tuple[str, dict[str, str]]:
+    """Log the same account in again and replace the stored session.
+
+    Returns the new session id and cookies; raises SESSION_INVALID when the
+    account is no longer configured or the login fails again.
+    """
+
+    runtime = get_runtime()
+    previous = runtime.store.get_session(session_id)
+    if previous is None:
+        raise ToolError(
+            ErrorCode.SESSION_INVALID,
+            f"unknown session: {session_id}",
+            hint="call session_bind first",
+        )
+    label = str(previous.get("label") or "")
+    account = next((item for item in _accounts() if item.label == label), None)
+    if account is None:
+        raise ToolError(
+            ErrorCode.SESSION_INVALID,
+            f"account {label!r} is no longer configured",
+            hint="re-add it to accounts.yaml and call session_bind",
+        )
+    result = login(account)
+    if not result.ok:
+        raise ToolError(
+            ErrorCode.SESSION_INVALID,
+            f"session renewal failed for {label}: {result.reason}",
+            hint="the credentials may have changed or the login page moved",
+        )
+    runtime.store.invalidate_session(session_id)
+    new_id = runtime.store.add_session(
+        label=account.label,
+        base_url=account.base_url,
+        cookies=result.cookies,
+        roles=list(account.roles),
+        username=account.username,
+        description=account.description,
+        login_url=account.login_url,
+        case_id=str(previous.get("case_id") or "") or None,
+    )
+    return new_id, result.cookies
