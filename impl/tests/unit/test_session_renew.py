@@ -127,3 +127,35 @@ def test_http_request_session_invalid_for_unknown_id(tmp_path, monkeypatch):
     with pytest.raises(ToolError):
         asyncio.run(http_module.http_request({"url": "http://x.test/", "session_id": "nope"}))
     reset_runtime()
+
+
+def test_verify_tag_reuses_session_cookies(tmp_path, monkeypatch):
+    accounts = _account_file(tmp_path)
+    monkeypatch.setenv("TIA_ACCOUNTS", str(accounts))
+    monkeypatch.setenv("TIA_STORE", str(tmp_path / "state.db"))
+    configure(_settings(tmp_path))
+
+    store = get_runtime().store
+    sid = store.add_session(
+        label="low", base_url="http://x.test/app", cookies={"PHPSESSID": "old"},
+        roles=[], username="u", description="low account", login_url="http://x.test/app/login.php",
+    )
+
+    seen: list[dict[str, str]] = []
+
+    def fake_fetch(input_, cookies=None):  # noqa: ANN001
+        seen.append(dict(cookies or {}))
+        return "<p>hello tia-tag</p>", "text/html", {}, 200
+
+    from tia.cap import verify as verify_module
+
+    monkeypatch.setattr(verify_module, "_fetch", fake_fetch)
+    result = asyncio.run(
+        verify_module.verify_tag(
+            {"url": "http://x.test/app/page.php", "tag": "tia-tag", "session_id": sid}
+        )
+    )
+    assert seen == [{"PHPSESSID": "old"}]
+    assert result.data["found"] is True
+    assert "SESSION_NOT_IMPLEMENTED" not in " ".join(result.warnings)
+    reset_runtime()

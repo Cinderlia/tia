@@ -34,7 +34,7 @@ from tia.ad.opcode_trace import (
 )
 from tia.cap.policy import require_case
 from tia.cap.registry import ToolOutput
-from tia.cap.session import looks_like_login, renew_session, session_cookies
+from tia.cap.session import looks_like_login, renew_session, resolve_session
 from tia.inf.runtime import get_runtime
 from tia.inf.store import now_iso
 from tia.schemas.envelope import ErrorCode, ToolError
@@ -81,6 +81,7 @@ class TraceRunInput(BaseModel):
     max_entries: int = Field(default=MAX_ENTRIES, ge=1, le=MAX_ENTRIES)
     dedupe: bool = True
     session_id: str | None = None
+    account_label: str = ""
 
 
 class TraceDiffInput(BaseModel):
@@ -338,9 +339,9 @@ async def trace_run(arguments: dict[str, Any]) -> ToolOutput:
         request_body = urlencode(request_params)
         request_params = {}
         request_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
-    session_id = params.session_id
-    cookies: dict[str, str] = session_cookies(session_id) if session_id else {}
-    warnings: list[str] = []
+    session_id, cookies, warnings = resolve_session(
+        params.session_id, url, params.account_label
+    )
     started = time.monotonic()
     try:
         http = _fetch(url, method, request_params, request_body, request_headers, cookies)

@@ -37,6 +37,11 @@ def _add_common(parser: argparse.ArgumentParser, *, base_url_required: bool) -> 
     parser.add_argument("--db-user", default=None)
     parser.add_argument("--db-password", default=None)
     parser.add_argument("--store", default=None, help="sqlite path (defaults to impl/var/tia.db)")
+    parser.add_argument(
+        "--account",
+        default="",
+        help="Account label pinned for this run (defaults to the first account matching the URL)",
+    )
     parser.add_argument("--json", action="store_true", help="stdout outputs only result JSON")
 
 
@@ -507,8 +512,10 @@ def _run_pipeline(args: argparse.Namespace) -> int:
 
 
 def _prepare_env(args: argparse.Namespace, profile: str = "trigger") -> None:
-    if args.accounts:
+    if getattr(args, "accounts", None):
         os.environ["TIA_ACCOUNTS"] = args.accounts
+    if getattr(args, "account", ""):
+        os.environ["TIA_ACCOUNT"] = args.account
     settings = Settings.load(profile, store_path=args.store)
     configure(settings)
 

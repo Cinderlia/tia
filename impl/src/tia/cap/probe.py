@@ -21,7 +21,7 @@ from tia.ad.http import HttpClient
 from tia.ad.sqlprobe import ProbeConfigError, SqlProbeAdapter
 from tia.cap.policy import require_case
 from tia.cap.registry import ToolOutput
-from tia.cap.session import looks_like_login, renew_session
+from tia.cap.session import looks_like_login, renew_session, resolve_session
 from tia.inf.runtime import get_runtime
 from tia.inf.store import now_iso
 from tia.schemas.envelope import ErrorCode, ToolError
@@ -214,6 +214,7 @@ class ProbeRunInput(BaseModel):
     wait_ms: int = Field(default=0, ge=0, le=MAX_WAIT_MS)
     capture_html: bool = False
     session_id: str | None = None
+    account_label: str = ""
 
 
 async def probe_run(arguments: dict[str, Any]) -> ToolOutput:
@@ -239,11 +240,9 @@ async def probe_run(arguments: dict[str, Any]) -> ToolOutput:
         key.lower() == "content-type" for key in headers
     ):
         headers["Content-Type"] = "application/x-www-form-urlencoded"
-    from tia.cap.session import session_cookies
-
-    session_id = params.session_id
-    cookies: dict[str, str] = session_cookies(session_id) if session_id else {}
-    warnings: list[str] = []
+    session_id, cookies, warnings = resolve_session(
+        params.session_id, params.url, params.account_label
+    )
     result = HttpClient().fetch(
         params.method,
         params.url,

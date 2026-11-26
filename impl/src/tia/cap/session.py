@@ -170,6 +170,78 @@ async def session_bind(arguments: dict[str, Any]) -> ToolOutput:
 _LOGIN_REDIRECT_HINTS = ("login", "signin", "sign-in", "auth")
 
 
+def _optional_accounts() -> list[Account]:
+    """Configured accounts, or an empty list when the file is absent."""
+
+    runtime = get_runtime()
+    try:
+        return load_accounts(runtime.settings.accounts_path)
+    except (AccountsConfigError, OSError):
+        return []
+
+
+def default_account_label() -> str:
+    """The label pinned for this run (``TIA_ACCOUNT`` / ``--account``)."""
+
+    return str(getattr(get_runtime().settings, "default_account", "") or "")
+
+
+def account_for_url(url: str, label: str = "") -> Account | None:
+    """Pick an account for a URL: explicit label, pinned label, then the first prefix match."""
+
+    accounts = _optional_accounts()
+    if not accounts:
+        return None
+    wanted = label or default_account_label()
+    if wanted:
+        return next((item for item in accounts if item.label == wanted), None)
+    for item in accounts:
+        if url.startswith(item.base_url.rstrip("/") + "/") or url == item.base_url.rstrip("/"):
+            return item
+    return None
+
+
+def ensure_session(
+    url: str, label: str = "", case_id: str | None = None
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Reuse a stored session or log the account in; anonymous when no account matches."""
+
+    account = account_for_url(url, label)
+    if account is None:
+        return None, []
+    runtime = get_runtime()
+    existing = runtime.store.find_session(account.label, account.base_url)
+    if existing is not None and existing.get("valid"):
+        return existing, []
+    result = login(account)
+    if not result.ok:
+        return None, [f"AUTO_LOGIN_FAILED: {account.label}: {result.reason}"]
+    session_id = runtime.store.add_session(
+        label=account.label,
+        base_url=account.base_url,
+        cookies=result.cookies,
+        roles=list(account.roles),
+        username=account.username,
+        description=account.description,
+        login_url=account.login_url,
+        case_id=case_id,
+    )
+    return runtime.store.get_session(session_id), []
+
+
+def resolve_session(
+    session_id: str | None, url: str, label: str = ""
+) -> tuple[str | None, dict[str, str], list[str]]:
+    """Cookies for a request: explicit session, else an automatically maintained one."""
+
+    if session_id:
+        return session_id, session_cookies(session_id), []
+    row, warnings = ensure_session(url, label)
+    if row is None:
+        return None, {}, warnings
+    return str(row["id"]), dict(row.get("cookies") or {}), warnings
+
+
 def session_cookies(session_id: str) -> dict[str, str]:
     """Cookies of a bound session; SESSION_INVALID when the id is unknown."""
 

@@ -87,6 +87,7 @@ class VerifyTagInput(BaseModel):
     html: str | None = None
     params: dict[str, str] = Field(default_factory=dict)
     session_id: str | None = None
+    account_label: str = ""
     tag: str
     #: Optional: full payload. Required to judge issues like "closed/carrying" that depend on injected content;
     #: If only the 4-character tag is provided, a conservative judgment is applied (see _judge_executable).
@@ -485,11 +486,13 @@ def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="milliseconds")
 
 
-def _fetch(input_: VerifyTagInput) -> tuple[str, str, dict[str, str], int]:
+def _fetch(
+    input_: VerifyTagInput, cookies: dict[str, str] | None = None
+) -> tuple[str, str, dict[str, str], int]:
     assert input_.url is not None
     try:
         with httpx.Client(follow_redirects=False, timeout=HTTP_TIMEOUT_SECONDS) as client:
-            response = client.get(input_.url, params=input_.params)
+            response = client.get(input_.url, params=input_.params, cookies=cookies or {})
     except httpx.HTTPError as exc:
         raise ToolError(
             ErrorCode.ENV_ERROR,
@@ -522,10 +525,24 @@ async def verify_tag(arguments: dict[str, Any]) -> ToolOutput:
         status = input_.status
         warnings: list[str] = []
     else:
-        html, content_type, headers, status = _fetch(input_)
+        from tia.cap.session import looks_like_login, renew_session, resolve_session
+
         warnings = []
-        if input_.session_id is not None:
-            warnings.append("SESSION_NOT_IMPLEMENTED: current version ignores session_id")
+        cookies: dict[str, str] = {}
+        if input_.url is not None:
+            _, cookies, auto_warnings = resolve_session(
+                input_.session_id, input_.url, input_.account_label
+            )
+            warnings.extend(auto_warnings)
+        html, content_type, headers, status = _fetch(input_, cookies)
+        if input_.session_id is not None and looks_like_login(
+            status, headers.get("location", ""), html
+        ):
+            from tia.cap.session import renew_session
+
+            _, cookies = renew_session(input_.session_id)
+            warnings.append("SESSION_RENEWED")
+            html, content_type, headers, status = _fetch(input_, cookies)
 
     result = analyze(
         html,

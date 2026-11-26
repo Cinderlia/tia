@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from tia.ad.http import HttpClient
 from tia.cap.registry import ToolOutput
-from tia.cap.session import looks_like_login, renew_session, session_cookies
+from tia.cap.session import looks_like_login, renew_session, resolve_session
 from tia.inf.runtime import get_runtime
 from tia.schemas.envelope import ErrorCode, ToolError
 from tia.schemas.objects import FlowRecord
@@ -38,6 +38,7 @@ class HttpRequestInput(BaseModel):
     body: str | None = None
     headers: dict[str, str] = Field(default_factory=dict)
     session_id: str | None = None
+    account_label: str = ""
     follow_redirects: bool = False
     max_redirects: int = Field(default=5, ge=0, le=10)
     capture: dict[str, Any] | None = None
@@ -76,11 +77,11 @@ async def http_request(arguments: dict[str, Any]) -> ToolOutput:
     if method not in {"GET", "POST", "PUT", "PATCH", "HEAD"}:
         raise _bad(f"Unsupported method: {method}")
 
-    session_id = params.session_id
-    cookies: dict[str, str] = session_cookies(session_id) if session_id else {}
+    session_id, cookies, warnings = resolve_session(
+        params.session_id, params.url, params.account_label
+    )
 
     capture = params.capture or {}
-    warnings: list[str] = []
     result = _fetch(params, rt, cookies, around=int(capture.get("around", 800)))
     if session_id and looks_like_login(
         result.status, result.headers.get("location", ""), result.body

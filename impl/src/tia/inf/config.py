@@ -87,6 +87,7 @@ class Settings:
     db: DbConfig
     profile: ProfileConfig
     accounts_path: Path
+    default_account: str = ""
 
     @classmethod
     def load(
@@ -120,6 +121,7 @@ class Settings:
             db=db,
             profile=ProfileConfig.load(profile),
             accounts_path=accounts,
+            default_account=_env("TIA_ACCOUNT", ""),
         )
 
     def with_db_name(self, name: str) -> Settings:
