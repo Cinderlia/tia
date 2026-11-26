@@ -21,7 +21,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from tia.ad.login import LoginResult
 from tia.inf import browser_setup
+from tia.inf.accounts import Account
 
 #: Installed before every document so that payloads can call ``xss("tag")``.
 BEACON_SCRIPT = """
@@ -207,3 +209,108 @@ class BrowserExecutor:
             screenshot_sha256=screenshot_sha256,
             error=None,
         )
+
+
+async def browser_login(
+    account: Account,
+    *,
+    timeout_ms: int = 30_000,
+    chrome: str | None = None,
+) -> LoginResult:
+    """Log in through a real browser and return the resulting cookie jar.
+
+    Used when the HTTP login failed several times (JavaScript challenges, WAF,
+    client-side CSRF handling). The result is a ``LoginResult`` so callers can
+    treat both paths identically; ``via`` is ``"browser"``.
+    """
+
+    from tia.ad.login import LoginResult
+
+    empty = LoginResult(ok=False, reason="BROWSER_UNAVAILABLE", via="browser")
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        empty.reason = f"BROWSER_UNAVAILABLE: {exc}"
+        return empty
+
+    try:
+        binary = chrome or browser_setup.chrome_binary()
+    except browser_setup.BrowserSetupError as exc:
+        empty.reason = f"BROWSER_UNAVAILABLE: {exc}"
+        return empty
+    if binary is None:
+        return empty
+
+    headless = _headless()
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(
+                executable_path=str(binary),
+                headless=headless,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            )
+            try:
+                context = await browser.new_context()
+                page = await context.new_page()
+                await page.goto(account.login_url, wait_until="load", timeout=timeout_ms)
+
+                password = page.locator('input[type="password"]:visible')
+                if await password.count() == 0:
+                    return LoginResult(
+                        ok=False,
+                        final_url=page.url,
+                        reason="NO_LOGIN_FORM",
+                        via="browser",
+                    )
+                username = page.locator(
+                    'input[type="text"]:visible, input[type="email"]:visible,'
+                    ' input:not([type]):visible'
+                ).first
+                if await username.count() == 0:
+                    return LoginResult(
+                        ok=False,
+                        final_url=page.url,
+                        reason="NO_USERNAME_FIELD",
+                        via="browser",
+                    )
+                await username.fill(account.username)
+                await password.first.fill(account.password)
+
+                submit = page.locator(
+                    'button[type="submit"]:visible, input[type="submit"]:visible,'
+                    ' button:visible'
+                ).first
+                clicked = False
+                if await submit.count() > 0:
+                    try:
+                        await submit.click(timeout=5_000)
+                        clicked = True
+                    except Exception:  # noqa: BLE001 - fall back to Enter
+                        clicked = False
+                if not clicked or page.url == account.login_url:
+                    # The click did nothing (or only re-rendered the form): submit by keyboard.
+                    await password.first.press("Enter")
+                with contextlib.suppress(Exception):
+                    await page.wait_for_load_state("load", timeout=timeout_ms)
+                await page.wait_for_timeout(1_000)
+
+                body = await page.content()
+                still_login = await page.locator('input[type="password"]').count() > 0
+                ok = "logout" in body.lower() or not still_login
+                cookies = {
+                    item["name"]: item["value"] for item in await context.cookies()
+                }
+                return LoginResult(
+                    ok=ok,
+                    status=0,
+                    final_url=page.url,
+                    reason="LOGGED_IN" if ok else "LOGIN_REJECTED",
+                    cookies=cookies,
+                    form_action=account.login_url,
+                    fields=[],
+                    via="browser",
+                )
+            finally:
+                await browser.close()
+    except Exception as exc:  # noqa: BLE001 - a broken page is not a crash
+        return LoginResult(ok=False, reason=f"BROWSER_ERROR: {exc}", via="browser")

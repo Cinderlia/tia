@@ -6,12 +6,14 @@ only ever returns the public account fields and the resulting session id.
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from tia.ad.login import login
+from tia.ad.browser import browser_login
+from tia.ad.login import LoginResult, login
 from tia.cap.registry import ToolOutput
 from tia.inf.accounts import Account, AccountsConfigError, load_accounts, pick_account
 from tia.inf.runtime import get_runtime
@@ -54,6 +56,53 @@ def _accounts() -> list[Account]:
 
 def _public_account(account: Account) -> dict[str, Any]:
     return account.public()
+
+
+def _browser_after() -> int:
+    """Consecutive HTTP login failures before the browser takes over."""
+
+    with_default = os.environ.get("TIA_LOGIN_BROWSER_AFTER", "2")
+    try:
+        return max(1, int(with_default))
+    except ValueError:
+        return 2
+
+
+async def login_account(account: Account, *, force_browser: bool = False) -> LoginResult:
+    """Log in over HTTP and fall back to a real browser after repeated failures.
+
+    The failure counter lives in the store so it survives across tool calls; a
+    successful login of either kind resets it.
+    """
+
+    runtime = get_runtime()
+    store = runtime.store
+    threshold = _browser_after()
+    force = force_browser or os.environ.get("TIA_LOGIN_BROWSER", "") == "1"
+    if force or store.login_failures(account.label) >= threshold:
+        result = await browser_login(account)
+        if result.ok:
+            store.reset_login_failure(account.label)
+            return result
+        if force or not result.reason.startswith("BROWSER_UNAVAILABLE"):
+            return result
+        # No usable browser: keep trying over HTTP rather than failing outright.
+
+    result = login(account)
+    if result.ok:
+        store.reset_login_failure(account.label)
+        return result
+
+    failures = store.bump_login_failure(account.label)
+    if failures < threshold:
+        return result
+    fallback = await browser_login(account)
+    if fallback.ok:
+        store.reset_login_failure(account.label)
+        return fallback
+    if fallback.reason.startswith("BROWSER_UNAVAILABLE"):
+        return result
+    return fallback
 
 
 def _session_data(session: dict[str, Any], *, reused: bool) -> dict[str, Any]:
@@ -135,7 +184,7 @@ async def session_bind(arguments: dict[str, Any]) -> ToolOutput:
         data["bound"] = True
         return ToolOutput(data=data)
 
-    result = login(account)
+    result = await login_account(account)
     if not result.ok:
         raise ToolError(
             ErrorCode.SESSION_INVALID,
@@ -158,6 +207,7 @@ async def session_bind(arguments: dict[str, Any]) -> ToolOutput:
     data = _session_data(row, reused=False)
     data["bound"] = True
     data["login"] = {
+        "via": result.via,
         "status": result.status,
         "final_url": result.final_url,
         "reason": result.reason,
@@ -201,7 +251,7 @@ def account_for_url(url: str, label: str = "") -> Account | None:
     return None
 
 
-def ensure_session(
+async def ensure_session(
     url: str, label: str = "", case_id: str | None = None
 ) -> tuple[dict[str, Any] | None, list[str]]:
     """Reuse a stored session or log the account in; anonymous when no account matches."""
@@ -213,7 +263,7 @@ def ensure_session(
     existing = runtime.store.find_session(account.label, account.base_url)
     if existing is not None and existing.get("valid"):
         return existing, []
-    result = login(account)
+    result = await login_account(account)
     if not result.ok:
         return None, [f"AUTO_LOGIN_FAILED: {account.label}: {result.reason}"]
     session_id = runtime.store.add_session(
@@ -229,14 +279,14 @@ def ensure_session(
     return runtime.store.get_session(session_id), []
 
 
-def resolve_session(
+async def resolve_session(
     session_id: str | None, url: str, label: str = ""
 ) -> tuple[str | None, dict[str, str], list[str]]:
     """Cookies for a request: explicit session, else an automatically maintained one."""
 
     if session_id:
         return session_id, session_cookies(session_id), []
-    row, warnings = ensure_session(url, label)
+    row, warnings = await ensure_session(url, label)
     if row is None:
         return None, {}, warnings
     return str(row["id"]), dict(row.get("cookies") or {}), warnings
@@ -267,7 +317,7 @@ def looks_like_login(status: int, location: str, body: str) -> bool:
     return re.search(r"""type\s*=\s*["']?password""", body, re.IGNORECASE) is not None
 
 
-def renew_session(session_id: str) -> tuple[str, dict[str, str]]:
+async def renew_session(session_id: str) -> tuple[str, dict[str, str]]:
     """Log the same account in again and replace the stored session.
 
     Returns the new session id and cookies; raises SESSION_INVALID when the
@@ -290,7 +340,7 @@ def renew_session(session_id: str) -> tuple[str, dict[str, str]]:
             f"account {label!r} is no longer configured",
             hint="re-add it to accounts.yaml and call session_bind",
         )
-    result = login(account)
+    result = await login_account(account)
     if not result.ok:
         raise ToolError(
             ErrorCode.SESSION_INVALID,

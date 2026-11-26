@@ -92,6 +92,14 @@ roles and description) so the model can choose the identity it needs; passing an
 written to tool output, evidence or reports. When a bound session expires, the
 HTTP-based tools log the same account in again once and replay the request.
 
+If HTTP login fails twice in a row for the same account — a JavaScript challenge,
+a WAF, or client-side CSRF handling — the login is retried in Chrome, which is
+also where `--browser` starts directly:
+
+```bash
+uv run tia-agent login --label site-user --browser
+```
+
 ## Execution confirmation (optional)
 
 Static verification inspects the returned page and judges whether the payload lands in an

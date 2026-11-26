@@ -244,7 +244,7 @@ def _trace_dir(case_id: str) -> Path:
     return Path(rt.store.path).parent / "traces" / "opcode" / case_id
 
 
-def _fetch(
+async def _fetch(
     url: str,
     method: str,
     params: dict[str, str],
@@ -339,18 +339,18 @@ async def trace_run(arguments: dict[str, Any]) -> ToolOutput:
         request_body = urlencode(request_params)
         request_params = {}
         request_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
-    session_id, cookies, warnings = resolve_session(
+    session_id, cookies, warnings = await resolve_session(
         params.session_id, url, params.account_label
     )
     started = time.monotonic()
     try:
-        http = _fetch(url, method, request_params, request_body, request_headers, cookies)
+        http = await _fetch(url, method, request_params, request_body, request_headers, cookies)
         if session_id and looks_like_login(
             http.status, http.headers.get("location", ""), http.body
         ):
-            session_id, cookies = renew_session(session_id)
+            session_id, cookies = await renew_session(session_id)
             warnings.append("SESSION_RENEWED")
-            http = _fetch(url, method, request_params, request_body, request_headers, cookies)
+            http = await _fetch(url, method, request_params, request_body, request_headers, cookies)
         text = adapter.read_output(canonical)
     finally:
         adapter.disarm()

@@ -31,6 +31,7 @@ class LoginResult:
     cookies: dict[str, str] = field(default_factory=dict)
     form_action: str = ""
     fields: list[str] = field(default_factory=list)
+    via: str = "http"
 
 
 def pick_login_form(forms: list[PageForm]) -> PageForm | None:

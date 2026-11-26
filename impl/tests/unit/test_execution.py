@@ -16,7 +16,7 @@ _HTML = "<html><body><p>hello q7z3</p><script>alert('q7z3')</script></body></htm
 
 @pytest.fixture(autouse=True)
 def _no_network(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fake_fetch(input_: Any, cookies: Any = None) -> tuple[str, str, dict[str, str], int]:
+    async def fake_fetch(input_: Any, cookies: Any = None) -> tuple[str, str, dict[str, str], int]:
         return _HTML, "text/html", {}, 200
 
     monkeypatch.setattr(verify_module, "_fetch", fake_fetch)

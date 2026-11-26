@@ -85,12 +85,14 @@ def test_ensure_session_reuses_the_first_account(tmp_path, monkeypatch):
         return LoginResult(True, 200, "http://x.test/app/index.php", "LOGGED_IN", {"SESSION": account.label})
 
     monkeypatch.setattr(session_module, "login", fake_login)
-    row, warnings = session_module.ensure_session("http://x.test/app/page.php")
+    row, warnings = asyncio.run(session_module.ensure_session("http://x.test/app/page.php"))
     assert warnings == []
     assert row is not None and row["label"] == "first"
     assert row["cookies"] == {"SESSION": "first"}
 
-    again, warnings2 = session_module.ensure_session("http://x.test/app/other.php")
+    again, warnings2 = asyncio.run(
+        session_module.ensure_session("http://x.test/app/other.php")
+    )
     assert warnings2 == []
     assert again is not None and again["id"] == row["id"]
     assert calls == ["first"]
@@ -107,7 +109,9 @@ def test_ensure_session_honours_an_explicit_label(tmp_path, monkeypatch):
         "login",
         lambda account, **_: LoginResult(True, 200, "http://x.test/app/i.php", "LOGGED_IN", {"S": account.label}),
     )
-    row, _ = session_module.ensure_session("http://x.test/app/page.php", label="second")
+    row, _ = asyncio.run(
+        session_module.ensure_session("http://x.test/app/page.php", label="second")
+    )
     assert row is not None and row["label"] == "second"
     assert row["cookies"] == {"S": "second"}
     reset_runtime()
@@ -126,7 +130,7 @@ def test_http_request_attaches_the_default_session(tmp_path, monkeypatch):
 
     seen: list[dict[str, str]] = []
 
-    def fake_fetch(params, rt, cookies, *, around):  # noqa: ANN001, ANN202
+    async def fake_fetch(params, rt, cookies, *, around):  # noqa: ANN001, ANN202
         seen.append(dict(cookies))
         return FakeResult()
 

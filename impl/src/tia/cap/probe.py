@@ -240,7 +240,7 @@ async def probe_run(arguments: dict[str, Any]) -> ToolOutput:
         key.lower() == "content-type" for key in headers
     ):
         headers["Content-Type"] = "application/x-www-form-urlencoded"
-    session_id, cookies, warnings = resolve_session(
+    session_id, cookies, warnings = await resolve_session(
         params.session_id, params.url, params.account_label
     )
     result = HttpClient().fetch(
@@ -255,7 +255,7 @@ async def probe_run(arguments: dict[str, Any]) -> ToolOutput:
     if session_id and looks_like_login(
         result.status, result.headers.get("location", ""), result.body
     ):
-        session_id, cookies = renew_session(session_id)
+        session_id, cookies = await renew_session(session_id)
         warnings.append("SESSION_RENEWED")
         result = HttpClient().fetch(
             params.method,

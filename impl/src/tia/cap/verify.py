@@ -526,7 +526,7 @@ def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="milliseconds")
 
 
-def _fetch(
+async def _fetch(
     input_: VerifyTagInput, cookies: dict[str, str] | None = None
 ) -> tuple[str, str, dict[str, str], int]:
     assert input_.url is not None
@@ -575,19 +575,19 @@ async def verify_tag(arguments: dict[str, Any]) -> ToolOutput:
 
         warnings = []
         if input_.url is not None:
-            _, cookies, auto_warnings = resolve_session(
+            _, cookies, auto_warnings = await resolve_session(
                 input_.session_id, input_.url, input_.account_label
             )
             warnings.extend(auto_warnings)
-        html, content_type, headers, status = _fetch(input_, cookies)
+        html, content_type, headers, status = await _fetch(input_, cookies)
         if input_.session_id is not None and looks_like_login(
             status, headers.get("location", ""), html
         ):
             from tia.cap.session import renew_session
 
-            _, cookies = renew_session(input_.session_id)
+            _, cookies = await renew_session(input_.session_id)
             warnings.append("SESSION_RENEWED")
-            html, content_type, headers, status = _fetch(input_, cookies)
+            html, content_type, headers, status = await _fetch(input_, cookies)
 
     result = analyze(
         html,

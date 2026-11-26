@@ -44,7 +44,7 @@ class HttpRequestInput(BaseModel):
     capture: dict[str, Any] | None = None
 
 
-def _fetch(
+async def _fetch(
     params: HttpRequestInput,
     rt: Any,
     cookies: dict[str, str],
@@ -77,18 +77,18 @@ async def http_request(arguments: dict[str, Any]) -> ToolOutput:
     if method not in {"GET", "POST", "PUT", "PATCH", "HEAD"}:
         raise _bad(f"Unsupported method: {method}")
 
-    session_id, cookies, warnings = resolve_session(
+    session_id, cookies, warnings = await resolve_session(
         params.session_id, params.url, params.account_label
     )
 
     capture = params.capture or {}
-    result = _fetch(params, rt, cookies, around=int(capture.get("around", 800)))
+    result = await _fetch(params, rt, cookies, around=int(capture.get("around", 800)))
     if session_id and looks_like_login(
         result.status, result.headers.get("location", ""), result.body
     ):
-        session_id, cookies = renew_session(session_id)
+        session_id, cookies = await renew_session(session_id)
         warnings.append("SESSION_RENEWED")
-        result = _fetch(params, rt, cookies, around=int(capture.get("around", 800)))
+        result = await _fetch(params, rt, cookies, around=int(capture.get("around", 800)))
     if result.truncated:
         warnings.append("TRUNCATED")
     data = {

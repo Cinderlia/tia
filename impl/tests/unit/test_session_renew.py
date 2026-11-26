@@ -54,7 +54,7 @@ def test_renew_session_replaces_cookies(tmp_path, monkeypatch):
         return LoginResult(True, 200, "http://x.test/app/index.php", "LOGGED_IN", {"PHPSESSID": "new"})
 
     monkeypatch.setattr(session_module, "login", fake_login)
-    new_id, cookies = session_module.renew_session(old)
+    new_id, cookies = asyncio.run(session_module.renew_session(old))
     assert new_id != old
     assert cookies == {"PHPSESSID": "new"}
     assert store.get_session(old)["valid"] is False
@@ -143,7 +143,7 @@ def test_verify_tag_reuses_session_cookies(tmp_path, monkeypatch):
 
     seen: list[dict[str, str]] = []
 
-    def fake_fetch(input_, cookies=None):  # noqa: ANN001
+    async def fake_fetch(input_, cookies=None):  # noqa: ANN001
         seen.append(dict(cookies or {}))
         return "<p>hello tia-tag</p>", "text/html", {}, 200
 

@@ -128,6 +128,11 @@ def _parser() -> argparse.ArgumentParser:
     login.add_argument("--case-id", default=None)
     login.add_argument("--accounts", default=None, help="accounts.yaml path")
     login.add_argument("--store", default=None)
+    login.add_argument(
+        "--browser",
+        action="store_true",
+        help="Skip the HTTP attempt and log in through Chrome",
+    )
     login.add_argument("--json", action="store_true")
 
     browser_install = sub.add_parser(
@@ -579,6 +584,8 @@ def _run_accounts(args: argparse.Namespace) -> int:
 
 
 def _run_login(args: argparse.Namespace) -> int:
+    if getattr(args, "browser", False):
+        os.environ["TIA_LOGIN_BROWSER"] = "1"
     _prepare_env(args, "trigger")
     roles = [item.strip() for item in args.roles.split(",") if item.strip()]
     data = _dispatch_session(

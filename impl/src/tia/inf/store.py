@@ -84,6 +84,11 @@ CREATE TABLE IF NOT EXISTS probe (
     body        TEXT NOT NULL,
     observed_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS login_failure (
+    label      TEXT PRIMARY KEY,
+    failures   INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS session (
     id          TEXT PRIMARY KEY,
     case_id     TEXT,
@@ -717,6 +722,30 @@ class Store:
     def invalidate_session(self, session_id: str) -> None:
         with self._conn() as conn:
             conn.execute("UPDATE session SET valid = 0 WHERE id = ?", (session_id,))
+
+    def login_failures(self, label: str) -> int:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT failures FROM login_failure WHERE label = ?", (label,)
+            ).fetchone()
+        return int(row["failures"]) if row is not None else 0
+
+    def bump_login_failure(self, label: str) -> int:
+        now = now_iso()
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO login_failure(label, failures, updated_at) VALUES (?, 1, ?)"
+                " ON CONFLICT(label) DO UPDATE SET failures = failures + 1, updated_at = excluded.updated_at",
+                (label, now),
+            )
+            row = conn.execute(
+                "SELECT failures FROM login_failure WHERE label = ?", (label,)
+            ).fetchone()
+        return int(row["failures"]) if row is not None else 1
+
+    def reset_login_failure(self, label: str) -> None:
+        with self._conn() as conn:
+            conn.execute("DELETE FROM login_failure WHERE label = ?", (label,))
 
     @staticmethod
     def _session_row(row: sqlite3.Row) -> dict[str, Any]:
