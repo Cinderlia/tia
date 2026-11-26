@@ -122,6 +122,22 @@ def _payload(notes: dict[str, Any]) -> str:
     return ""
 
 
+def _entry_pairs(entry: dict[str, Any], field: str, payload: str) -> list[tuple[str, str]]:
+    raw_fields = entry.get("fields")
+    names = [str(name) for name in raw_fields] if isinstance(raw_fields, (dict, list)) else []
+    if field and field not in names:
+        names.append(field)
+    pairs: list[tuple[str, str]] = []
+    for name in names:
+        if name == field:
+            pairs.append((name, payload))
+        elif name.lower() in {"submit", "btnsubmit", "login", "go"}:
+            pairs.append((name, "1"))
+        else:
+            pairs.append((name, ""))
+    return pairs
+
+
 def _verify_section(notes: dict[str, Any], kind: str) -> list[str]:
     """Steps a human can execute in a browser (URL, plus a form for POST)."""
 
@@ -142,8 +158,10 @@ def _verify_section(notes: dict[str, Any], kind: str) -> list[str]:
     if not url:
         return lines + ["- No URL recorded for this finding."]
     step = 1
-    if method == "get" and field and payload:
-        target = f"{url}{'&' if '?' in url else '?'}{field}={quote(payload, safe='')}"
+    pairs = _entry_pairs(entry, field, payload) if payload else []
+    if method == "get" and pairs:
+        query = "&".join(f"{quote(name)}={quote(value, safe='')}" for name, value in pairs)
+        target = f"{url}{'&' if '?' in url else '?'}{query}"
         lines += [f"{step}. Open: {target}"]
         step += 1
     elif method == "get":
@@ -158,20 +176,9 @@ def _verify_section(notes: dict[str, Any], kind: str) -> list[str]:
             "| --- | --- |",
         ]
         step += 2
-        raw_fields = entry.get("fields")
-        if isinstance(raw_fields, dict):
-            names = list(raw_fields)
-        elif isinstance(raw_fields, list):
-            names = [str(name) for name in raw_fields]
-        else:
-            names = []
-        for name in names:
-            if name == field:
-                lines.append(f"| `{name}` | `{payload}` |")
-            else:
-                lines.append(f"| `{name}` | (empty) |")
-        if not names:
-            lines.append(f"| `{field}` | `{payload}` |")
+        for name, value in pairs or [(field, payload)]:
+            shown = "(empty)" if value == "" else f"`{value}`"
+            lines.append(f"| `{name}` | {shown} |")
         lines.append("")
     if kind == "second_order":
         lines.append(f"{step}. Open the read page: {_read_request(notes)}")

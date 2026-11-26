@@ -242,6 +242,31 @@ def _breaks_out(payload: str, quoting: str) -> bool:
     return ">" in payload or " " in payload
 
 
+def _attr_executes(payload: str, quoting: str) -> bool:
+    """True only when the payload really leaves the attribute value and starts markup/handlers."""
+
+    if quoting == "double":
+        quote = '"'
+    elif quoting == "single":
+        quote = "'"
+    else:
+        # Unquoted values end at whitespace: injection needs " on*=", or ">" then a tag.
+        return bool(re.search(r"\s+on\w+\s*=", payload)) or bool(
+            re.search(r">\s*<[A-Za-z]", payload)
+        )
+    index = payload.find(quote)
+    if index < 0:
+        return False
+    rest = payload[index + 1 :]
+    if re.search(r"(^|\s)on\w+\s*=", rest):
+        return True
+    if ">" in rest:
+        after = rest[rest.index(">") :]
+        if re.search(r"<[A-Za-z]", after):
+            return True
+    return False
+
+
 def _breaks_js_string(payload: str, quoting: str) -> bool:
     if quoting == "double":
         return '"' in payload
@@ -270,6 +295,7 @@ def _judge(
     sandboxed: bool,
     is_html: bool,
     attr_value: str,
+    payload_present: bool = True,
 ) -> tuple[bool, str, str]:
     """Returns ``(executable, reason, confidence)``; defaults to False if uncertain."""
     kind = context.kind
@@ -298,25 +324,27 @@ def _judge(
         if context.node is not None and context.node.tag == "title":
             return False, "TITLE_NOT_EXECUTABLE", "high"
         if payload:
+            if not payload_present:
+                return False, "ENCODED_ONLY", "high"
             if _EXECUTABLE_CONSTRUCT.search(payload):
                 return True, "HTML_EXECUTABLE", "high"
             return False, "INERT_PAYLOAD", "medium"
         return False, "NEEDS_EXECUTABLE_PAYLOAD", "medium"
 
     if kind == ContextKind.ATTR:
+        if context.in_tag:
+            return False, "NOT_CLOSED", "high"
         if context.js_state == "style":
             return False, "STYLE_NOT_SCRIPTABLE", "medium"
         event = _is_event_attr(context.attr_name, attr_value)
         if payload is not None and payload != "":
             if event:
                 return True, "EVENT_HANDLER", "high"
-            if _breaks_out(payload, context.quoting) and (
-                _EXECUTABLE_CONSTRUCT.search(payload) or _EVENT_ATTR_INJECT.search(payload)
-            ):
+            if not payload_present:
+                return False, "ENCODED_ONLY", "high"
+            if _attr_executes(payload, context.quoting):
                 return True, "ATTR_BREAKOUT", "high"
-            if _breaks_out(payload, context.quoting):
-                return False, "INERT_PAYLOAD", "medium"
-            return False, "NOT_CLOSED", "high"
+            return False, "NEEDS_CLOSING_QUOTE", "high"
         if event:
             return False, "NEEDS_EXECUTABLE_PAYLOAD", "medium"
         return False, "NEEDS_CLOSING_QUOTE", "medium"
@@ -336,6 +364,8 @@ def _judge(
 
     if kind == ContextKind.SCRIPT_STRING:
         if payload:
+            if re.search(r"</\s*script", payload, re.IGNORECASE):
+                return True, "SCRIPT_BREAKOUT", "high"
             if _breaks_js_string(payload, context.quoting) and (
                 ";" in payload or "\n" in payload or "//" in payload
             ):
@@ -373,6 +403,7 @@ def analyze(
     is_html = domscan.is_html_content_type(content_type)
     csp_blocked = _csp_blocks_inline(safe_headers)
     downstream = bool(_DOWNSTREAM_WRITE.search(html))
+    payload_present = payload is None or payload == "" or payload in html
 
     occurrences: list[Occurrence] = []
     seen: set[tuple[str, str | None]] = set()
@@ -396,6 +427,7 @@ def analyze(
             sandboxed=_sandbox_blocked(node),
             is_html=is_html,
             attr_value=attr_value,
+            payload_present=payload_present,
         )
         chain, truncated = (
             domscan.chain_html(html, node, start, end)

@@ -375,6 +375,10 @@ class Context:
     node: Node | None
     js_state: str | None = None
     attr_name: str | None = None
+    #: True when the landing point sits inside a start tag but outside any quoted value
+    #: (i.e. in attribute-name space). Markup written there is parsed as more attributes,
+    #: never as a new element, so it cannot execute.
+    in_tag: bool = False
 
 
 def classify(document: Document, pos: int, *, content_type: str = "text/html") -> Context:
@@ -398,6 +402,17 @@ def classify(document: Document, pos: int, *, content_type: str = "text/html") -
             js_state=None,
             attr_name=segment.attr_name,
         )
+
+    if segment is None:
+        holder = _start_tag_at(document, pos)
+        if holder is not None:
+            return Context(
+                kind="attr",
+                quoting="none",
+                node=holder,
+                attr_name=None,
+                in_tag=True,
+            )
 
     owner = _owner_for_position(document, pos)
     if owner is None:
@@ -429,6 +444,17 @@ def classify(document: Document, pos: int, *, content_type: str = "text/html") -
     if tag == "pre":
         return Context(kind="plain_text", quoting="none", node=owner)
     return Context(kind="html_text", quoting="none", node=owner)
+
+
+def _start_tag_at(document: Document, pos: int) -> Node | None:
+    """Innermost element whose start tag spans ``pos`` (attribute-name space)."""
+    holder: Node | None = None
+    for node in document.nodes:
+        if node.start <= pos < node.start_tag_end and (
+            holder is None or node.start >= holder.start
+        ):
+            holder = node
+    return holder
 
 
 def _owner_for_position(document: Document, pos: int) -> Node | None:
