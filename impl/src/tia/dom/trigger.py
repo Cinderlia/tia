@@ -192,6 +192,7 @@ async def run_trigger(
         "base_url": base_url,
         "sink": f"{sink_file}:{sink_line}",
         "sink_file": sink_file,
+        "sink_code": str(sink.get("code") or ""),
     }
     kernel = Kernel(
         profile="trigger", budget=budget, client=client or LocalToolClient(profile="trigger")
@@ -452,10 +453,12 @@ async def run_trigger(
     stages.append(StageRecord("P6", residue == 0, f"residue={residue}"))
 
     rt.store.set_case_verdict(case_id, str(verdict), ceiling="EXECUTABLE")
+    rt.store.merge_case_notes(case_id, notes)
     report = await kernel.report()
     rt.store.set_case_report(case_id, report)
     write_case_report(rt.store, case_id)
     stages.append(StageRecord("P6", True, "Report generated"))
+    notes["account"] = os.environ.get("TIA_ACCOUNT") or "anonymous (no login)"
     notes["observed_at"] = now_iso()
     return done(
         TriggerResult(

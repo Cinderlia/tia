@@ -318,6 +318,8 @@ async def _finish(
     store = get_runtime().store
     store.set_case_verdict(case_id, verdict, ceiling="EXECUTABLE")
     record_case(store, {"sinkFile": str(notes.get("sink_file") or "")}, verdict, notes)
+    notes["account"] = os.environ.get("TIA_ACCOUNT") or "anonymous (no login)"
+    store.merge_case_notes(case_id, notes)
     report = await kernel.report()
     store.set_case_report(case_id, report)
     write_case_report(store, case_id)

@@ -293,6 +293,19 @@ class Store:
                 (verdict, ceiling, report, now_iso(), case_id),
             )
 
+    def merge_case_notes(self, case_id: str, notes: dict[str, Any]) -> None:
+        """Merge structured notes into the case (JSON-safe, best effort)."""
+        with self._conn() as conn:
+            row = conn.execute("SELECT notes FROM case_file WHERE id=?", (case_id,)).fetchone()
+            if row is None:
+                return
+            current: dict[str, Any] = json.loads(row["notes"])
+            current.update(notes)
+            conn.execute(
+                "UPDATE case_file SET notes=?, updated_at=? WHERE id=?",
+                (json.dumps(current, ensure_ascii=False, default=str), now_iso(), case_id),
+            )
+
     def set_case_report(self, case_id: str, report: str) -> None:
         """Store the Markdown report generated at the end of a case."""
         with self._conn() as conn:

@@ -24,6 +24,7 @@ from tia.dom.inject import run_inject
 from tia.dom.main import seed_queue
 from tia.dom.pairing_agent import PairingConfig, build_pairing_queue
 from tia.dom.trigger import normalize_slice, run_trigger
+from tia.inf.findings import finding_db_only, finding_first_order, finding_second_order
 from tia.inf.reports import RunReports
 from tia.inf.runtime import get_runtime
 from tia.orch.kernel import ToolCallError, ToolClient
@@ -263,6 +264,7 @@ async def run_pipeline(
         record["queue_items"] = len(pairing.queue)
         if not pairing.queue:
             record["stopped_at"] = "pairing"
+            finding_db_only(store, trigger.case_id)
             result.rounds.append(record)
             continue
 
@@ -286,6 +288,13 @@ async def run_pipeline(
             {"item": item.slice_id, "verdict": item.verdict} for item in injected.outcomes
         ]
         result.outcomes.extend(injected.outcomes)
+        confirmed = [
+            item for item in injected.outcomes if item.verdict in ("EXECUTABLE", "EXECUTED")
+        ]
+        for outcome in confirmed:
+            finding_second_order(store, outcome.case_id)
+        if not confirmed:
+            finding_db_only(store, trigger.case_id)
         for outcome in injected.outcomes:
             reports.add(
                 outcome.case_id,
@@ -337,6 +346,8 @@ async def _run_direct_round(
         return
     store.archive_slice(str(leased["id"]), direct.verdict, case_id=direct.case_id)
     reports.add(direct.case_id, "direct", direct.verdict, _slice_label(raw))
+    if direct.verdict == "EXECUTED":
+        finding_first_order(store, direct.case_id)
     result.outcomes.append(
         CaseOutcome(
             slice_id=str(leased["id"]),
@@ -456,6 +467,17 @@ async def walk_injection_queue(
                     str(hints[1]["alternate_write_slice_id"]), retry.verdict,
                     case_id=retry.case_id,
                 )
+        read_sink = _slice_label(read_raw) if read_raw else ""
+        extra = {
+            "read_url": read_url,
+            "read_sink": read_sink,
+            "read_sink_code": str((read_raw.get("sink") or {}).get("code") or "")
+            if isinstance(read_raw.get("sink"), dict)
+            else str(read_raw.get("sinkCode") or ""),
+        }
+        inject.notes.update(extra)
+        if inject.case_id:
+            store.merge_case_notes(inject.case_id, extra)
         store.archive_injection_item(str(item["item_id"]), inject.verdict, case_id=inject.case_id)
         store.archive_slice(str(item["write_slice_id"]), inject.verdict, case_id=inject.case_id)
         read_identity = str(item.get("read_identity") or "")
@@ -500,11 +522,13 @@ def _columns_label(value: Any) -> str:
 
 
 def _slice_label(raw: dict[str, Any]) -> str:
-    """Short human label for a slice in the run index."""
+    """Short human label for a slice in the run index (``file:line``)."""
     sink = raw.get("sink")
     if isinstance(sink, dict):
         return f"{sink.get('file', '?')}:{sink.get('line', '?')}"
-    return str(raw.get("sinkFile") or raw.get("sink") or "?")
+    file = str(raw.get("sinkFile") or raw.get("sink") or "?")
+    line = raw.get("sinkLine")
+    return f"{file}:{line}" if line else file
 
 
 def _report(result: PipelineResult) -> str:

@@ -642,6 +642,9 @@ async def _finish(kernel: Kernel, result: InjectResult, cleanup: bool = True) ->
         report = str(data.get("markdown", "")) if isinstance(data, dict) else ""
     except ToolCallError:
         report = ""
+    result.notes["account"] = os.environ.get("TIA_ACCOUNT") or "anonymous (no login)"
+    if result.case_id:
+        get_runtime().store.merge_case_notes(result.case_id, result.notes)
     result.report = report
     if result.case_id and report:
         get_runtime().store.set_case_report(result.case_id, report)

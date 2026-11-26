@@ -262,6 +262,10 @@ def _run_trigger(args: argparse.Namespace) -> int:
         "tool_calls": len(result.trace),
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
+    if result.verdict == "EXECUTED":
+        from tia.inf.findings import finding_db_only
+
+        finding_db_only(get_runtime().store, result.case_id)
     if not args.json:
         print(result.report)
     return 0
@@ -453,6 +457,10 @@ def _run_direct(args: argparse.Namespace) -> int:
         "notes": result.notes,
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
+    if result.verdict == "EXECUTED":
+        from tia.inf.findings import finding_first_order
+
+        finding_first_order(get_runtime().store, result.case_id)
     if not args.json:
         print(result.report)
     return 0 if result.verdict == "EXECUTED" else 1
