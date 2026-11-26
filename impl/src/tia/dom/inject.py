@@ -158,6 +158,7 @@ async def run_inject(
     payload_constraints: dict[str, Any] | None = None,
     slice_id: str | None = None,
     learning: dict[str, Any] | None = None,
+    read_target: dict[str, Any] | None = None,
 ) -> InjectResult:
     kernel = Kernel(
         profile="inject", budget=budget, client=client or LocalToolClient(profile="inject")
@@ -175,6 +176,10 @@ async def run_inject(
     line_match = re.search(r":(\d+)", sink)
     sink_line = int(line_match.group(1)) if line_match else int(raw_slice.get("sinkLine") or 0)
     notes["sink_file"] = sink_file
+    read_file = str((read_target or {}).get("file") or "")
+    read_line = int((read_target or {}).get("line") or 0)
+    if read_file or read_line:
+        notes["read_target"] = {"file": read_file, "line": read_line}
     params = [str(p) for p in raw_slice.get("params") or []]
     if not params:
         for source in raw_slice.get("sources") or []:
@@ -348,9 +353,21 @@ async def run_inject(
             values[param] = values[param] or f"tia-{tag}"
     body = urlencode(values)
     armed = False
+    arm_targets: list[dict[str, Any]] = []
     if insert_line is not None:
+        arm_targets.append({"file": sink_file, "line": insert_line})
+    if read_file and read_line and (read_file, read_line) != (sink_file, insert_line):
+        arm_targets.append({"file": read_file, "line": read_line})
+    if arm_targets:
         try:
-            await call("probe_arm", {"case_id": result.case_id, "file": sink_file, "line": insert_line})
+            await call(
+                "probe_arm",
+                {
+                    "case_id": result.case_id,
+                    "targets": arm_targets,
+                    "output": f"inject-{tag}.json",
+                },
+            )
             armed = True
         except ToolCallError as exc:
             notes["probe_error"] = str(exc.envelope.error.message if exc.envelope.error else exc)
@@ -364,6 +381,7 @@ async def run_inject(
                     "method": "POST",
                     "body": body,
                     "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+                    "capture_html": True,
                 },
             )
         else:
@@ -390,6 +408,8 @@ async def run_inject(
         query = (submitted.get("queries") or [{}])[0]
         notes["probe"] = {
             "mode": submitted.get("mode"),
+            "targets": submitted.get("targets"),
+            "by_target": submitted.get("by_target"),
             "sql": query.get("sql"),
             "bindings": query.get("bindings"),
             "affected_rows": query.get("affected_rows"),
@@ -417,7 +437,25 @@ async def run_inject(
     # Second-order XSS: the write entry and the read page differ. Fetch the read
     # page with its own entry parameters before classifying the tag context.
     verify_content_type = "text/html"
-    if verify_url and verify_url != form.action and verify_entry:
+    verify: dict[str, Any] | None = None
+    submitted_http = submitted.get("http") or {}
+    same_page_html = str(submitted_http.get("html") or "")
+    if same_page_html and tag in same_page_html:
+        # The write page already rendered the tag: one arm, one request covered both
+        # the write target and the read target.
+        verify = await call(
+            "verify_tag",
+            {
+                "tag": tag,
+                "payload": payload,
+                "html": same_page_html,
+                "content_type": str(submitted_http.get("content_type") or "text/html"),
+            },
+        )
+        notes["verify_on"] = "probe_page"
+        notes["verify_attempts"] = [{"values": values, "source": "probe_page",
+                                     "found": bool(verify.get("found"))}]
+    elif verify_url and verify_url != form.action and verify_entry:
         entry_method = str(verify_entry.get("method") or "POST").upper()
         entry_spec = [entry_field(item) for item in verify_entry.get("fields") or []]
         written_row: dict[str, Any] | None = None
@@ -458,12 +496,42 @@ async def run_inject(
             {"method": candidate.method, "confidence": candidate.confidence, "values": candidate.values}
             for candidate in entry_candidates_list
         ]
-        verify: dict[str, Any] | None = None
+        verify = None
         attempts: list[dict[str, Any]] = []
+        read_armed = False
+        if read_file and read_line:
+            with contextlib.suppress(ToolCallError):
+                await call(
+                    "probe_arm",
+                    {
+                        "case_id": result.case_id,
+                        "targets": [{"file": read_file, "line": read_line}],
+                        "output": f"inject-read-{tag}.json",
+                    },
+                )
+                read_armed = True
         for values in attempt_values:
             attempt_html: str | None = None
             try:
-                if entry_method == "GET":
+                if read_armed:
+                    probe_page = await call(
+                        "probe_run",
+                        {
+                            "case_id": result.case_id,
+                            "url": verify_url,
+                            "method": entry_method,
+                            "params": values if entry_method == "GET" else {},
+                            "body": urlencode(values) if entry_method == "POST" else None,
+                            "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+                            "capture_html": True,
+                        },
+                    )
+                    page = probe_page.get("http") or {}
+                    attempt_html = str(page.get("html") or "")
+                    verify_content_type = str(page.get("content_type") or "text/html")
+                    status = page.get("status")
+                    notes.setdefault("read_probe", []).append(probe_page.get("by_target"))
+                elif entry_method == "GET":
                     page = await call("http_request", {"method": "GET", "url": verify_url, "params": values})
                 else:
                     page = await call(
@@ -475,7 +543,7 @@ async def run_inject(
                             "headers": {"Content-Type": "application/x-www-form-urlencoded"},
                         },
                     )
-                attempt_html = str(page.get("body") or "")
+                attempt_html = attempt_html if attempt_html is not None else str(page.get("body") or "")
                 verify_content_type = str(page.get("content_type") or "text/html")
                 status = page.get("status")
             except ToolCallError as exc:
@@ -499,6 +567,9 @@ async def run_inject(
                 verify = this_verify
             if this_verify.get("found"):
                 break
+        if read_armed:
+            with contextlib.suppress(ToolCallError):
+                await call("probe_disarm", {"case_id": result.case_id})
         notes["verify_attempts"] = attempts
         stage("I6", verify is not None, f"read page {verify_url} attempts={len(attempts)}")
         if verify is None:

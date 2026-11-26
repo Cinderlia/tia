@@ -29,6 +29,30 @@ from tia.orch.learning import hints_for
 from tia.schemas.objects import CaseOutcome
 
 
+def _read_target(raw: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return the (file, line) the trigger agent proved reachable, if known."""
+
+    if not raw:
+        return None
+    probe = raw.get("sqlProbe")
+    probe_cfg = probe.get("extensionConfig") if isinstance(probe, dict) else None
+    raw_sink = raw.get("sink")
+    sink: dict[str, Any] = raw_sink if isinstance(raw_sink, dict) else {}
+    file = str(raw.get("sinkFile") or sink.get("file") or "")
+    line = int(raw.get("sinkLine") or sink.get("line") or 0)
+    if not file and ":" in str(raw.get("sink") or ""):
+        path, _, number = str(raw.get("sink")).rpartition(":")
+        file = path
+        line = int(number) if number.isdigit() else 0
+    if isinstance(probe_cfg, dict) and probe_cfg.get("line") and file:
+        # The navi slice may carry the SQL read line; keep the app-relative file
+        # from the slice because the analysis path is not mounted in the target.
+        return {"file": file, "line": int(probe_cfg["line"])}
+    if not file or not line:
+        return None
+    return {"file": file, "line": line}
+
+
 def _read_entry(
     reader: Callable[[str, int, int], list[tuple[int, str]]] | None,
     raw: dict[str, Any],
@@ -364,6 +388,7 @@ async def walk_injection_queue(
             payload_constraints=payload_constraints,
             slice_id=str(item["write_slice_id"]),
             learning=hints_for(store, read_raw or write_raw),
+            read_target=_read_target(read_raw),
         )
         store.archive_injection_item(str(item["item_id"]), inject.verdict, case_id=inject.case_id)
         store.archive_slice(str(item["write_slice_id"]), inject.verdict, case_id=inject.case_id)

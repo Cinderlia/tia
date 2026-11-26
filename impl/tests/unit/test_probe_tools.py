@@ -162,6 +162,27 @@ async def test_run_reads_capture_and_normalizes_rows(env: dict[str, Any]) -> Non
     assert FakeHttp.calls[0]["url"].endswith("/xvwa/home.php")
 
 
+async def test_run_captures_html_on_demand(env: dict[str, Any]) -> None:
+    await _arm(env)
+    output_dir = env["probe_base"] / "sql"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / f"{env['case_id']}-2.json").write_text(json.dumps(CAPTURE), encoding="utf-8")
+    (output_dir / "sqlquery_debug.log").write_text("matched_queries=1\n", encoding="utf-8")
+
+    plain = await probe_run({"case_id": env["case_id"], "url": "http://127.0.0.1/xvwa/home.php"})
+    assert "html" not in plain.data["http"]
+
+    captured = await probe_run(
+        {
+            "case_id": env["case_id"],
+            "url": "http://127.0.0.1/xvwa/home.php",
+            "capture_html": True,
+        }
+    )
+    assert captured.data["http"]["html"] == "<html><body>ok</body></html>"
+    assert captured.data["http"]["content_type"].startswith("text/html")
+
+
 async def test_run_without_capture_reports_not_found(env: dict[str, Any]) -> None:
     await _arm(env)
     with pytest.raises(ToolError) as excinfo:

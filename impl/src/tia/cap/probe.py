@@ -211,6 +211,7 @@ class ProbeRunInput(BaseModel):
     headers: dict[str, str] = Field(default_factory=dict)
     output: str | None = None
     wait_ms: int = Field(default=0, ge=0, le=MAX_WAIT_MS)
+    capture_html: bool = False
 
 
 async def probe_run(arguments: dict[str, Any]) -> ToolOutput:
@@ -296,6 +297,7 @@ async def probe_run(arguments: dict[str, Any]) -> ToolOutput:
                 "content_type": result.content_type,
                 "redirect_chain": result.redirect_chain,
                 "bytes": result.body_bytes,
+                **({"html": result.body} if params.capture_html else {}),
             },
             "debug": snapshot.debug,
             "observed_at": now_iso(),
