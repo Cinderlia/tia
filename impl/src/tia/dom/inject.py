@@ -589,7 +589,30 @@ async def run_inject(
     notes.update({"tag_in_page": found, "executable": executable, "context_kind": best.get("context_kind")})
     stage("I6", found, f"tag_in_page={found} executable={executable} kind={best.get('context_kind')}")
 
-    verdict, explanation = judge_inject(in_db, found, executable)
+    if executable and verify is not None:
+        try:
+            method = "POST" if notes.get("verify_on") == "probe_page" else "GET"
+            target_url = form.action if method == "POST" else (verify_url or form.action)
+            fields = dict(values) if method == "POST" else {}
+            confirmed = await call(
+                "verify_tag",
+                {
+                    "url": target_url,
+                    "tag": tag,
+                    "payload": payload,
+                    "execute": True,
+                    "execute_method": method,
+                    "execute_fields": fields,
+                },
+            )
+            execution = confirmed.get("execution")
+            if isinstance(verify, dict):
+                verify["execution"] = execution
+            notes["execution"] = execution
+        except ToolCallError:
+            notes["execution"] = None
+
+    verdict, explanation = judge_inject(in_db, found, executable, notes.get("execution"))
     notes["explanation"] = explanation
 
     # ---- I7 cleanup: delete self-generated data, keep change record for rollback ----

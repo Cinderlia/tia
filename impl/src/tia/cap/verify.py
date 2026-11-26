@@ -98,6 +98,13 @@ class VerifyTagInput(BaseModel):
     content_type: str | None = None
     headers: dict[str, str] = Field(default_factory=dict)
     status: int | None = None
+    #: Optional browser-side confirmation (requires the ``browser`` extra and a Chrome
+    #: binary). Static judgment never depends on it; ``execution`` is added evidence.
+    execute: bool = False
+    execute_method: Literal["GET", "POST"] = "GET"
+    execute_fields: dict[str, str] = Field(default_factory=dict)
+    execute_wait_ms: int = Field(default=600, ge=0, le=10_000)
+    execute_timeout_ms: int = Field(default=15_000, ge=1_000, le=60_000)
 
     @model_validator(mode="after")
     def _check_source(self) -> VerifyTagInput:
@@ -141,6 +148,7 @@ class VerifyTagResult(BaseModel):
     content_type: str = "text/html"
     status: int | None = None
     warnings: list[str] = Field(default_factory=list)
+    execution: dict[str, Any] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -524,7 +532,12 @@ def _fetch(
     assert input_.url is not None
     try:
         with httpx.Client(follow_redirects=False, timeout=HTTP_TIMEOUT_SECONDS) as client:
-            response = client.get(input_.url, params=input_.params, cookies=cookies or {})
+            # Passing an empty ``params`` dict makes httpx drop the URL's own query
+            # string, so only library-style params are forwarded when present.
+            kwargs: dict[str, Any] = {"cookies": cookies or {}}
+            if input_.params:
+                kwargs["params"] = input_.params
+            response = client.get(input_.url, **kwargs)
     except httpx.HTTPError as exc:
         raise ToolError(
             ErrorCode.ENV_ERROR,
@@ -550,6 +563,7 @@ async def verify_tag(arguments: dict[str, Any]) -> ToolOutput:
             hint="Either url or html; tag must be 1..64 non-whitespace characters",
         ) from exc
 
+    cookies: dict[str, str] = {}
     if input_.html is not None:
         html = input_.html
         content_type = input_.content_type or "text/html"
@@ -560,7 +574,6 @@ async def verify_tag(arguments: dict[str, Any]) -> ToolOutput:
         from tia.cap.session import looks_like_login, renew_session, resolve_session
 
         warnings = []
-        cookies: dict[str, str] = {}
         if input_.url is not None:
             _, cookies, auto_warnings = resolve_session(
                 input_.session_id, input_.url, input_.account_label
@@ -585,5 +598,21 @@ async def verify_tag(arguments: dict[str, Any]) -> ToolOutput:
         status=status,
         max_occurrences=input_.max_occurrences,
     )
+    if input_.execute and input_.url is not None:
+        from tia.ad.browser import BrowserExecutor
+
+        executor = BrowserExecutor(
+            timeout_ms=input_.execute_timeout_ms, wait_ms=input_.execute_wait_ms
+        )
+        execution = await executor.run(
+            input_.url,
+            cookies=cookies or None,
+            method=input_.execute_method,
+            fields=input_.execute_fields,
+            action=input_.url,
+        )
+        result.execution = execution.to_dict()
+        if execution.error is not None:
+            result.warnings.append(execution.error.split(":", 1)[0])
     result.warnings = [*warnings, *result.warnings]
     return ToolOutput(data=result.model_dump(mode="json"))

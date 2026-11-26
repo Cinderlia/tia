@@ -91,3 +91,28 @@ roles and description) so the model can choose the identity it needs; passing an
 `account_label` binds that one. Passwords are only read at login and are never
 written to tool output, evidence or reports. When a bound session expires, the
 HTTP-based tools log the same account in again once and replay the request.
+
+## Execution confirmation (optional)
+
+Static verification inspects the returned page and judges whether the payload lands in an
+executable context. TIA can additionally load that page in Chrome and record whether the
+payload actually executed, which separates "looks executable" from "executed".
+
+Use a browser you already have — just point TIA at it:
+
+```bash
+export TIA_CHROME=/usr/bin/google-chrome
+```
+
+Or let TIA download its pinned Chrome for Testing build into the project
+(`impl/var/browsers/<version>/`, never a global install):
+
+```bash
+uv sync --extra browser
+uv run tia-agent browser-install   # downloads the pinned version
+uv run tia-agent browser-check     # shows which browser will be used
+```
+
+`TIA_CHROME` always wins when set. The browser runs headless by default;
+`TIA_BROWSER_HEADED=1` opens a window when a display is available. Without a browser the
+agents fall back to static judgment and the report says execution was not verified.

@@ -406,6 +406,31 @@ async def run_trigger(
                 verify = await kernel.call("verify_tag", {"tag": tag, "payload": payload, "url": base_url})
             except ToolCallError as exc:
                 notes["verify_error"] = f"{exc.code.value}: {exc.message}"
+        if verify is not None and bool((verify.get("best") or {}).get("executable")):
+            last = verify_attempts[-1] if verify_attempts else {"method": "GET", "values": {}}
+            raw_values = last.get("values")
+            exec_fields = (
+                {str(key): str(value) for key, value in raw_values.items()}
+                if isinstance(raw_values, dict)
+                else {}
+            )
+            try:
+                confirmed = await kernel.call(
+                    "verify_tag",
+                    {
+                        "url": base_url,
+                        "tag": tag,
+                        "payload": payload,
+                        "execute": True,
+                        "execute_method": str(last.get("method") or "GET").upper(),
+                        "execute_fields": exec_fields,
+                    },
+                )
+                notes["execution"] = confirmed.get("execution")
+                if isinstance(verify, dict):
+                    verify["execution"] = confirmed.get("execution")
+            except ToolCallError:
+                notes["execution"] = None
         notes["entry_attempts"] = verify_attempts
         if verify is not None:
             notes["occurrence_count"] = verify.get("occurrence_count")

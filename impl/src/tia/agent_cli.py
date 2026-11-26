@@ -130,6 +130,18 @@ def _parser() -> argparse.ArgumentParser:
     login.add_argument("--store", default=None)
     login.add_argument("--json", action="store_true")
 
+    browser_install = sub.add_parser(
+        "browser-install", help="Download Chrome for Testing used by execution confirmation"
+    )
+    browser_install.add_argument("--version", default=None, help="Chrome version (default: pinned build)")
+    browser_install.add_argument("--force", action="store_true", help="Re-download even when present")
+    browser_install.add_argument("--json", action="store_true")
+
+    browser_check = sub.add_parser(
+        "browser-check", help="Show which Chrome the execution confirmation would use"
+    )
+    browser_check.add_argument("--json", action="store_true")
+
     pipeline = sub.add_parser(
         "pipeline",
         help="Main → trigger proof → pairing → injection queue (one stage failure stops downstream)",
@@ -258,6 +270,7 @@ def _run_trigger(args: argparse.Namespace) -> int:
         "occurrence_count": result.notes.get("occurrence_count"),
         "change_id": result.notes.get("change_id"),
         "payload_constraints": result.notes.get("payload_constraints"),
+        "execution": result.notes.get("execution"),
         "explanation": result.notes.get("explanation"),
         "tool_calls": len(result.trace),
     }
@@ -596,7 +609,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command is None:
         parser.error(
             "Subcommand required: direct | trigger | inject | main | pairing | pipeline"
-            " | accounts | login"
+            " | accounts | login | browser-install | browser-check"
         )
     handlers = {
         "direct": _run_direct,
@@ -607,5 +620,27 @@ def main(argv: list[str] | None = None) -> int:
         "pipeline": _run_pipeline,
         "accounts": _run_accounts,
         "login": _run_login,
+        "browser-install": _run_browser_install,
+        "browser-check": _run_browser_check,
     }
     return handlers[args.command](args)
+
+
+def _run_browser_install(args: argparse.Namespace) -> int:
+    from tia.inf.browser_setup import BrowserSetupError, install_chrome
+
+    try:
+        result = install_chrome(args.version, force=args.force)
+    except BrowserSetupError as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}), file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def _run_browser_check(args: argparse.Namespace) -> int:
+    from tia.inf import browser_setup
+
+    status = browser_setup.status()
+    print(json.dumps(status, indent=2))
+    return 0 if status.get("available") else 1

@@ -271,6 +271,23 @@ async def _deliver_and_verify(
         },
     )
     best = verify.get("best") if isinstance(verify.get("best"), dict) else {}
+    execution = None
+    if bool(best.get("executable")):
+        try:
+            confirmed = await kernel.call(
+                "verify_tag",
+                {
+                    "url": form.action,
+                    "tag": tag,
+                    "payload": payload,
+                    "execute": True,
+                    "execute_method": form.method.upper(),
+                    "execute_fields": values,
+                },
+            )
+            execution = confirmed.get("execution")
+        except ToolCallError:
+            execution = None
     return {
         "shape": shape,
         "payload": payload,
@@ -283,6 +300,7 @@ async def _deliver_and_verify(
         "context_kind": best.get("context_kind"),
         "reason": best.get("executable_reason"),
         "node_path": best.get("node_path"),
+        "execution": execution,
         "verify": verify,
     }
 
