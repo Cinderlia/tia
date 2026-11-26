@@ -12,6 +12,7 @@ import hashlib
 import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from tia.inf.reports import _safe, reports_root
 
@@ -107,6 +108,78 @@ def _read_request(notes: dict[str, Any]) -> str:
     return f"GET {url}" if url else "(not recorded)"
 
 
+def _payload(notes: dict[str, Any]) -> str:
+    payload = str(notes.get("payload") or "")
+    if payload:
+        return payload
+    attempts = notes.get("attempts") or []
+    for attempt in reversed(attempts):
+        if attempt.get("executable") and attempt.get("payload"):
+            return str(attempt["payload"])
+    for attempt in reversed(attempts):
+        if attempt.get("payload"):
+            return str(attempt["payload"])
+    return ""
+
+
+def _verify_section(notes: dict[str, Any], kind: str) -> list[str]:
+    """Steps a human can execute in a browser (URL, plus a form for POST)."""
+
+    payload = _payload(notes)
+    raw_entry = notes.get("entry")
+    entry: dict[str, Any] = raw_entry if isinstance(raw_entry, dict) else {}
+    url = str(entry.get("url") or notes.get("read_url") or notes.get("base_url") or "")
+    method = str(entry.get("method") or "get").lower()
+    field = str(entry.get("field") or entry.get("param") or "")
+    lines = ["", "## Verify in a browser", ""]
+    if kind == "second_order_db_only":
+        lines += [
+            "1. Run the SQL above against the target database.",
+            f"2. Open: {_read_request(notes)}",
+            "3. The page reflects the value (payload derived from the stored tag is in Evidence).",
+        ]
+        return lines
+    if not url:
+        return lines + ["- No URL recorded for this finding."]
+    step = 1
+    if method == "get" and field and payload:
+        target = f"{url}{'&' if '?' in url else '?'}{field}={quote(payload, safe='')}"
+        lines += [f"{step}. Open: {target}"]
+        step += 1
+    elif method == "get":
+        lines += [f"{step}. Open: {url}"]
+        step += 1
+    else:
+        lines += [
+            f"{step}. Open: {url}",
+            f"{step + 1}. POST the form with:",
+            "",
+            "| Field | Value |",
+            "| --- | --- |",
+        ]
+        step += 2
+        raw_fields = entry.get("fields")
+        if isinstance(raw_fields, dict):
+            names = list(raw_fields)
+        elif isinstance(raw_fields, list):
+            names = [str(name) for name in raw_fields]
+        else:
+            names = []
+        for name in names:
+            if name == field:
+                lines.append(f"| `{name}` | `{payload}` |")
+            else:
+                lines.append(f"| `{name}` | (empty) |")
+        if not names:
+            lines.append(f"| `{field}` | `{payload}` |")
+        lines.append("")
+    if kind == "second_order":
+        lines.append(f"{step}. Open the read page: {_read_request(notes)}")
+        step += 1
+    lines.append(f"{step}. The value is rendered at the sink above.")
+    return lines
+
+
 def _evidence(notes: dict[str, Any]) -> str:
     parts: list[str] = []
     if notes.get("tag"):
@@ -162,11 +235,12 @@ def write_finding(
         lines.append(f"- Read request: {_read_request(notes)}")
     else:
         lines.append(f"- Injection request: {request_detail}")
-    lines.append(f"- Storage (database field): {storage}")
+    if kind != "first_order":
+        lines.append(f"- Storage (database field): {storage}")
     if sql:
         label = "Application SQL observed" if kind != "second_order_db_only" else "SQL executed"
         lines.append(f"- {label}:\n\n```sql\n{sql}\n```")
-    if kind != "second_order_db_only":
+    if kind == "second_order":
         lines.append(f"- Read request: {_read_request(notes)}")
     lines += [
         f"- Account: {_account(notes)}",
@@ -178,17 +252,8 @@ def write_finding(
         lines += [
             "",
             "This value was written to the database directly (no HTTP request was confirmed to store it).",
-            "Reproduce by executing the SQL above, then open the read request.",
         ]
-    else:
-        lines += [
-            "",
-            "## Reproduce",
-            "",
-            "1. Send the request above (substitute the payload for the tag if needed).",
-            f"2. Open: {_read_request(notes)}",
-            "3. The sink reflects the value; check the case report for the exact evidence chain.",
-        ]
+    lines += _verify_section(notes, kind)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     index = reports_root(store) / "findings.md"
