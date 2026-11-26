@@ -212,6 +212,7 @@ class ProbeRunInput(BaseModel):
     output: str | None = None
     wait_ms: int = Field(default=0, ge=0, le=MAX_WAIT_MS)
     capture_html: bool = False
+    session_id: str | None = None
 
 
 async def probe_run(arguments: dict[str, Any]) -> ToolOutput:
@@ -237,12 +238,23 @@ async def probe_run(arguments: dict[str, Any]) -> ToolOutput:
         key.lower() == "content-type" for key in headers
     ):
         headers["Content-Type"] = "application/x-www-form-urlencoded"
+    cookies: dict[str, str] = {}
+    if params.session_id:
+        session = rt.store.get_session(params.session_id)
+        if session is None or not session.get("valid"):
+            raise ToolError(
+                ErrorCode.SESSION_INVALID,
+                f"unknown or expired session: {params.session_id}",
+                hint="call session_bind first",
+            )
+        cookies = dict(session.get("cookies") or {})
     result = HttpClient().fetch(
         params.method,
         params.url,
         params=params.params or None,
         body=params.body,
         headers=headers,
+        cookies=cookies,
         max_bytes=rt.settings.profile.max_http_bytes,
     )
     if params.wait_ms:

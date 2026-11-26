@@ -10,6 +10,7 @@ also avoiding connection conflicts between async handlers.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import uuid
@@ -222,6 +223,16 @@ class Store:
                 ("alternates", "ALTER TABLE injection_queue ADD COLUMN alternates TEXT NOT NULL DEFAULT '[]'"),
             ):
                 if name not in queue_columns:
+                    conn.execute(ddl)
+            session_columns = {row["name"] for row in conn.execute("PRAGMA table_info(session)")}
+            for name, ddl in (
+                ("label", "ALTER TABLE session ADD COLUMN label TEXT NOT NULL DEFAULT ''"),
+                ("roles", "ALTER TABLE session ADD COLUMN roles TEXT NOT NULL DEFAULT '[]'"),
+                ("username", "ALTER TABLE session ADD COLUMN username TEXT NOT NULL DEFAULT ''"),
+                ("description", "ALTER TABLE session ADD COLUMN description TEXT NOT NULL DEFAULT ''"),
+                ("login_url", "ALTER TABLE session ADD COLUMN login_url TEXT NOT NULL DEFAULT ''"),
+            ):
+                if name not in session_columns:
                     conn.execute(ddl)
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS conclusion ("
@@ -617,6 +628,88 @@ class Store:
                 (signature,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def add_session(
+        self,
+        *,
+        label: str,
+        base_url: str,
+        cookies: dict[str, str],
+        roles: list[str],
+        username: str = "",
+        description: str = "",
+        login_url: str = "",
+        case_id: str | None = None,
+        expires_at: str | None = None,
+    ) -> str:
+        """Persist one logged-in session; only cookies, never the password."""
+
+        session_id = "sess-" + hashlib.sha1(
+            f"{label}|{base_url}|{now_iso()}".encode()
+        ).hexdigest()[:10]
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO session (id, case_id, base_url, cookies, valid, expires_at,"
+                " observed_at, label, roles, username, description, login_url)"
+                " VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    case_id,
+                    base_url,
+                    json.dumps(cookies, ensure_ascii=False),
+                    expires_at,
+                    now_iso(),
+                    label,
+                    json.dumps(list(roles), ensure_ascii=False),
+                    username,
+                    description,
+                    login_url,
+                ),
+            )
+        return session_id
+
+    def get_session(self, session_id: str) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            row = conn.execute("SELECT * FROM session WHERE id = ?", (session_id,)).fetchone()
+        return self._session_row(row) if row is not None else None
+
+    def find_session(self, label: str, base_url: str) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM session WHERE label = ? AND base_url = ? AND valid = 1"
+                " ORDER BY observed_at DESC LIMIT 1",
+                (label, base_url),
+            ).fetchone()
+        return self._session_row(row) if row is not None else None
+
+    def list_sessions(self, base_url: str = "") -> list[dict[str, Any]]:
+        sql = "SELECT * FROM session"
+        args: tuple[Any, ...] = ()
+        if base_url:
+            sql += " WHERE base_url = ?"
+            args = (base_url,)
+        sql += " ORDER BY observed_at DESC"
+        with self._conn() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        return [self._session_row(row) for row in rows]
+
+    def invalidate_session(self, session_id: str) -> None:
+        with self._conn() as conn:
+            conn.execute("UPDATE session SET valid = 0 WHERE id = ?", (session_id,))
+
+    @staticmethod
+    def _session_row(row: sqlite3.Row) -> dict[str, Any]:
+        data = dict(row)
+        try:
+            data["cookies"] = json.loads(data.get("cookies") or "{}")
+        except json.JSONDecodeError:
+            data["cookies"] = {}
+        try:
+            data["roles"] = json.loads(data.get("roles") or "[]")
+        except json.JSONDecodeError:
+            data["roles"] = []
+        data["valid"] = bool(data.get("valid"))
+        return data
 
     def add_flow(self, case_id: str, kind: str, body: dict[str, Any], code_ver: str = "") -> int:
         with self._conn() as conn:

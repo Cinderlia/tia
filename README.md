@@ -71,3 +71,21 @@ uv run mypy src
 
 TIA does not provide a web UI, model fine-tuning, a payload generator, or integrations with
 IDA or Burp. It never modifies the source code of the target application.
+
+## Accounts
+
+Login credentials are supplied by the operator in a YAML file that never enters
+the repository; copy `impl/examples/accounts.example.yaml` to
+`impl/var/accounts.yaml` and fill in one entry per account. Each entry carries a
+`label`, the application `base_url`, an optional `login_url` (roles may log in on
+different pages), `username`, `password` or `password_ref: env:NAME`, the `roles`
+it covers and a short `description`.
+
+```bash
+uv run tia-agent accounts                # list labels, roles and descriptions
+uv run tia-agent login --label site-user  # log in over HTTP, store the cookies
+```
+
+The agent binds by account label or by required roles and always picks the
+least-privileged account that covers them. Passwords are only read at login and
+are never written to tool output, evidence or reports.

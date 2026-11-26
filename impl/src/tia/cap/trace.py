@@ -79,6 +79,7 @@ class TraceRunInput(BaseModel):
     output: str | None = None
     max_entries: int = Field(default=MAX_ENTRIES, ge=1, le=MAX_ENTRIES)
     dedupe: bool = True
+    session_id: str | None = None
 
 
 class TraceDiffInput(BaseModel):
@@ -247,6 +248,7 @@ def _fetch(
     params: dict[str, str],
     body: str | None,
     headers: dict[str, str],
+    cookies: dict[str, str] | None = None,
 ) -> HttpResult:
     rt = get_runtime()
     client = HttpClient()
@@ -256,6 +258,7 @@ def _fetch(
         params=params or None,
         body=body,
         headers=headers or None,
+        cookies=cookies,
         follow_redirects=False,
         max_bytes=rt.settings.profile.max_http_bytes,
     )
@@ -334,9 +337,19 @@ async def trace_run(arguments: dict[str, Any]) -> ToolOutput:
         request_body = urlencode(request_params)
         request_params = {}
         request_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+    cookies: dict[str, str] = {}
+    if params.session_id:
+        session = rt.store.get_session(params.session_id)
+        if session is None or not session.get("valid"):
+            raise ToolError(
+                ErrorCode.SESSION_INVALID,
+                f"unknown or expired session: {params.session_id}",
+                hint="call session_bind first",
+            )
+        cookies = dict(session.get("cookies") or {})
     started = time.monotonic()
     try:
-        http = _fetch(url, method, request_params, request_body, request_headers)
+        http = _fetch(url, method, request_params, request_body, request_headers, cookies)
         text = adapter.read_output(canonical)
     finally:
         adapter.disarm()

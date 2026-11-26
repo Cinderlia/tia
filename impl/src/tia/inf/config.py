@@ -86,6 +86,7 @@ class Settings:
     store_path: Path
     db: DbConfig
     profile: ProfileConfig
+    accounts_path: Path
 
     @classmethod
     def load(
@@ -111,12 +112,14 @@ class Settings:
         )
         root = Path(_env("TIA_APP_ROOT", str(app_root or "/app"))).resolve()
         store = Path(store_path or _env("TIA_STORE", str(_IMPL_ROOT / "var" / "tia.db")))
+        accounts = Path(_env("TIA_ACCOUNTS", str(store.parent / "accounts.yaml")))
         return cls(
             impl_root=_IMPL_ROOT,
             app_root=root,
             store_path=store,
             db=db,
             profile=ProfileConfig.load(profile),
+            accounts_path=accounts,
         )
 
     def with_db_name(self, name: str) -> Settings:

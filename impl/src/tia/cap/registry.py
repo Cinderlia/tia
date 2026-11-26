@@ -183,6 +183,21 @@ _TRACE_RUN_SCHEMA = {
     "additionalProperties": False,
 }
 
+_SESSION_BIND_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "account_label": {"type": "string", "description": "Configured account label to bind"},
+        "roles": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Required roles; the least-privileged covering account is chosen",
+        },
+        "base_url": {"type": "string", "description": "Restrict the account to this application URL"},
+        "case_id": {"type": "string", "description": "Optional case that owns the session"},
+    },
+    "additionalProperties": False,
+}
+
 _TRACE_DIFF_SCHEMA = {
     "type": "object",
     "properties": {
@@ -374,7 +389,8 @@ TOOLS: tuple[ToolSpec, ...] = (
     _t("case_open", "Create case", "control", mutating=True, handler_path="tia.cap.case:case_open"),
     _t("case_note", "Append evidence note to case", "control", mutating=True, handler_path="tia.cap.case:case_note"),
     _t("case_report", "Generate Markdown report for case", "control", handler_path="tia.cap.case:case_report"),
-    _t("session_bind", "Bind valid login session to case", "control", mutating=True),
+    _t("session_bind", "Bind valid login session to case", "control", mutating=True,
+       input_schema=_SESSION_BIND_SCHEMA, handler_path="tia.cap.session:session_bind"),
     _t("human_ask", "Ask human (login, authorization, binary choice)", "control"),
     _t("artifact_save", "Save artifact to project directory", "control",
        input_schema=_ARTIFACT_SAVE_SCHEMA, handler_path="tia.cap.offline:artifact_save"),

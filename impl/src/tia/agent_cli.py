@@ -8,12 +8,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
 from tia import __version__
+from tia.cap.registry import dispatch as registry_dispatch
 from tia.dom.inject import InjectResult, run_inject
 from tia.dom.main import MainResult, run_injection_queue, run_main, run_queue, seed_queue
 from tia.dom.pairing_agent import PairingConfig, build_pairing_queue
@@ -109,6 +111,20 @@ def _parser() -> argparse.ArgumentParser:
     direct.add_argument("--db-password", default=None)
     direct.add_argument("--store", default=None)
     direct.add_argument("--json", action="store_true")
+    accounts = sub.add_parser("accounts", help="List configured accounts (never prints passwords)")
+    accounts.add_argument("--accounts", default=None, help="accounts.yaml path")
+    accounts.add_argument("--store", default=None)
+    accounts.add_argument("--json", action="store_true")
+
+    login = sub.add_parser("login", help="Bind one account over HTTP and store its session cookies")
+    login.add_argument("--label", default="", help="Account label")
+    login.add_argument("--roles", default="", help="Comma separated required roles")
+    login.add_argument("--base-url", default="", help="Restrict the account to this application URL")
+    login.add_argument("--case-id", default=None)
+    login.add_argument("--accounts", default=None, help="accounts.yaml path")
+    login.add_argument("--store", default=None)
+    login.add_argument("--json", action="store_true")
+
     pipeline = sub.add_parser(
         "pipeline",
         help="Main → trigger proof → pairing → injection queue (one stage failure stops downstream)",
@@ -490,6 +506,63 @@ def _run_pipeline(args: argparse.Namespace) -> int:
     return 0
 
 
+def _prepare_env(args: argparse.Namespace, profile: str = "trigger") -> None:
+    if args.accounts:
+        os.environ["TIA_ACCOUNTS"] = args.accounts
+    settings = Settings.load(profile, store_path=args.store)
+    configure(settings)
+
+
+def _dispatch_session(payload: dict[str, Any]) -> dict[str, Any]:
+    envelope = asyncio.run(registry_dispatch("trigger", "session_bind", payload))
+    if not envelope.ok:
+        error = envelope.error
+        raise SystemExit(
+            json.dumps(
+                {"ok": False, "tool": "session_bind", "error": error.model_dump() if error else None},
+                ensure_ascii=False,
+            )
+        )
+    return dict(envelope.data) if isinstance(envelope.data, dict) else {}
+
+
+def _run_accounts(args: argparse.Namespace) -> int:
+    _prepare_env(args)
+    data = _dispatch_session({})
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return 0
+    for account in data.get("accounts", []):
+        roles = ",".join(account.get("roles") or []) or "-"
+        print(
+            f"{account.get('label')}\t{account.get('base_url')}\troles={roles}"
+            f"\t{account.get('description', '')}"
+        )
+    return 0
+
+
+def _run_login(args: argparse.Namespace) -> int:
+    _prepare_env(args, "trigger")
+    roles = [item.strip() for item in args.roles.split(",") if item.strip()]
+    data = _dispatch_session(
+        {
+            "account_label": args.label,
+            "roles": roles,
+            "base_url": args.base_url,
+            "case_id": args.case_id,
+        }
+    )
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return 0
+    print(
+        f"session {data.get('session_id')} label={data.get('label')}"
+        f" roles={','.join(data.get('roles') or []) or '-'}"
+        f" cookies={data.get('cookie_count')} reused={data.get('reused')}"
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
@@ -497,7 +570,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"tia-agent {__version__}")
         return 0
     if args.command is None:
-        parser.error("Subcommand required: direct | trigger | inject | main | pairing | pipeline")
+        parser.error(
+            "Subcommand required: direct | trigger | inject | main | pairing | pipeline"
+            " | accounts | login"
+        )
     handlers = {
         "direct": _run_direct,
         "trigger": _run_trigger,
@@ -505,5 +581,7 @@ def main(argv: list[str] | None = None) -> int:
         "main": _run_main,
         "pairing": _run_pairing,
         "pipeline": _run_pipeline,
+        "accounts": _run_accounts,
+        "login": _run_login,
     }
     return handlers[args.command](args)

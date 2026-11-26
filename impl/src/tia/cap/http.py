@@ -51,6 +51,17 @@ async def http_request(arguments: dict[str, Any]) -> ToolOutput:
     if method not in {"GET", "POST", "PUT", "PATCH", "HEAD"}:
         raise _bad(f"Unsupported method: {method}")
 
+    cookies: dict[str, str] = {}
+    if params.session_id:
+        session = rt.store.get_session(params.session_id)
+        if session is None or not session.get("valid"):
+            raise ToolError(
+                ErrorCode.SESSION_INVALID,
+                f"unknown or expired session: {params.session_id}",
+                hint="call session_bind first",
+            )
+        cookies = dict(session.get("cookies") or {})
+
     capture = params.capture or {}
     marker = capture.get("marker")
     result = HttpClient().fetch(
@@ -59,6 +70,7 @@ async def http_request(arguments: dict[str, Any]) -> ToolOutput:
         params=params.params or None,
         body=params.body,
         headers=params.headers,
+        cookies=cookies,
         follow_redirects=params.follow_redirects,
         max_redirects=params.max_redirects,
         max_bytes=rt.settings.profile.max_http_bytes,
@@ -66,8 +78,6 @@ async def http_request(arguments: dict[str, Any]) -> ToolOutput:
         around=int(capture.get("around", 800)),
     )
     warnings: list[str] = []
-    if params.session_id:
-        warnings.append("SESSION_NOT_BOUND")
     if result.truncated:
         warnings.append("TRUNCATED")
     data = {

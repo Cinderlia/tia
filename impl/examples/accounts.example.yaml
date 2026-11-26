@@ -1,0 +1,29 @@
+# Example account catalogue for `tia-agent accounts` / `tia-agent login`.
+# Copy to impl/var/accounts.yaml and edit; the file is git-ignored because it
+# names real credentials. Passwords are only allowed as `env:NAME` / `file:PATH`
+# references recommended; a literal password also works because this file is
+# git-ignored.
+accounts:
+  - label: bwapp-low
+    base_url: http://127.0.0.1/bwapp
+    login_url: /bwapp/login.php
+    username: bee
+    password: env:XVWA_BWAPP_PASSWORD
+    roles: []
+    description: "bWAPP default user: low privilege, no admin pages"
+
+  - label: bwapp-admin
+    base_url: http://127.0.0.1/bwapp
+    login_url: /bwapp/login.php
+    username: admin
+    password: env:XVWA_BWAPP_ADMIN_PASSWORD
+    roles: [admin]
+    description: "bWAPP administrator: user management and settings pages"
+
+  - label: dvwa-low
+    base_url: http://127.0.0.1/dvwa
+    login_url: /dvwa/login.php
+    username: admin
+    password: env:XVWA_DVWA_PASSWORD
+    roles: []
+    description: "DVWA default admin account, security level low"
