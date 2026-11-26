@@ -483,6 +483,7 @@ async def run_inject(
         hint=f"payload must be written through parameter {field_name}",
         constraints=", ".join(f"{name}: {kind}" for name, kind in column_limits.items()),
         fallback_fields=fallback,
+        observation="\n".join(kernel.tool_errors[-3:]),
         max_rounds=WRITE_ATTEMPTS,
         send=_send,
         accept=_accept,

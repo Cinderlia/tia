@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from tia.ad.llm import LlmClient
+from tia.cap.domscan import echo_snapshot
 from tia.cap.forms import PageForm
 from tia.cap.request_plan import PlannedRequest, plan_request
 
@@ -179,9 +180,21 @@ async def deliver(
         attempt.html = str(page.get("body") or page.get("html") or "")
         attempt.probe_hit = bool(page.get("probe_hit"))
         delivery.attempts.append(attempt)
-        if await accept(attempt, page):
+        snapshot = echo_snapshot(attempt.html, tag) if tag and attempt.html else ""
+        if snapshot:
+            attempt.extra["echo"] = snapshot
+            html = snapshot
+        try:
+            accepted = await accept(attempt, page)
+        except Exception as exc:  # noqa: BLE001 - a failed check is feedback too
+            attempt.error = f"{type(exc).__name__}: {exc}"
+            observation = attempt.error
+            continue
+        if accepted:
             return delivery
         observation = diagnose(attempt.html, attempt.status, attempt.probe_hit, tag)
+        if snapshot:
+            observation = f"{observation}\n\nECHO AROUND TAG (only the markup wrapping it):\n{snapshot}"
     last_plan = delivery.plan
     if last_plan is not None and last_plan.payload_field:
         values = {last_plan.payload_field: last_plan.payload or payload}

@@ -203,6 +203,7 @@ async def run_direct(
         constraints=constraints,
         fallback_fields={item.name: item.value for item in form.fields},
         fallback_method=form.method.upper(),
+        observation="\n".join(kernel.tool_errors[-3:]),
         max_rounds=_attempts(),
         send=_send,
         accept=_accept,

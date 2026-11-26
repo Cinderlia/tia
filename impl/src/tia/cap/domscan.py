@@ -49,6 +49,8 @@ _ATTR = re.compile(
 )
 _RAW_CLOSE = re.compile(r"</\s*([A-Za-z][A-Za-z0-9:_-]*)\s*>", re.IGNORECASE)
 
+_QUOTE_TEXT: dict[str, str] = {"double": '"', "single": "'", "none": ""}
+
 
 @dataclass(slots=True)
 class Attr:
@@ -475,3 +477,56 @@ def _owner_for_position(document: Document, pos: int) -> Node | None:
 def is_html_content_type(content_type: str) -> bool:
     lowered = content_type.split(";")[0].strip().lower()
     return lowered in {"text/html", "application/xhtml+xml", ""}
+
+
+def echo_snapshot(html: str, tag: str, *, before: int = 120, after: int = 120, max_len: int = 4000) -> str:
+    """Return only the markup that directly wraps the echoed tag.
+
+    A whole response page is mostly noise and truncating it can cut exactly the
+    quote or comment that decides whether the payload is inert. This keeps the
+    tag occurrence plus its enclosing chain (start tags, quote, comment or
+    script string) and drops sibling content.
+    """
+    position = html.find(tag)
+    if position < 0:
+        return ""
+    document = parse(html)
+    segment = document.segment_at(position)
+    inner = html[max(0, position - before) : position + len(tag) + after]
+    if segment is None:
+        return inner[:max_len]
+    if segment.kind == "comment":
+        return f"<!-- ... {inner} ... -->"[:max_len]
+    node = segment.node
+    if segment.kind == "attr" and node is not None:
+        name = segment.attr_name or ""
+        quote = _QUOTE_TEXT.get(segment.quote or "", "")
+        value = html[segment.start : segment.end]
+        opening = "".join(
+            f" {other}={_QUOTE_TEXT.get(q, '')}{node.attrs[other]}{_QUOTE_TEXT.get(q, '')}"
+            for other, q in node.attr_quotes.items()
+            if other != name
+        )
+        text = f"<{node.tag}{opening} {name}={quote}{value}{quote}>"
+        if not html[segment.start : segment.end + 1].endswith(quote):
+            text += "  [attribute value is not closed after the payload]"
+        return text[:max_len]
+    if node is None:
+        return inner[:max_len]
+    closing = f"</{node.tag}>"
+    node_end = node.end - len(closing) if html[node.end - len(closing) : node.end].lower() == closing else node.end
+    inner_start = max(node.start_tag_end, position - before)
+    inner_end = min(node_end, position + len(tag) + after)
+    inner = html[inner_start:inner_end]
+    chain: list[Node] = []
+    current: Node | None = node
+    while current is not None:
+        if current.tag not in {"html", "body"}:
+            chain.append(current)
+        current = current.parent
+    opened = "".join(f"<{item.tag}>" for item in reversed(chain))
+    closed = "".join(f"</{item.tag}>" for item in chain)
+    text = opened + inner + closed
+    if node.tag in {"script", "style", "textarea", "title"}:
+        text += f"\n[payload sits inside <{node.tag}>; the closing sequence decides execution]"
+    return text[:max_len]

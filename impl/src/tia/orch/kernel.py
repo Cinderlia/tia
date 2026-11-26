@@ -91,6 +91,7 @@ class Kernel:
     trace: list[StepRecord] = field(default_factory=list)
     used: int = 0
     slice_id: str | None = None
+    tool_errors: list[str] = field(default_factory=list)
     _recorder: ExperienceRecorder | None = None
 
     async def call(
@@ -129,6 +130,11 @@ class Kernel:
                 )
             )
             self._record_call(tool, args, envelope)
+            error = envelope.error
+            self.tool_errors.append(
+                f"{tool}: {error.code if error else 'ENV_ERROR'}: "
+                f"{error.message if error else 'tool failed'}"
+            )
             if strict:
                 raise ToolCallError(tool, envelope)
             return None
