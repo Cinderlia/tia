@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from tia.cap.registry import ToolOutput
 from tia.inf.runtime import get_runtime
+from tia.orch.learning import hints_for
 from tia.schemas.envelope import ErrorCode, ToolError
 
 
@@ -73,6 +74,9 @@ async def slice_next(arguments: dict[str, Any]) -> ToolOutput:
         for candidate in candidates:
             # Recent attempts for the same slice: summaries only, never raw returns.
             candidate["experience"] = store.slice_experience(str(candidate["slice_id"]), limit=6)
+            # Cross-family prior: both the direct and the second-order agents
+            # write here, so the planner sees one shared history per site.
+            candidate["learning"] = hints_for(store, candidate.get("slice") or {})
         return ToolOutput(
             data={
                 "found": bool(candidates),

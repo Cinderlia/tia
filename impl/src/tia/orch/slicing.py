@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from tia.orch.learning import score_delta
+
 REFLECTION = ("echo", "print", "printf", "print_r", "var_dump")
 EXECUTION = ("eval", "system", "exec", "passthru", "shell_exec", "popen", "assert")
 WRITE_MARKERS = ("bindparam", "bindvalue", "insert into", "update ", "delete from")
@@ -54,6 +56,7 @@ def score_slice(
     paired: bool = False,
     history: list[str] | None = None,
     order_mode: str = "second",
+    learning: dict[str, Any] | None = None,
 ) -> SliceScore:
     """Heuristic prior in [0, 100]; every adjustment carries a readable reason."""
     digest = slice_digest(raw)
@@ -134,6 +137,11 @@ def score_slice(
             add(-6, f"earlier run produced {verdict}")
         elif verdict in {"BLOCKED_CSP", "NO_HTTP_ENTRY", "PATH_UNREACHABLE"}:
             add(-12, f"earlier run produced {verdict}")
+
+    if learning:
+        delta, learned = score_delta(learning)
+        for reason in learned:
+            add(delta, reason)
 
     return SliceScore(score=max(0, min(100, score)), reasons=reasons, digest=digest)
 

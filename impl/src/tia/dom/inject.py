@@ -25,10 +25,12 @@ from tia.cap.entry import (
     resolve_values_with_guess,
 )
 from tia.cap.forms import forms_from_document
+from tia.cap.payloads import render as render_shape
 from tia.dom.trigger import StageRecord
 from tia.inf.runtime import get_runtime
 from tia.orch.judge import judge_inject
 from tia.orch.kernel import Kernel, LocalToolClient, ToolCallError, ToolClient
+from tia.orch.learning import preferred_payload_shape, record_case
 
 DEFAULT_PAYLOAD = "<script>alert(1)</script>"
 
@@ -155,6 +157,7 @@ async def run_inject(
     verify_entry: dict[str, Any] | None = None,
     payload_constraints: dict[str, Any] | None = None,
     slice_id: str | None = None,
+    learning: dict[str, Any] | None = None,
 ) -> InjectResult:
     kernel = Kernel(
         profile="inject", budget=budget, client=client or LocalToolClient(profile="inject")
@@ -171,6 +174,7 @@ async def run_inject(
     sink_file = str(raw_slice.get("sinkFile") or (sink.split(":", 1)[0] if ":" in sink else ""))
     line_match = re.search(r":(\d+)", sink)
     sink_line = int(line_match.group(1)) if line_match else int(raw_slice.get("sinkLine") or 0)
+    notes["sink_file"] = sink_file
     params = [str(p) for p in raw_slice.get("params") or []]
     if not params:
         for source in raw_slice.get("sources") or []:
@@ -297,8 +301,14 @@ async def run_inject(
             pk_columns = [str(item) for item in table_item.get("primary_key") or []]
             for column in table_item.get("columns") or []:
                 widths[str(column.get("name"))] = column.get("length")
-    payload = f"{payload_base}<tia-{tag}>"
     constraints = dict(payload_constraints or {})
+    learned_shape = preferred_payload_shape(learning, constraints.get("context_kind"))
+    if learned_shape:
+        payload = render_shape(learned_shape, tag)
+        notes["payload_shape"] = learned_shape
+        stage("I3", True, f"learned payload shape {learned_shape} for this site")
+    else:
+        payload = f"{payload_base}<tia-{tag}>"
     if constraints:
         notes["payload_constraints"] = constraints
         max_length = constraints.get("max_length")
@@ -476,7 +486,14 @@ async def run_inject(
                                "content_type": verify_content_type}
             )
             attempts.append(
-                {"values": values, "status": status, "found": bool(this_verify.get("found"))}
+                {
+                    "values": values,
+                    "status": status,
+                    "found": bool(this_verify.get("found")),
+                    "shape": notes.get("payload_shape"),
+                    "executable": bool((this_verify.get("best") or {}).get("executable")),
+                    "context_kind": (this_verify.get("best") or {}).get("context_kind"),
+                }
             )
             if verify is None or (this_verify.get("found") and not bool(verify.get("found"))):
                 verify = this_verify
@@ -535,6 +552,13 @@ async def run_inject(
 
 
 async def _finish(kernel: Kernel, result: InjectResult, cleanup: bool = True) -> InjectResult:
+    if result.case_id:
+        record_case(
+            get_runtime().store,
+            {"sinkFile": str(result.notes.get("sink_file") or "")},
+            str(result.verdict),
+            result.notes,
+        )
     if result.case_id:
         get_runtime().store.set_case_verdict(result.case_id, str(result.verdict), ceiling="EXECUTABLE")
     report = ""

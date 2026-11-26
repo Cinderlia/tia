@@ -16,6 +16,7 @@ from tia.dom.inject import run_inject
 from tia.dom.trigger import normalize_slice, run_trigger
 from tia.inf.runtime import get_runtime
 from tia.orch.kernel import ToolClient
+from tia.orch.learning import hints_for
 from tia.orch.pairing import Reader, resolve_entry
 from tia.orch.slicing import score_slice
 from tia.schemas.objects import CaseOutcome
@@ -81,6 +82,7 @@ async def run_main(
                 budget=min(budget, 40),
                 client=inject_client,
                 slice_id=sid,
+                learning=hints_for(get_runtime().store, raw),
             )
             refs = [step.evidence_ref for step in inject.trace if step.evidence_ref]
             outcome = CaseOutcome(
@@ -192,6 +194,7 @@ async def run_injection_queue(
                 payload_base=payload_base,
                 budget=min(budget, 40),
                 client=inject_client,
+                learning=hints_for(queue_store, read_raw),
                 pair_hints=[hint],
                 slice_id=str(item["write_slice_id"]),
             )
@@ -282,6 +285,7 @@ def seed_queue(
             paired=False,
             history=history.get(f"{entry.file}:{entry.line}", []),
             order_mode=order_mode,
+            learning=hints_for(queue_store, raw),
         )
         queue_store.set_slice_score(slice_id_, scored.score, scored.reasons, scored.digest)
     return [str(item) for item in ids]

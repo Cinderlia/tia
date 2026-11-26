@@ -25,6 +25,7 @@ from tia.dom.pairing_agent import PairingConfig, build_pairing_queue
 from tia.dom.trigger import normalize_slice, run_trigger
 from tia.inf.runtime import get_runtime
 from tia.orch.kernel import ToolCallError, ToolClient
+from tia.orch.learning import hints_for
 from tia.schemas.objects import CaseOutcome
 
 
@@ -362,6 +363,7 @@ async def walk_injection_queue(
             verify_entry=entry,
             payload_constraints=payload_constraints,
             slice_id=str(item["write_slice_id"]),
+            learning=hints_for(store, read_raw or write_raw),
         )
         store.archive_injection_item(str(item["item_id"]), inject.verdict, case_id=inject.case_id)
         store.archive_slice(str(item["write_slice_id"]), inject.verdict, case_id=inject.case_id)

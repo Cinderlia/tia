@@ -30,6 +30,7 @@ from tia.inf.runtime import get_runtime
 from tia.inf.store import now_iso
 from tia.orch.judge import judge_trigger
 from tia.orch.kernel import Kernel, LocalToolClient, StepRecord, ToolCallError, ToolClient
+from tia.orch.learning import record_case
 
 #: Exploration budget: enough attempts for complex entry pages, still bounded.
 ENTRY_ATTEMPTS = max(1, int(os.environ.get("TIA_ENTRY_ATTEMPTS", "8")))
@@ -186,10 +187,18 @@ async def run_trigger(
     sink_file, sink_line = sink["file"], sink["line"]
     params = [str(p) for p in (slice_doc.get("params") or [])]
     stages: list[StageRecord] = []
-    notes: dict[str, Any] = {"base_url": base_url, "sink": f"{sink_file}:{sink_line}"}
+    notes: dict[str, Any] = {
+        "base_url": base_url,
+        "sink": f"{sink_file}:{sink_line}",
+        "sink_file": sink_file,
+    }
     kernel = Kernel(
         profile="trigger", budget=budget, client=client or LocalToolClient(profile="trigger")
     )
+
+    def done(result: TriggerResult) -> TriggerResult:
+        record_case(rt.store, {"sinkFile": sink_file}, result.verdict, result.notes)
+        return result
 
     # P0 Create case ------------------------------------------------------------
     opened = await kernel.call("case_open", {"slice": slice_doc, "agent": "trigger", "write_targets": []})
@@ -207,9 +216,9 @@ async def run_trigger(
     columns = inferred["insert_columns"]
     if not table:
         stages.append(StageRecord("P1", False, "Failed to infer target table from source code"))
-        return TriggerResult(case_id=case_id, verdict="SQL_ERROR", residue=None,
-                             report=await kernel.report(), stages=stages, notes=notes,
-                             trace=kernel.trace)
+        return done(TriggerResult(case_id=case_id, verdict="SQL_ERROR", residue=None,
+                                  report=await kernel.report(), stages=stages, notes=notes,
+                                  trace=kernel.trace))
     post_vars = sorted(set(_POST_VAR_RE.findall(source_text))) or params
     entry_plan = infer_entry(source_text)
     read_line = _read_line([line for line in source["lines"] if isinstance(line, dict)], table)
@@ -256,9 +265,9 @@ async def run_trigger(
     )
     if status >= 400:
         stages.append(StageRecord("P2", False, f"Page returned {status}"))
-        return TriggerResult(case_id=case_id, verdict="READ_EMPTY", residue=None,
-                             report=await kernel.report(), stages=stages, notes=notes,
-                             trace=kernel.trace)
+        return done(TriggerResult(case_id=case_id, verdict="READ_EMPTY", residue=None,
+                                  report=await kernel.report(), stages=stages, notes=notes,
+                                  trace=kernel.trace))
     stages.append(StageRecord("P2", True, f"HTTP {status}, form fields {form_fields}"))
 
     # P3 Prepare data ----------------------------------------------------------
@@ -445,14 +454,16 @@ async def run_trigger(
     report = await kernel.report()
     stages.append(StageRecord("P6", True, "Report generated"))
     notes["observed_at"] = now_iso()
-    return TriggerResult(
-        case_id=case_id,
-        verdict=str(verdict),
-        residue=residue,
-        report=report,
-        stages=stages,
-        notes=notes,
-        trace=kernel.trace,
+    return done(
+        TriggerResult(
+            case_id=case_id,
+            verdict=str(verdict),
+            residue=residue,
+            report=report,
+            stages=stages,
+            notes=notes,
+            trace=kernel.trace,
+        )
     )
 
 

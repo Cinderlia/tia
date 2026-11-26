@@ -157,6 +157,16 @@ CREATE TABLE IF NOT EXISTS tool_trace (
 );
 CREATE INDEX IF NOT EXISTS idx_tool_trace_case ON tool_trace(case_id, seq);
 CREATE INDEX IF NOT EXISTS idx_tool_trace_slice ON tool_trace(slice_id, id);
+CREATE TABLE IF NOT EXISTS learning (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    signature  TEXT NOT NULL,
+    attribute  TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    successes  INTEGER NOT NULL DEFAULT 0,
+    failures   INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    UNIQUE(signature, attribute, value)
+);
 """
 
 
@@ -480,6 +490,33 @@ class Store:
             for row in rows
         ]
 
+    def bump_learning(self, signature: str, attribute: str, value: str, success: bool) -> None:
+        """Accumulate one observation for a site signature; shared by both families."""
+        now = now_iso()
+        hit, miss = (1, 0) if success else (0, 1)
+        with self._conn() as conn:
+            changed = conn.execute(
+                "UPDATE learning SET successes=successes+?, failures=failures+?, updated_at=? "
+                "WHERE signature=? AND attribute=? AND value=?",
+                (hit, miss, now, signature, attribute, value),
+            ).rowcount
+            if not changed:
+                conn.execute(
+                    "INSERT INTO learning (signature, attribute, value, successes, failures, updated_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (signature, attribute, value, hit, miss, now),
+                )
+
+    def learning_rows(self, signature: str) -> list[dict[str, Any]]:
+        if not signature:
+            return []
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT signature, attribute, value, successes, failures FROM learning WHERE signature=?",
+                (signature,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def add_flow(self, case_id: str, kind: str, body: dict[str, Any], code_ver: str = "") -> int:
         with self._conn() as conn:
             row = conn.execute(
@@ -643,8 +680,8 @@ class Store:
     def peek_slices(self, limit: int = 5, run_id: str | None = None) -> list[dict[str, Any]]:
         """Pending slices in queue order, digest only (no lease, no attempt bump)."""
         sql = (
-            "SELECT id, run_id, kind, sink_file, sink_line, attempts, score, reasons, digest, order_mode"
-            " FROM slice WHERE status='pending'"
+            "SELECT id, run_id, kind, sink_file, sink_line, attempts, score, reasons, digest,"
+            " order_mode, slice_json FROM slice WHERE status='pending'"
         )
         args: tuple[Any, ...] = ()
         if run_id:
@@ -659,11 +696,15 @@ class Store:
             item = {
                 "slice_id": row["id"],
                 "run_id": row["run_id"],
+                "kind": row["kind"],
+                "sink_file": row["sink_file"],
+                "sink_line": row["sink_line"],
                 "attempts": row["attempts"],
                 "score": row["score"],
                 "order_mode": row["order_mode"],
                 "reasons": json.loads(row["reasons"] or "[]"),
                 "digest": json.loads(row["digest"] or "{}"),
+                "slice": json.loads(row["slice_json"] or "{}"),
             }
             item["pairs"] = self._pairs_for(row["id"], limit=3)
             peeked.append(item)

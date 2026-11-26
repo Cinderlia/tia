@@ -38,6 +38,7 @@ from tia.dom.trigger import _POST_VAR_RE, StageRecord, TriggerResult, normalize_
 from tia.inf.runtime import get_runtime
 from tia.orch.judge import judge_direct
 from tia.orch.kernel import Kernel, LocalToolClient, ToolCallError, ToolClient
+from tia.orch.learning import hints_for, order_shapes, record_case
 
 
 def _attempts() -> int:
@@ -92,6 +93,7 @@ async def run_direct(
         post_params.append(source_param)
     notes.update(
         {
+            "sink_file": file,
             "sink_code": sink_code,
             "source_window_sha256": window.get("sha256"),
             "entry_plan": {"method": plan.method, "has_filter": plan.has_filter},
@@ -160,6 +162,8 @@ async def run_direct(
         {"method": item.method, "values": item.values, "confidence": item.confidence, "basis": item.basis}
         for item in candidates
     ]
+    hints = hints_for(get_runtime().store, raw)
+    notes["learning"] = hints
     attempts: list[dict[str, Any]] = []
     budget_left = _attempts()
     for candidate in [*candidates, None]:
@@ -174,7 +178,7 @@ async def run_direct(
         if probe.get("executable"):
             break
         context_kind = str(probe.get("context_kind") or "")
-        for shape in shapes_for(context_kind):
+        for shape in order_shapes(shapes_for(context_kind), hints):
             if budget_left <= 0:
                 break
             tag = _tag()
@@ -310,7 +314,9 @@ async def _finish(
     stages: list[StageRecord],
     notes: dict[str, Any],
 ) -> TriggerResult:
-    get_runtime().store.set_case_verdict(case_id, verdict, ceiling="EXECUTABLE")
+    store = get_runtime().store
+    store.set_case_verdict(case_id, verdict, ceiling="EXECUTABLE")
+    record_case(store, {"sinkFile": str(notes.get("sink_file") or "")}, verdict, notes)
     report = await kernel.report()
     stages.append(StageRecord("D6", True, "report generated"))
     return TriggerResult(
