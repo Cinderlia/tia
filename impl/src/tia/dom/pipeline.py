@@ -277,11 +277,18 @@ async def run_pipeline(
                 budget=budget,
                 inject_client=inject_client,
                 url_for=url_for,
+                reader=reader,
                 payload_constraints=(trigger.notes or {}).get("payload_constraints"),
+                read_values=(trigger.notes or {}).get("read_entry_values"),
             )
         except ToolCallError as exc:
             record["stopped_at"] = "inject_error"
             record["error"] = exc.envelope.model_dump()
+            result.rounds.append(record)
+            continue
+        except Exception as exc:  # noqa: BLE001 - keep the pipeline alive across one bad candidate
+            record["stopped_at"] = "inject_error"
+            record["error"] = f"{type(exc).__name__}: {exc}"
             result.rounds.append(record)
             continue
         record["injections"] = [
@@ -384,6 +391,7 @@ async def walk_injection_queue(
     url_for: Callable[[dict[str, Any]], str] | None,
     reader: Callable[[str, int, int], list[tuple[int, str]]] | None = None,
     payload_constraints: dict[str, Any] | None = None,
+    read_values: dict[str, str] | None = None,
 ) -> PipelineResult:
     """Inject every candidate in queue order; the read side is already proven."""
     result = PipelineResult()
@@ -431,6 +439,7 @@ async def walk_injection_queue(
             pair_hints=hints[:1],
             verify_url=read_url,
             verify_entry=entry,
+            verify_values=read_values,
             payload_constraints=payload_constraints,
             slice_id=str(item["write_slice_id"]),
             learning=hints_for(store, read_raw or write_raw),
@@ -452,6 +461,7 @@ async def walk_injection_queue(
                     pair_hints=hints[1:],
                     verify_url=read_url,
                     verify_entry=entry,
+                    verify_values=read_values,
                     payload_constraints=payload_constraints,
                     slice_id=str(hints[1]["alternate_write_slice_id"]),
                     learning=hints_for(store, read_raw or write_raw),

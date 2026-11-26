@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import parse_qsl, urljoin
 
 import httpx
 
@@ -45,6 +45,7 @@ class HttpClient:
         max_bytes: int = 32 * 1024,
         marker: str | None = None,
         around: int = 800,
+        files: dict[str, tuple[str, bytes]] | None = None,
     ) -> HttpResult:
         chain: list[dict[str, Any]] = []
         current = url
@@ -57,13 +58,28 @@ class HttpClient:
                 cookies=cookies or {},
             ) as client:
                 for _ in range(max_redirects + 1):
-                    response = client.request(
-                        method,
-                        current,
-                        params=params,
-                        content=body.encode() if body is not None else None,
-                        headers=request_headers,
-                    )
+                    if files:
+                        form_data = dict(parse_qsl(body or ""))
+                        response = client.request(
+                            method,
+                            current,
+                            params=params,
+                            data=form_data or None,
+                            files=files,
+                            headers={
+                                key: value
+                                for key, value in request_headers.items()
+                                if key.lower() != "content-type"
+                            },
+                        )
+                    else:
+                        response = client.request(
+                            method,
+                            current,
+                            params=params,
+                            content=body.encode() if body is not None else None,
+                            headers=request_headers,
+                        )
                     if response.is_redirect and follow_redirects:
                         location = response.headers.get("location", "")
                         chain.append({"status": response.status_code, "location": location})

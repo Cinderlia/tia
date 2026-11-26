@@ -29,6 +29,7 @@ class PageForm:
     method: str
     fields: list[FormField] = field(default_factory=list)
     enctype: str = "application/x-www-form-urlencoded"
+    files: list[str] = field(default_factory=list)
 
     @property
     def names(self) -> list[str]:
@@ -52,6 +53,7 @@ def forms_from_document(document: Document, page_url: str) -> list[PageForm]:
         method = (node.attrs.get("method") or "get").lower()
         enctype = node.attrs.get("enctype", "application/x-www-form-urlencoded")
         fields: list[FormField] = []
+        files: list[str] = []
         stack = list(node.children)
         while stack:
             child = stack.pop()
@@ -60,7 +62,9 @@ def forms_from_document(document: Document, page_url: str) -> list[PageForm]:
                 continue
             name = child.attrs.get("name")
             kind = (child.attrs.get("type") or "text").lower()
-            if name and kind not in {"file", "image", "reset"}:
+            if name and kind == "file":
+                files.append(name)
+            elif name and kind not in {"image", "reset"}:
                 fields.append(
                     FormField(
                         name=name,
@@ -78,6 +82,7 @@ def forms_from_document(document: Document, page_url: str) -> list[PageForm]:
                 method=method,
                 fields=fields,
                 enctype=enctype,
+                files=files,
             )
         )
     return forms

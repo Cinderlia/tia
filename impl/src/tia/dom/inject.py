@@ -24,8 +24,9 @@ from tia.cap.entry import (
     entry_field,
     resolve_values_with_guess,
 )
-from tia.cap.forms import forms_from_document
+from tia.cap.forms import FormField, PageForm, forms_from_document
 from tia.cap.payloads import render as render_shape
+from tia.cap.request_plan import plan_request
 from tia.dom.trigger import StageRecord
 from tia.inf.reports import write_case_report
 from tia.inf.runtime import get_runtime
@@ -37,6 +38,7 @@ DEFAULT_PAYLOAD = "<script>alert(1)</script>"
 
 #: Verification attempts on the read page: bounded exploration, not one shot.
 VERIFY_ATTEMPTS = max(1, int(os.environ.get("TIA_VERIFY_ATTEMPTS", "4")))
+WRITE_ATTEMPTS = max(1, int(os.environ.get("TIA_WRITE_ATTEMPTS", "2")))
 _TAG_RE = re.compile(r"<tia-([a-z0-9]{4})>")
 _POST_VAR_RE = re.compile(r"\$_POST\[\s*[\'\"]([A-Za-z_][\w]*)[\'\"]\s*\]")
 
@@ -57,6 +59,7 @@ class _Form:
     action: str
     method: str
     fields: dict[str, str]
+    files: list[str] = field(default_factory=list)
 
 
 def _tag() -> str:
@@ -76,6 +79,7 @@ def _forms(document: Document, page_url: str) -> list[_Form]:
             action=form.action,
             method=form.method,
             fields={field.name: field.value for field in form.fields},
+            files=list(form.files),
         )
         for form in forms_from_document(document, page_url)
     ]
@@ -156,6 +160,7 @@ async def run_inject(
     pair_hints: list[dict[str, Any]] | None = None,
     verify_url: str | None = None,
     verify_entry: dict[str, Any] | None = None,
+    verify_values: dict[str, str] | None = None,
     payload_constraints: dict[str, Any] | None = None,
     slice_id: str | None = None,
     learning: dict[str, Any] | None = None,
@@ -296,17 +301,21 @@ async def run_inject(
         result.verdict = "ENTRY_AMBIGUOUS"
         return await _finish(kernel, result)
     notes["candidates"] = candidates
-    stage("I2", True, f"form {forms[0].action} candidate fields={candidates}")
+    stage("I2", True, f"forms={len(forms)} candidate fields={candidates}")
 
     # ---- I3 Length budget: pick the widest writable column that fits the payload ----
     schema = await call("db_schema", {"table": target["table"]})
     widths: dict[str, int | None] = {}
+    column_limits: dict[str, str] = {}
     pk_columns: list[str] = []
     for table_item in schema.get("tables") or []:
         if table_item.get("name") == target["table"]:
             pk_columns = [str(item) for item in table_item.get("primary_key") or []]
             for column in table_item.get("columns") or []:
                 widths[str(column.get("name"))] = column.get("length")
+                column_limits[str(column.get("name"))] = (
+                    f"{column.get('type') or 'text'}({column.get('length') or '?'})"
+                )
     constraints = dict(payload_constraints or {})
     learned_shape = preferred_payload_shape(learning, constraints.get("context_kind"))
     if learned_shape:
@@ -314,15 +323,15 @@ async def run_inject(
         notes["payload_shape"] = learned_shape
         stage("I3", True, f"learned payload shape {learned_shape} for this site")
     else:
-        payload = f"{payload_base}<tia-{tag}>"
+        payload = f"{payload_base}{tag}"
     if constraints:
         notes["payload_constraints"] = constraints
         max_length = constraints.get("max_length")
-        overhead = len(f"<tia-{tag}>")
+        overhead = len(tag)
         if isinstance(max_length, int) and max_length > overhead and len(payload) > max_length:
             keep = max_length - overhead
             trimmed = payload_base[:keep]
-            payload = f"{trimmed}<tia-{tag}>"
+            payload = f"{trimmed}{tag}"
             notes["payload_trimmed"] = {"max_length": max_length, "base_chars": len(trimmed)}
             stage("I3", True, f"payload trimmed to {len(payload)} chars for column limit {max_length}")
     fitting: list[tuple[int, str, str]] = []
@@ -347,62 +356,191 @@ async def run_inject(
     stage("I4", True, f"intersect: field={field_name}, column={chosen_column}, payload {len(payload)} chars")
 
     # ---- I4/I5 delivery: use the application's own form ----
-    values = dict(form.fields)
-    values[field_name] = payload
-    for param in params:
-        if param in form.fields and param != field_name:
-            values[param] = values[param] or f"tia-{tag}"
-    body = urlencode(values)
+    # The model plans the request; local code only fills a page every field
+    # blank and validates the plan. Execution (probe/verify) decides if it worked.
+    fallback = {name: (value or "tia") for name, value in form.fields.items()}
+    fallback[field_name] = payload
+    plan_forms = [
+        PageForm(
+            action=item.action,
+            method=item.method,
+            fields=[
+                FormField(name=name, type="text", value=value)
+                for name, value in item.fields.items()
+            ],
+            files=list(item.files),
+        )
+        for item in forms
+    ]
+    def _diagnose(html: str, status: Any, probe_hit: bool) -> str:
+        parts = [f"HTTP {status}"]
+        if not probe_hit:
+            parts.append(
+                "no SQL matched the armed target lines, so the request did not reach the sink"
+            )
+        if html:
+            lowered = html.lower()
+            for keyword in (
+                "error",
+                "fatal",
+                "warning",
+                "invalid",
+                "required",
+                "not found",
+                "can not use both",
+            ):
+                position = lowered.find(keyword)
+                if position >= 0:
+                    snippet = " ".join(html[max(0, position - 60): position + 140].split())
+                    parts.append(f"page text near {keyword!r}: {snippet}")
+                    break
+            if tag not in html:
+                parts.append("the case tag does not appear in the response")
+        return "; ".join(parts)
+
+    uploads: dict[str, str] = {}
+    values: dict[str, str] = fallback
+    observation = ""
+    submitted: dict[str, Any] = {}
     armed = False
     arm_targets: list[dict[str, Any]] = []
     if insert_line is not None:
         arm_targets.append({"file": sink_file, "line": insert_line})
     if read_file and read_line and (read_file, read_line) != (sink_file, insert_line):
         arm_targets.append({"file": read_file, "line": read_line})
-    if arm_targets:
-        try:
-            await call(
-                "probe_arm",
-                {
-                    "case_id": result.case_id,
-                    "targets": arm_targets,
-                    "output": f"inject-{tag}.json",
-                },
-            )
-            armed = True
-        except ToolCallError as exc:
-            notes["probe_error"] = str(exc.envelope.error.message if exc.envelope.error else exc)
-    try:
-        if armed:
-            submitted = await call(
-                "probe_run",
-                {
-                    "case_id": result.case_id,
-                    "url": form.action,
-                    "method": "POST",
-                    "body": body,
-                    "headers": {"Content-Type": "application/x-www-form-urlencoded"},
-                    "capture_html": True,
-                },
-            )
+    for attempt_index in range(WRITE_ATTEMPTS):
+        if attempt_index == 0 and arm_targets:
+            try:
+                await call(
+                    "probe_arm",
+                    {
+                        "case_id": result.case_id,
+                        "targets": arm_targets,
+                        "output": f"inject-{tag}.json",
+                    },
+                )
+                armed = True
+            except ToolCallError as exc:
+                notes["probe_error"] = str(
+                    exc.envelope.error.message if exc.envelope.error else exc
+                )
+        request_plan = await plan_request(
+            client=LlmClient.from_env(),
+            goal=(
+                "submit this form so the application inserts the payload into "
+                f"{target['table']}.{chosen_column} via the code at line {target.get('line')}"
+            ),
+            page_url=base_url,
+            forms=plan_forms,
+            source_text=text,
+            payload=payload,
+            hint=f"payload must be written through parameter {field_name}",
+            constraints=", ".join(f"{name}: {kind}" for name, kind in column_limits.items()),
+            observation=observation,
+            fallback_fields=fallback,
+        )
+        if request_plan is not None and request_plan.source == "rejected":
+            notes["request_plan_rejection"] = request_plan.rejection
+            stage("I4", False, f"plan rejected: {request_plan.rejection[:200]}")
+            observation = f"local validator rejected the plan: {request_plan.rejection}"
+            request_plan = None
+        if request_plan is not None:
+            notes["request_plan"] = request_plan.to_dict()
+            if request_plan.warnings:
+                notes["request_plan_warnings"] = request_plan.warnings
+            if request_plan.url and request_plan.url != base_url:
+                for candidate_form in forms:
+                    if candidate_form.action == request_plan.url:
+                        form = candidate_form
+                        break
+            if request_plan.payload:
+                payload = request_plan.payload
+                notes["payload"] = payload
+            if request_plan.column and request_plan.column in widths:
+                width = widths.get(request_plan.column)
+                if width is None or len(payload) <= int(width):
+                    chosen_column = request_plan.column
+                    target["column"] = chosen_column
+                    notes["column_chosen_by"] = "llm"
+                else:
+                    notes["column_rejected"] = (
+                        f"{request_plan.column} holds {width} chars, payload needs {len(payload)}"
+                    )
+            values = dict(request_plan.values)
+            if request_plan.payload_field:
+                values[request_plan.payload_field] = payload
+            if request_plan.files:
+                uploads = dict(request_plan.files)
+            elif form.files:
+                uploads = {name: f"tia-{tag}.png" for name in form.files}
+            notes["entry"] = {
+                "url": request_plan.url or form.action,
+                "method": request_plan.method.lower(),
+                "field": request_plan.payload_field or field_name,
+                "fields": dict(form.fields),
+                "planned_by": request_plan.source,
+            }
         else:
-            submitted = await call(
-                "http_request",
-                {
-                    "method": "POST",
-                    "url": form.action,
-                    "body": body,
-                    "headers": {"Content-Type": "application/x-www-form-urlencoded"},
-                },
+            values = fallback
+            uploads = {name: f"tia-{tag}.png" for name in form.files}
+        body = urlencode(values)
+        try:
+            if armed:
+                submitted = await call(
+                    "probe_run",
+                    {
+                        "case_id": result.case_id,
+                        "url": form.action,
+                        "method": "POST",
+                        "body": body,
+                        "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+                        "capture_html": True,
+                        "files": uploads,
+                    },
+                )
+            else:
+                submitted = await call(
+                    "http_request",
+                    {
+                        "method": "POST",
+                        "url": form.action,
+                        "body": body,
+                        "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+                        "files": uploads,
+                    },
+                )
+        except ToolCallError as exc:
+            observation = str(exc.envelope.error.message if exc.envelope.error else exc)
+            notes.setdefault("write_attempts", []).append(
+                {"values": values, "upload": bool(uploads), "error": observation}
             )
-    except ToolCallError as exc:
-        stage("I5", False, f"POST failed: {exc}")
-        result.verdict = "WRITE_NOT_REACHED"
-        return await _finish(kernel, result)
-    finally:
+            continue
+        status = submitted.get("http", {}).get("status") if armed else submitted.get("status")
+        queries = submitted.get("queries") or []
+        probe_hit = any(int(query.get("affected_rows") or 0) > 0 for query in queries)
+        page_html = str((submitted.get("http") or {}).get("html") or "")
+        notes.setdefault("write_attempts", []).append(
+            {
+                "values": values,
+                "upload": bool(uploads),
+                "status": status,
+                "probe_hit": probe_hit,
+            }
+        )
+        if int(status or 0) < 400 and (not armed or probe_hit):
+            break
+        observation = _diagnose(page_html, status, probe_hit)
+        stage("I5", False, f"POST {form.action} → {status}; retrying with feedback")
+    else:
         if armed:
             with contextlib.suppress(ToolCallError):
                 await call("probe_disarm", {"case_id": result.case_id})
+        stage("I5", False, "POST never reached the sink")
+        result.verdict = "WRITE_NOT_REACHED"
+        return await _finish(kernel, result)
+    if armed:
+        with contextlib.suppress(ToolCallError):
+            await call("probe_disarm", {"case_id": result.case_id})
     status = submitted.get("http", {}).get("status") if armed else submitted.get("status")
     stage("I5", True, f"POST {form.action} → {status} probe={armed}")
     if armed and (submitted.get("queries") or []):
@@ -427,7 +565,7 @@ async def run_inject(
     probe = await call(
         "db_read",
         {
-            "sql": f"SELECT COUNT(*) AS n FROM `{table}` WHERE `{column}` LIKE '%<tia-{tag}>%'",
+            "sql": f"SELECT COUNT(*) AS n FROM `{table}` WHERE `{column}` LIKE '%{tag}%'",
         },
     )
     rows = probe.get("rows") or []
@@ -441,7 +579,8 @@ async def run_inject(
     verify: dict[str, Any] | None = None
     submitted_http = submitted.get("http") or {}
     same_page_html = str(submitted_http.get("html") or "")
-    if same_page_html and tag in same_page_html:
+    same_page_is_sink = not verify_url or verify_url == form.action
+    if same_page_is_sink and same_page_html and tag in same_page_html:
         # The write page already rendered the tag: one arm, one request covered both
         # the write target and the read target.
         verify = await call(
@@ -459,13 +598,27 @@ async def run_inject(
     elif verify_url and verify_url != form.action and verify_entry:
         entry_method = str(verify_entry.get("method") or "POST").upper()
         entry_spec = [entry_field(item) for item in verify_entry.get("fields") or []]
+        read_forms: list[PageForm] = []
+        read_html = ""
+        try:
+            read_page = await call("http_request", {"method": "GET", "url": verify_url})
+            read_html = str(read_page.get("body") or "")
+            read_forms = forms_from_document(parse(read_html), verify_url)
+            notes["read_forms"] = [
+                {"action": form.action, "method": form.method, "fields": sorted(field.name for field in form.fields)}
+                for form in read_forms
+            ]
+        except ToolCallError as exc:
+            notes["read_page_error"] = str(
+                exc.envelope.error.message if exc.envelope.error else exc
+            )
         written_row: dict[str, Any] | None = None
         try:
             row_hit = await call(
                 "db_read",
                 {
                     "sql": (
-                        f"SELECT * FROM `{table}` WHERE `{column}` LIKE '%<tia-{tag}>%' LIMIT 1"
+                        f"SELECT * FROM `{table}` WHERE `{column}` LIKE '%{tag}%' LIMIT 1"
                     )
                 },
             )
@@ -497,6 +650,37 @@ async def run_inject(
             {"method": candidate.method, "confidence": candidate.confidence, "values": candidate.values}
             for candidate in entry_candidates_list
         ]
+        read_plan = await plan_request(
+            client=LlmClient.from_env(),
+            goal=(
+                "open this page so the row that carries the tag is selected and rendered; "
+                "some pages reject mutually exclusive parameters"
+            ),
+            page_url=verify_url,
+            forms=read_forms
+            or [
+                PageForm(
+                    action=verify_url,
+                    method=entry_method.lower(),
+                    fields=[FormField(name=item.name, type="numeric" if item.numeric else "text")
+                            for item in entry_spec],
+                )
+            ],
+            html=read_html,
+            source_text=str(notes.get("read_sink_code") or text),
+            payload=tag,
+            tag=tag,
+            constraints=", ".join(f"{name}: {kind}" for name, kind in column_limits.items()),
+            hint="choose the parameters that make this page query the row that contains the tag",
+            fallback_fields=attempt_values[0] if attempt_values else {},
+            fallback_method=entry_method,
+        )
+        if read_plan is not None and read_plan.values:
+            notes["read_request_plan"] = read_plan.to_dict()
+            ordered = [read_plan.values] + [
+                item for item in attempt_values if dict(item) != dict(read_plan.values)
+            ]
+            attempt_values = ordered[: VERIFY_ATTEMPTS + 1]
         verify = None
         attempts: list[dict[str, Any]] = []
         read_armed = False
@@ -511,7 +695,31 @@ async def run_inject(
                     },
                 )
                 read_armed = True
-        for values in attempt_values:
+        queue: list[dict[str, str]] = []
+        if verify_values:
+            # The trigger proved which read parameters reach the sink, but its tag
+            # belongs to the trigger case. Reuse only the "exact" values; rewrite
+            # every "contains" field with this case's tag.
+            by_name = {spec.name: spec for spec in entry_spec}
+            seeded: dict[str, str] = {}
+            for name, value in verify_values.items():
+                spec = by_name.get(str(name))
+                if spec is not None and spec.usage == "contains":
+                    seeded[str(name)] = tag
+                elif value not in (None, ""):
+                    seeded[str(name)] = str(value)
+            if seeded:
+                queue.append(seeded)
+        for seed in attempt_values:
+            seed_values = dict(seed)
+            if seed_values not in queue:
+                queue.append(seed_values)
+        used_plans = 0
+        observation = ""
+        index = 0
+        while index < len(queue) and len(attempts) < VERIFY_ATTEMPTS + 1:
+            values = queue[index]
+            index += 1
             attempt_html: str | None = None
             try:
                 if read_armed:
@@ -533,7 +741,12 @@ async def run_inject(
                     status = page.get("status")
                     notes.setdefault("read_probe", []).append(probe_page.get("by_target"))
                 elif entry_method == "GET":
-                    page = await call("http_request", {"method": "GET", "url": verify_url, "params": values})
+                    page = await call(
+                        "http_request", {"method": "GET", "url": verify_url, "params": values}
+                    )
+                    attempt_html = str(page.get("body") or "")
+                    verify_content_type = str(page.get("content_type") or "text/html")
+                    status = page.get("status")
                 else:
                     page = await call(
                         "http_request",
@@ -544,11 +757,52 @@ async def run_inject(
                             "headers": {"Content-Type": "application/x-www-form-urlencoded"},
                         },
                     )
-                attempt_html = attempt_html if attempt_html is not None else str(page.get("body") or "")
-                verify_content_type = str(page.get("content_type") or "text/html")
-                status = page.get("status")
+                    attempt_html = str(page.get("body") or "")
+                    verify_content_type = str(page.get("content_type") or "text/html")
+                    status = page.get("status")
             except ToolCallError as exc:
                 attempts.append({"values": values, "error": str(exc)})
+                observation = str(exc)
+                if used_plans < 1:
+                    used_plans += 1
+                    again = await plan_request(
+                        client=LlmClient.from_env(),
+                        goal=(
+                            "open this page so the row that carries the tag is selected and rendered"
+                        ),
+                        page_url=verify_url,
+                        forms=read_forms
+                        or [
+                            PageForm(
+                                action=verify_url,
+                                method=entry_method.lower(),
+                                fields=[
+                                    FormField(
+                                        name=item.name,
+                                        type="numeric" if item.numeric else "text",
+                                    )
+                                    for item in entry_spec
+                                ],
+                            )
+                        ],
+                        html=read_html,
+                        source_text=str(notes.get("read_sink_code") or text),
+                        payload=tag,
+                        tag=tag,
+                        constraints=", ".join(
+                            f"{name}: {kind}" for name, kind in column_limits.items()
+                        ),
+                        observation=observation,
+                        hint="the previous attempt did not render the row; change the request",
+                        fallback_fields=queue[0] if queue else {},
+                        fallback_method=entry_method,
+                    )
+                    if again is not None and again.source == "rejected":
+                        notes["read_request_plan_rejection"] = again.rejection
+                        observation = f"local validator rejected the plan: {again.rejection}"
+                    elif again is not None and again.source == "llm" and again.values:
+                        notes["read_request_plan"] = again.to_dict()
+                        queue.append(dict(again.values))
                 continue
             this_verify = await call(
                 "verify_tag", {"tag": tag, "payload": payload, "html": attempt_html,
@@ -568,6 +822,56 @@ async def run_inject(
                 verify = this_verify
             if this_verify.get("found"):
                 break
+            lowered = attempt_html.lower()
+            snippet = ""
+            for keyword in ("error", "fatal", "warning", "invalid", "required", "not found"):
+                position = lowered.find(keyword)
+                if position >= 0:
+                    snippet = " ".join(
+                        attempt_html[max(0, position - 60): position + 140].split()
+                    )
+                    break
+            observation = f"HTTP {status}; the case tag is absent from the response"
+            if snippet:
+                observation += f"; page text: {snippet}"
+            if used_plans < 1:
+                used_plans += 1
+                again = await plan_request(
+                    client=LlmClient.from_env(),
+                    goal="open this page so the row that carries the tag is selected and rendered",
+                    page_url=verify_url,
+                    forms=read_forms
+                    or [
+                        PageForm(
+                            action=verify_url,
+                            method=entry_method.lower(),
+                            fields=[
+                                FormField(
+                                    name=item.name,
+                                    type="numeric" if item.numeric else "text",
+                                )
+                                for item in entry_spec
+                            ],
+                        )
+                    ],
+                    html=read_html,
+                    source_text=str(notes.get("read_sink_code") or text),
+                    payload=tag,
+                    tag=tag,
+                    constraints=", ".join(
+                        f"{name}: {kind}" for name, kind in column_limits.items()
+                    ),
+                    observation=observation,
+                    hint="the row was written but this request did not show it",
+                    fallback_fields=values,
+                    fallback_method=entry_method,
+                )
+                if again is not None and again.source == "rejected":
+                    notes["read_request_plan_rejection"] = again.rejection
+                    observation = f"local validator rejected the plan: {again.rejection}"
+                elif again is not None and again.source == "llm" and again.values:
+                    notes["read_request_plan"] = again.to_dict()
+                    queue.append(dict(again.values))
         if read_armed:
             with contextlib.suppress(ToolCallError):
                 await call("probe_disarm", {"case_id": result.case_id})
@@ -591,9 +895,14 @@ async def run_inject(
 
     if executable and verify is not None:
         try:
-            method = "POST" if notes.get("verify_on") == "probe_page" else "GET"
-            target_url = form.action if method == "POST" else (verify_url or form.action)
-            fields = dict(values) if method == "POST" else {}
+            if notes.get("verify_on") == "probe_page":
+                method, target_url, fields = "POST", form.action, dict(values)
+            else:
+                attempts = notes.get("verify_attempts") or []
+                last = attempts[-1] if attempts else {}
+                method = str((verify_entry or {}).get("method") or "POST").upper()
+                target_url = verify_url or form.action
+                fields = dict(last.get("values") or {})
             confirmed = await call(
                 "verify_tag",
                 {
@@ -622,18 +931,18 @@ async def run_inject(
                 "db_write",
                 {
                     "case_id": result.case_id,
-                    "sql": f"DELETE FROM `{table}` WHERE `{column}` LIKE '%<tia-{tag}>%'",
+                    "sql": f"DELETE FROM `{table}` WHERE `{column}` LIKE '%{tag}%'",
                     "expect_affected": 1,
                 },
             )
             change = (deleted.get("change") or {}).get("change_id")
-            again = await call(
+            again_rows = await call(
                 "db_read",
                 {
-                    "sql": f"SELECT COUNT(*) AS n FROM `{table}` WHERE `{column}` LIKE '%<tia-{tag}>%'",
+                    "sql": f"SELECT COUNT(*) AS n FROM `{table}` WHERE `{column}` LIKE '%{tag}%'",
                 },
             )
-            rows_again = again.get("rows") or []
+            rows_again = again_rows.get("rows") or []
             result.residue = int(rows_again[0].get("n") or 0) if rows_again else 0
             notes["cleanup"] = {"change_id": change, "residue": result.residue}
             stage("I7", result.residue == 0, f"cleanup change={change} residue={result.residue}")

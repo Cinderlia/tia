@@ -6,6 +6,7 @@ Fields with missing values go into ``missing``; no default values are guessed fo
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -16,6 +17,8 @@ from tia.cap.session import looks_like_login, renew_session, resolve_session
 from tia.inf.runtime import get_runtime
 from tia.schemas.envelope import ErrorCode, ToolError
 from tia.schemas.objects import FlowRecord
+
+MIME_OK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 def _bad(message: str, hint: str = "") -> ToolError:
@@ -42,6 +45,8 @@ class HttpRequestInput(BaseModel):
     follow_redirects: bool = False
     max_redirects: int = Field(default=5, ge=0, le=10)
     capture: dict[str, Any] | None = None
+    #: Multipart file fields: field name -> filename. Content is a small marker.
+    files: dict[str, str] = Field(default_factory=dict)
 
 
 async def _fetch(
@@ -65,6 +70,7 @@ async def _fetch(
         max_bytes=rt.settings.profile.max_http_bytes,
         marker=str(marker) if marker else None,
         around=around,
+        files=_file_fields(params.files),
     )
 
 
@@ -146,3 +152,19 @@ async def form_fill(arguments: dict[str, Any]) -> ToolOutput:
             request["csrf"] = {"field": step.csrf_source.get("field", ""), "refetched": False}
         requests.append(request)
     return ToolOutput(data={"requests": requests, "missing": sorted(set(missing))})
+
+
+def _file_fields(files: dict[str, str]) -> dict[str, tuple[str, bytes]] | None:
+    """Multipart parts for the upload fields a form advertises.
+
+    The bytes only need to be a valid upload; the interesting value travels in
+    the ordinary fields (filename or description depending on the app).
+    """
+    if not files:
+        return None
+    parts: dict[str, tuple[str, bytes]] = {}
+    for name, filename in files.items():
+        if not MIME_OK.match(filename):
+            raise _bad(f"Invalid upload filename: {filename!r}")
+        parts[name] = (filename, b"tia-upload")
+    return parts

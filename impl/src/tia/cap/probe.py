@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from tia.ad.http import HttpClient
 from tia.ad.sqlprobe import ProbeConfigError, SqlProbeAdapter
+from tia.cap.http import _file_fields
 from tia.cap.policy import require_case
 from tia.cap.registry import ToolOutput
 from tia.cap.session import looks_like_login, renew_session, resolve_session
@@ -213,6 +214,7 @@ class ProbeRunInput(BaseModel):
     output: str | None = None
     wait_ms: int = Field(default=0, ge=0, le=MAX_WAIT_MS)
     capture_html: bool = False
+    files: dict[str, str] = Field(default_factory=dict)
     session_id: str | None = None
     account_label: str = ""
 
@@ -251,6 +253,7 @@ async def probe_run(arguments: dict[str, Any]) -> ToolOutput:
         headers=headers,
         cookies=cookies,
         max_bytes=rt.settings.profile.max_http_bytes,
+        files=_file_fields(params.files),
     )
     if session_id and looks_like_login(
         result.status, result.headers.get("location", ""), result.body

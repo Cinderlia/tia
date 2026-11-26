@@ -287,6 +287,12 @@ _PROBE_RUN_SCHEMA = {
         "headers": {"type": "object"},
         "output": {"type": "string", "description": "Read this capture instead of the armed one"},
         "wait_ms": {"type": "integer", "minimum": 0, "maximum": 2000},
+        "capture_html": {"type": "boolean"},
+        "files": {
+            "type": "object",
+            "description": "Multipart fields: field name -> upload filename",
+            "additionalProperties": {"type": "string"},
+        },
     },
     "required": ["case_id", "url"],
     "additionalProperties": False,

@@ -36,6 +36,7 @@ from tia.orch.pairing import (
     extract_ops,
     group_by_slice,
     merge_ops,
+    pair_id_for,
     resolve_entry,
 )
 from tia.orch.slicing import score_slice
@@ -221,6 +222,39 @@ def build_pairing_queue(
         min_confidence=cfg.min_confidence,
         allow_column_only=cfg.allow_column_only,
     )
+    # The proven read must pair with table-compatible writes even when the
+    # generic ops extraction missed one side (e.g. select * spans files).
+    known = {(str(item["read_slice_id"]), str(item["write_slice_id"])) for item in pairs}
+    for read_entry in entries[:read_count]:
+        read_tables = {op.table for op in read_entry.ops if op.op == "select" and op.table}
+        if not read_tables:
+            continue
+        for write_entry in entries[read_count:]:
+            write_tables = {
+                op.table for op in write_entry.ops if op.op in {"insert", "update"} and op.table
+            }
+            shared_tables = read_tables & write_tables
+            if not shared_tables:
+                continue
+            fallback_key = (read_entry.slice_id, write_entry.slice_id)
+            if fallback_key in known:
+                continue
+            known.add(fallback_key)
+            table = sorted(shared_tables)[0]
+            pairs.append(
+                {
+                    "pair_id": pair_id_for(read_entry.slice_id, write_entry.slice_id),
+                    "read_slice_id": read_entry.slice_id,
+                    "write_slice_id": write_entry.slice_id,
+                    "table": table,
+                    "columns": [],
+                    "confidence": 45 + (8 if read_entry.probe else 0),
+                    "direction": (
+                        "write_then_read" if write_entry.line <= read_entry.line else "read_then_write"
+                    ),
+                    "reasons": [f"proven read table {table} matched a write to the same table"],
+                }
+            )
     result.n_pairs = len(pairs)
     grouped = group_by_slice(pairs)
     for slice_id, raw in zip(seeded_ids, usable, strict=False):

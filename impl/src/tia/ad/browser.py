@@ -132,7 +132,10 @@ class BrowserExecutor:
                 executed=False, error=f"BROWSER_UNAVAILABLE: {exc}"
             )
 
-        binary = self._binary()
+        try:
+            binary = self._binary()
+        except BrowserUnavailable as exc:
+            return ExecutionResult(executed=False, error=f"BROWSER_UNAVAILABLE: {exc}")
         beacons: list[str] = []
         dialogs: list[dict[str, str]] = []
         console: list[str] = []

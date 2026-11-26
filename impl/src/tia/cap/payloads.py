@@ -8,6 +8,8 @@ report can show exactly which shape was used.
 
 from __future__ import annotations
 
+import re
+
 #: Contexts where the reflection is inert markup (script tags execute).
 _INLINE_HTML = ("html_text", "plain_text", "textarea", "json", "comment")
 
@@ -47,3 +49,25 @@ def render(shape: str, tag: str) -> str:
 
 def is_inline_html(context_kind: str | None) -> bool:
     return str(context_kind or "") in _INLINE_HTML
+
+
+_ATTR_SINK = re.compile(r"""(?:value|src|href)\s*=\s*["']""", re.IGNORECASE)
+
+
+def infer_sink_context(sink_code: str) -> str:
+    """Best static guess of the output context from the sink expression.
+
+    The trigger agent refines this with ``verify_tag`` after the first write;
+    this guess only orders the payload candidates.
+    """
+    code = sink_code or ""
+    if "<!--" in code or "-->" in code:
+        return "comment"
+    if _ATTR_SINK.search(code):
+        return "attr"
+    lowered = code.lower()
+    if "<script" in lowered or '"<script' in lowered or "'<script" in lowered:
+        return "script_block"
+    if "json_encode" in lowered:
+        return "json"
+    return "html_text"

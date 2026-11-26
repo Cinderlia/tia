@@ -26,6 +26,9 @@ from tia.cap.entry import (
     entry_candidates,
     infer_entry,
 )
+from tia.cap.forms import FormField, PageForm
+from tia.cap.payloads import infer_sink_context, render, shapes_for
+from tia.cap.request_plan import plan_request
 from tia.inf.reports import write_case_report
 from tia.inf.runtime import get_runtime
 from tia.inf.store import now_iso
@@ -35,6 +38,8 @@ from tia.orch.learning import record_case
 
 #: Exploration budget: enough attempts for complex entry pages, still bounded.
 ENTRY_ATTEMPTS = max(1, int(os.environ.get("TIA_ENTRY_ATTEMPTS", "8")))
+#: How many payload shapes one slice may try before the slice is judged.
+PAYLOAD_ATTEMPTS = max(1, int(os.environ.get("TIA_PAYLOAD_ATTEMPTS", "3")))
 
 _INSERT_RE = re.compile(r"insert\s+into\s+`?(\w+)`?\s*\(([^)]*)\)", re.IGNORECASE)
 _SELECT_TABLE_RE = re.compile(r"\bfrom\s+`?(\w+)`?", re.IGNORECASE)
@@ -162,15 +167,58 @@ def _infer_target(source_text: str, params: list[str]) -> dict[str, Any]:
     return {"table": table, "insert_columns": columns, "params": params or []}
 
 
-def _column_value(column: str, *, payload: str, tag: str) -> str:
-    lowered = column.lower()
-    if lowered in {"comment", "msg", "message", "content", "descricao", "description", "text"}:
-        return payload
-    if lowered in {"user", "name", "author", "username", "nome"}:
-        return f"tia-{tag}"
-    if lowered in {"date", "created_at", "time", "datetime", "timestamp"}:
+def _column_value(column: str, *, payload: str, tag: str, column_type: str = "") -> str:
+    """Value for a column: real payload in strings, a legal filler elsewhere."""
+    declared = (column_type or "").lower()
+    if any(kind in declared for kind in ("int", "decimal", "float", "double", "numeric")):
+        return "1"
+    if any(kind in declared for kind in ("date", "time")):
         return _today()
-    return f"tia-{tag}"
+    return payload
+
+
+def _payload_candidates(
+    payload_base: str, tag: str, context_kind: str, limit: int
+) -> list[tuple[str, str]]:
+    """Ordered payload candidates: caller override first, then context shapes."""
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    custom = f"{payload_base}{tag}" if payload_base else ""
+    if custom:
+        out.append(("custom", custom))
+        seen.add(custom)
+    for shape in shapes_for(context_kind):
+        payload = render(shape, tag)
+        if payload in seen:
+            continue
+        out.append((shape, payload))
+        seen.add(payload)
+    return out[:limit]
+
+
+def _entry_variants(candidates: list[EntryCandidate], limit: int) -> list[EntryCandidate]:
+    """Add single-field variants: exclusive filters often accept only one key."""
+    out: list[EntryCandidate] = []
+    seen: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
+    for candidate in candidates:
+        variants = [candidate]
+        if len(candidate.values) > 1:
+            for key, value in candidate.values.items():
+                variants.append(
+                    EntryCandidate(
+                        candidate.method,
+                        {key: value},
+                        max(10, candidate.confidence - 5),
+                        {key: "single-field"},
+                    )
+                )
+        for variant in variants:
+            marker = (variant.method, tuple(sorted(variant.values.items())))
+            if marker in seen:
+                continue
+            seen.add(marker)
+            out.append(variant)
+    return out[:limit]
 
 
 async def run_trigger(
@@ -281,39 +329,58 @@ async def run_trigger(
     }
     stages.append(StageRecord("P3", True, f"Table {table} has {len(table_meta['columns'])} columns"))
 
-    # P4 Design and write payload ----------------------------------------------
+    # P4 Craft payload candidates from the sink context and write them --------
     tag = _tag()
-    payload = f"{payload_base}{tag}"
-    value_columns = columns or [c["name"] for c in table_meta["columns"] if c["name"] not in table_meta.get("primary_key", [])]
-    values = [_column_value(col, payload=payload, tag=tag) for col in value_columns]
-    sql = (
-        f"INSERT INTO `{table}` ({', '.join(f'`{c}`' for c in value_columns)}) "
-        f"VALUES ({', '.join(_sql_literal(v) for v in values)})"
-    )
-    notes.update({"tag": tag, "payload": payload, "insert_sql": sql})
+    context_hint = infer_sink_context(str(sink.get("code") or ""))
+    payloads = _payload_candidates(payload_base, tag, context_hint, PAYLOAD_ATTEMPTS)
+    notes.update({"tag": tag, "context_hint": context_hint})
+    pk_columns = list(table_meta.get("primary_key") or [])
+    value_columns = columns or [
+        c["name"] for c in table_meta["columns"] if c["name"] not in pk_columns
+    ]
+    column_length = {c["name"]: c.get("length") for c in table_meta["columns"]}
+    column_type = {c["name"]: str(c.get("type") or "") for c in table_meta["columns"]}
+    payload_column = value_columns[0] if value_columns else ""
+
     change: dict[str, Any] | None = None
     db_error: str | None = None
-    try:
-        written = await kernel.call("db_write", {"sql": sql})
-        change = written.get("change") if isinstance(written, dict) else None
-        notes["change_id"] = change["change_id"] if change else None
-    except ToolCallError as exc:
-        db_error = f"{exc.code.value}: {exc.message}"
-        notes["db_error"] = db_error
-    stages.append(
-        StageRecord("P4", db_error is None, "Write successful" if db_error is None else f"Write failed: {db_error}")
-    )
-
-    # Exploration: the entry parameters are ordered attempts, not a proof.
-    # The tag identifies the written row; the row's primary key and the tag are
-    # the strongest values, weaker candidates follow inside a small budget.
-    payload_column = value_columns[values.index(payload)] if payload in values else value_columns[-1]
-    pk_columns = list(table_meta.get("primary_key") or [])
-    candidates: list[EntryCandidate] = []
+    verify: dict[str, Any] | None = None
+    verify_attempts: list[dict[str, Any]] = []
+    payload_attempts: list[dict[str, Any]] = []
+    chosen: dict[str, Any] | None = None
     entry_request: tuple[str, dict[str, str]] | None = None
-    if db_error is None:
-        order = f" ORDER BY `{pk_columns[0]}` DESC" if pk_columns else ""
+
+    for shape, payload in payloads:
+        values = []
+        for col in value_columns:
+            value = _column_value(col, payload=payload, tag=tag, column_type=column_type.get(col, ""))
+            declared_length = column_length.get(col)
+            if value == payload and declared_length is not None and len(payload) > int(declared_length):
+                value = f"tia-{tag}"
+            values.append(value)
+        written_columns = [col for col, value in zip(value_columns, values, strict=True) if value == payload]
+        if written_columns:
+            payload_column = written_columns[0]
+        sql = (
+            f"INSERT INTO `{table}` ({', '.join(f'`{c}`' for c in value_columns)}) "
+            f"VALUES ({', '.join(_sql_literal(v) for v in values)})"
+        )
+        try:
+            written = await kernel.call("db_write", {"sql": sql})
+        except ToolCallError as exc:
+            db_error = f"{exc.code.value}: {exc.message}"
+            payload_attempts.append(
+                {"shape": shape, "payload": payload, "written": False, "error": db_error}
+            )
+            continue
+        change = written.get("change") if isinstance(written, dict) else None
+        change_id = change.get("change_id") if change else None
+        notes["change_id"] = change_id
+        notes["insert_sql"] = sql
+        payload_attempts.append({"shape": shape, "payload": payload, "written": True})
+
         row: dict[str, Any] | None = None
+        order = f" ORDER BY `{pk_columns[0]}` DESC" if pk_columns else ""
         try:
             found = await kernel.call(
                 "db_read",
@@ -336,34 +403,66 @@ async def run_trigger(
             client=LlmClient.from_env(),
             limit=ENTRY_ATTEMPTS,
         )
-        if candidates:
-            first = candidates[0]
-            entry_request = (first.method, first.values)
-            notes["read_entry_values"] = first.values
-            notes["read_entry_basis"] = first.basis
-
-    # P5 Sink read probe + verify_tag forensics --------------------------------
-    if db_error is None and read_line is not None:
-        notes["sink_read"] = await _probe_sink_read(
-            kernel, case_id, sink_file, read_line, base_url, tag, entry_request
+        variants = _entry_variants(candidates, ENTRY_ATTEMPTS)
+        planned = await plan_request(
+            client=LlmClient.from_env(),
+            goal="open this page so the row that carries the tag is selected and rendered",
+            page_url=base_url,
+            forms=[
+                PageForm(
+                    action=base_url,
+                    method=entry_plan.method.lower() or "get",
+                    fields=[
+                        FormField(name=item.name, type="numeric" if item.numeric else "text")
+                        for item in entry_plan.fields
+                    ],
+                )
+            ],
+            source_text=source_text,
+            payload=tag,
+            hint="the payload was just written; choose parameters that make the page query and render that row",
+            fallback_fields=variants[0].values if variants else {},
+            fallback_method=entry_plan.method.upper() or "GET",
         )
-    verify: dict[str, Any] | None = None
-    verify_attempts: list[dict[str, Any]] = []
-    if db_error is None:
-        for candidate in candidates[:ENTRY_ATTEMPTS]:
+        if planned is not None and planned.values:
+            plan_note = {
+                "source": planned.source,
+                "method": planned.method,
+                "values": planned.values,
+                "reason": planned.reason,
+            }
+            notes["read_request_plan"] = plan_note
+            variants = [
+                EntryCandidate(
+                    method=planned.method,
+                    values=planned.values,
+                    confidence=90 if planned.source == "llm" else 60,
+                    basis={"plan": planned.source},
+                )
+            ] + [c for c in variants if (c.method, c.values) != (planned.method, planned.values)]
+        if variants and entry_request is None:
+            entry_request = (variants[0].method, variants[0].values)
+        if read_line is not None:
+            notes["sink_read"] = await _probe_sink_read(
+                kernel, case_id, sink_file, read_line, base_url, tag, entry_request
+            )
+
+        attempt_verify: dict[str, Any] | None = None
+        for candidate in variants:
             attempt: dict[str, Any] = {
+                "shape": shape,
+                "payload": payload,
                 "method": candidate.method,
                 "values": candidate.values,
                 "confidence": candidate.confidence,
                 "basis": candidate.basis,
                 "found": False,
             }
-            verify_html: str | None = None
-            verify_content_type = "text/html"
             try:
                 if candidate.method == "GET":
                     fetched = await kernel.call(
-                        "http_request", {"method": "GET", "url": base_url, "params": candidate.values}
+                        "http_request",
+                        {"method": "GET", "url": base_url, "params": candidate.values},
                     )
                 else:
                     fetched = await kernel.call(
@@ -375,95 +474,126 @@ async def run_trigger(
                             "headers": {"Content-Type": "application/x-www-form-urlencoded"},
                         },
                     )
-                verify_html = str(fetched.get("body") or "")
-                verify_content_type = str(fetched.get("content_type") or "text/html")
                 attempt["status"] = fetched.get("status")
-            except ToolCallError as exc:
-                attempt["error"] = f"{exc.code.value}: {exc.message}"
-                verify_attempts.append(attempt)
-                continue
-            verify_args: dict[str, Any] = {"tag": tag, "payload": payload}
-            if verify_html:
-                verify_args["html"] = verify_html
-                verify_args["content_type"] = verify_content_type
-            else:
-                verify_args["url"] = base_url
-            try:
+                body = str(fetched.get("body") or "")
+                verify_args: dict[str, Any] = {"tag": tag, "payload": payload}
+                if body:
+                    verify_args["html"] = body
+                    verify_args["content_type"] = str(fetched.get("content_type") or "text/html")
+                else:
+                    verify_args["url"] = base_url
                 attempt_verify = await kernel.call("verify_tag", verify_args)
             except ToolCallError as exc:
                 attempt["error"] = f"{exc.code.value}: {exc.message}"
                 verify_attempts.append(attempt)
                 continue
             attempt["found"] = bool(attempt_verify.get("found"))
+            attempt["executable"] = bool((attempt_verify.get("best") or {}).get("executable"))
             attempt["occurrence_count"] = attempt_verify.get("occurrence_count")
             verify_attempts.append(attempt)
-            if verify is None or (attempt["found"] and not bool(verify.get("found"))):
-                verify = attempt_verify
             if attempt["found"]:
-                break
-        if not candidates:
-            try:
-                verify = await kernel.call("verify_tag", {"tag": tag, "payload": payload, "url": base_url})
-            except ToolCallError as exc:
-                notes["verify_error"] = f"{exc.code.value}: {exc.message}"
-        if verify is not None and bool((verify.get("best") or {}).get("executable")):
-            last = verify_attempts[-1] if verify_attempts else {"method": "GET", "values": {}}
-            raw_values = last.get("values")
-            exec_fields = (
-                {str(key): str(value) for key, value in raw_values.items()}
-                if isinstance(raw_values, dict)
-                else {}
-            )
+                if (
+                    verify is None
+                    or attempt["executable"]
+                    or not bool((verify.get("best") or {}).get("executable"))
+                ):
+                    verify = attempt_verify
+                entry_request = (candidate.method, candidate.values)
+                chosen = {"shape": shape, "payload": payload, "values": candidate.values,
+                          "method": candidate.method}
+                if attempt["executable"]:
+                    break
+        payload_attempts[-1]["found"] = bool(attempt_verify and attempt_verify.get("found"))
+        payload_attempts[-1]["executable"] = bool(
+            attempt_verify and (attempt_verify.get("best") or {}).get("executable")
+        )
+        if attempt_verify is not None and bool((attempt_verify.get("best") or {}).get("executable")):
+            break
+        # Not executable yet: drop this row and try the next shape.
+        if change_id:
+            with contextlib.suppress(ToolCallError):
+                await kernel.call("db_undo", {"change_id": change_id})
+            change = None
+
+    if chosen is None and verify is not None:
+        chosen = {"shape": "unknown", "payload": payloads[0][1], "values": {}, "method": "GET"}
+    notes["payload_attempts"] = payload_attempts
+    notes["payload_candidates"] = [payload for _, payload in payloads]
+    if chosen is not None:
+        notes["payload_shape"] = chosen["shape"]
+        notes["payload"] = chosen["payload"]
+        if entry_request is not None:
+            notes["read_entry_values"] = entry_request[1]
+
+    stages.append(
+        StageRecord(
+            "P4",
+            any(item.get("written") for item in payload_attempts),
+            f"shapes={[shape for shape, _ in payloads]}"
+            + (f" db_error={db_error}" if db_error else ""),
+        )
+    )
+
+    # P5 Verify the reflected payload -----------------------------------------
+    notes["entry_attempts"] = verify_attempts
+    if verify is not None:
+        notes["occurrence_count"] = verify.get("occurrence_count")
+        best = verify.get("best") or {}
+        notes["best"] = {
+            "context_kind": best.get("context_kind"),
+            "executable": best.get("executable"),
+            "reason": best.get("executable_reason"),
+            "node_path": best.get("node_path"),
+        }
+        final_payload = str((chosen or {}).get("payload") or "")
+        notes["payload_constraints"] = derive_payload_constraints(
+            verify,
+            column=payload_column,
+            column_length=column_length.get(payload_column),
+            payload=final_payload,
+        )
+        if bool(best.get("executable")) and chosen is not None:
             try:
                 confirmed = await kernel.call(
                     "verify_tag",
                     {
                         "url": base_url,
                         "tag": tag,
-                        "payload": payload,
+                        "payload": final_payload,
                         "execute": True,
-                        "execute_method": str(last.get("method") or "GET").upper(),
-                        "execute_fields": exec_fields,
+                        "execute_method": str(chosen.get("method") or "GET").upper(),
+                        "execute_fields": {
+                            str(key): str(value)
+                            for key, value in dict(chosen.get("values") or {}).items()
+                        },
                     },
                 )
                 notes["execution"] = confirmed.get("execution")
-                if isinstance(verify, dict):
-                    verify["execution"] = confirmed.get("execution")
+                verify["execution"] = confirmed.get("execution")
             except ToolCallError:
                 notes["execution"] = None
-        notes["entry_attempts"] = verify_attempts
-        if verify is not None:
-            notes["occurrence_count"] = verify.get("occurrence_count")
-            best = verify.get("best") or {}
-            notes["best"] = {
-                "context_kind": best.get("context_kind"),
-                "executable": best.get("executable"),
-                "reason": best.get("executable_reason"),
-                "node_path": best.get("node_path"),
-            }
-            column_length = None
-            for column in table_meta.get("columns") or []:
-                if column.get("name") == payload_column:
-                    column_length = column.get("length")
-            notes["payload_constraints"] = derive_payload_constraints(
-                verify,
-                column=payload_column,
-                column_length=column_length,
-                payload=payload,
+    elif db_error is None:
+        try:
+            verify = await kernel.call(
+                "verify_tag", {"tag": tag, "payload": payloads[0][1], "url": base_url}
             )
-        sink_read = notes.get("sink_read") or {}
-        stages.append(
-            StageRecord(
-                "P5",
-                verify is not None and bool(verify.get("found")),
-                f"found={bool(verify and verify.get('found'))} occurrences={notes.get('occurrence_count')}"
-                f" attempts={len(verify_attempts)}"
-                f" sink_read={sink_read.get('rows_with_tag')}/{sink_read.get('row_count')}",
-            )
-        )
+        except ToolCallError as exc:
+            notes["verify_error"] = f"{exc.code.value}: {exc.message}"
 
+    sink_read = notes.get("sink_read") or {}
+    stages.append(
+        StageRecord(
+            "P5",
+            verify is not None and bool(verify.get("found")),
+            f"found={bool(verify and verify.get('found'))} occurrences={notes.get('occurrence_count')}"
+            f" payloads={len(payload_attempts)} attempts={len(verify_attempts)}"
+            f" sink_read={sink_read.get('rows_with_tag')}/{sink_read.get('row_count')}",
+        )
+    )
+
+    wrote_any = any(bool(item.get("written")) for item in payload_attempts)
     verdict, explanation = judge_trigger(
-        verify=verify, written=change is not None, db_error=db_error
+        verify=verify, written=change is not None or wrote_any, db_error=db_error
     )
     notes["explanation"] = explanation
 
