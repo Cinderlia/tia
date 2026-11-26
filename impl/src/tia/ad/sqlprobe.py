@@ -27,6 +27,7 @@ from typing import Any
 CONFIG_NAME = "sql_query.json"
 OUTPUT_DIR_NAME = "sql"
 DEBUG_LOG_NAME = "sqlquery_debug.log"
+MAX_TARGETS = 16
 
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
@@ -90,12 +91,23 @@ class SqlProbeAdapter:
             raise ProbeConfigError("output name contains unsupported characters")
         return candidate
 
-    def arm(self, file: str, line: int, output: str) -> dict[str, Any]:
-        """Write the configuration atomically so the runtime never reads half a file."""
+    def arm(self, targets: list[tuple[str, int]], output: str) -> dict[str, Any]:
+        """Write the configuration atomically so the runtime never reads half a file.
 
-        if line <= 0:
-            raise ProbeConfigError("line must be a positive integer")
-        config = {"file": file, "line": line, "output": self.normalize_name(output)}
+        ``targets`` is a list of ``(file, line)`` pairs. The extension accepts up
+        to 16 of them and matches them in a single request.
+        """
+
+        if not targets:
+            raise ProbeConfigError("at least one target is required")
+        if len(targets) > MAX_TARGETS:
+            raise ProbeConfigError(f"at most {MAX_TARGETS} targets are supported")
+        cleaned: list[dict[str, Any]] = []
+        for file_name, line in targets:
+            if line <= 0:
+                raise ProbeConfigError("line must be a positive integer")
+            cleaned.append({"file": file_name, "line": line})
+        config = {"targets": cleaned, "output": self.normalize_name(output)}
         self.base.mkdir(parents=True, exist_ok=True)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         tmp = self.config_path.with_suffix(".json.tmp")

@@ -9,7 +9,8 @@ BUILD="${1:-php84-build}"
 TEST="${2:-php84-dev}"
 SRC="$(cd "$(dirname "$0")/.." && pwd)/probe-php/opcode-tracer"
 
-docker cp "$SRC" "$BUILD:/php-build/ext/opcode_tracer"
+docker exec "$BUILD" mkdir -p /php-build/ext/opcode_tracer
+docker cp "$SRC/." "$BUILD:/php-build/ext/opcode_tracer/"
 docker exec "$BUILD" bash -lc '
   cd /php-build/ext/opcode_tracer
   phpize >/dev/null

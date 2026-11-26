@@ -30,6 +30,7 @@ from tia.ad.opcode_trace import (
     OpcodeTraceAdapter,
     TraceConfigError,
     TraceRequest,
+    TraceTarget,
 )
 from tia.cap.policy import require_case
 from tia.cap.registry import ToolOutput
@@ -43,6 +44,20 @@ _LINE_RE = re.compile(r"^(?P<file>.*?):(?P<line>\d+) \| op=(?P<op>[A-Za-z0-9_]+)
 _PC_RE = re.compile(r" \| pc=(-?\d+)")
 _DEPTH_RE = re.compile(r" \| depth=(\d+)")
 _FUNC_RE = re.compile(r" \| func=([^|]*)")
+_TARGET_RE = re.compile(r" \| target=(-?\d+)")
+_OPERAND_RES = {
+    name: re.compile(rf" \| {name}=([^|]*)")
+    for name in ("o1", "o2", "res", "bpc", "branch")
+}
+
+
+class TraceTargetInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    file: str
+    line_from: int = 0
+    line_to: int = 0
+    function: str = ""
 
 
 class TraceRunInput(BaseModel):
@@ -50,10 +65,11 @@ class TraceRunInput(BaseModel):
 
     case_id: str
     url: str
-    file: str
+    file: str | None = None
     line_from: int = 0
     line_to: int = 0
     function: str = ""
+    targets: list[TraceTargetInput] = Field(default_factory=list)
     max_depth: int = 0
     max_lines: int = Field(default=20000, ge=1, le=MAX_TRACE_LINES)
     method: str = "GET"
@@ -83,6 +99,7 @@ class TraceEntry:
     depth: int | None
     func: str | None
     raw: str
+    target: int | None = None
 
     @property
     def signature(self) -> str:
@@ -96,6 +113,7 @@ class TraceEntry:
             "pc": self.pc,
             "depth": self.depth,
             "func": self.func,
+            "target": self.target,
             "raw": self.raw,
         }
 
@@ -149,6 +167,7 @@ def parse_trace(text: str) -> tuple[list[TraceEntry], list[str]]:
         pc = _PC_RE.search(rest)
         depth = _DEPTH_RE.search(rest)
         func = _FUNC_RE.search(rest)
+        target = _TARGET_RE.search(rest)
         entries.append(
             TraceEntry(
                 file=match.group("file"),
@@ -157,10 +176,22 @@ def parse_trace(text: str) -> tuple[list[TraceEntry], list[str]]:
                 pc=int(pc.group(1)) if pc else None,
                 depth=int(depth.group(1)) if depth else None,
                 func=func.group(1).strip() if func and func.group(1).strip() else None,
+                target=int(target.group(1)) if target else None,
                 raw=raw,
             )
         )
     return entries, markers
+
+
+def operands(entry: TraceEntry) -> dict[str, str]:
+    """Operand view of one opcode, for LLM reading only (never for diffing)."""
+
+    values: dict[str, str] = {"op": entry.op}
+    for name, pattern in _OPERAND_RES.items():
+        found = pattern.search(entry.raw)
+        if found and found.group(1).strip():
+            values[name] = found.group(1).strip()
+    return values
 
 
 def dedupe_adjacent(entries: list[TraceEntry]) -> list[TraceEntry]:
@@ -186,6 +217,11 @@ def summarize(entries: list[TraceEntry], markers: list[str]) -> dict[str, Any]:
         files[entry.file] = files.get(entry.file, 0) + 1
         if entry.func:
             functions[entry.func] = functions.get(entry.func, 0) + 1
+    by_target: dict[str, int] = {}
+    for entry in entries:
+        if entry.target is not None:
+            key = str(entry.target)
+            by_target[key] = by_target.get(key, 0) + 1
     top_ops = sorted(ops.items(), key=lambda item: (-item[1], item[0]))[:10]
     top_functions = sorted(functions.items(), key=lambda item: (-item[1], item[0]))[:10]
     return {
@@ -193,6 +229,7 @@ def summarize(entries: list[TraceEntry], markers: list[str]) -> dict[str, Any]:
         "files": files,
         "opcodes": dict(top_ops),
         "functions": dict(top_functions),
+        "by_target": by_target,
         "first": entries[0].to_dict() if entries else None,
         "last": entries[-1].to_dict() if entries else None,
         "markers": markers,
@@ -241,9 +278,37 @@ async def trace_run(arguments: dict[str, Any]) -> ToolOutput:
     if not (url.startswith("http://") or url.startswith("https://")):
         raise _bad("url must be an absolute http(s) URL")
     method = _method_name(params.method)
-    target = _target_file(params.file)
-    if params.line_from and params.line_to and params.line_from > params.line_to:
-        raise _bad("line_from must not be greater than line_to")
+    requested: list[TraceTargetInput] = list(params.targets)
+    if params.file is not None:
+        requested.append(
+            TraceTargetInput(
+                file=params.file,
+                line_from=params.line_from,
+                line_to=params.line_to,
+                function=params.function,
+            )
+        )
+    if not requested:
+        raise _bad("give at least one target", "Pass targets: [{file, line_from, line_to}]")
+    resolved: list[TraceTarget] = []
+    seen: set[tuple[str, int, int, str]] = set()
+    for item in requested:
+        if item.line_from and item.line_to and item.line_from > item.line_to:
+            raise _bad("line_from must not be greater than line_to")
+        target_file = _target_file(item.file)
+        key = (target_file, item.line_from, item.line_to, item.function)
+        if key in seen:
+            continue
+        seen.add(key)
+        resolved.append(
+            TraceTarget(
+                file=target_file,
+                line_from=item.line_from,
+                line_to=item.line_to,
+                function=item.function,
+            )
+        )
+    target = resolved[0].file
 
     adapter = OpcodeTraceAdapter()
     try:
@@ -253,11 +318,8 @@ async def trace_run(arguments: dict[str, Any]) -> ToolOutput:
     except TraceConfigError as exc:
         raise _bad(str(exc)) from exc
     request = TraceRequest(
-        file=target,
         output=canonical,
-        line_from=params.line_from,
-        line_to=params.line_to,
-        function=params.function,
+        targets=tuple(resolved),
         max_depth=params.max_depth,
         max_lines=params.max_lines,
     )
@@ -308,9 +370,9 @@ async def trace_run(arguments: dict[str, Any]) -> ToolOutput:
         trace_id=trace_id,
         case_id=params.case_id,
         file=target,
-        line_from=params.line_from,
-        line_to=params.line_to,
-        function=params.function,
+        line_from=resolved[0].line_from,
+        line_to=resolved[0].line_to,
+        function=resolved[0].function,
         method=method,
         url=url,
         output=canonical,
@@ -325,14 +387,19 @@ async def trace_run(arguments: dict[str, Any]) -> ToolOutput:
     warnings: list[str] = []
     if truncated:
         warnings.append("TRACE_TRUNCATED")
+    seen_targets = {entry.target for entry in entries if entry.target is not None}
+    if len(resolved) > 1 and len(seen_targets) < len(resolved):
+        warnings.append("TRACE_TARGET_UNMATCHED")
     if http.status >= 400:
         warnings.append(f"HTTP_STATUS_{http.status}")
     data = {
         "trace_id": trace_id,
+        "targets": [item.to_config() for item in resolved],
+        "target_count": len(resolved),
         "file": target,
-        "line_from": params.line_from,
-        "line_to": params.line_to,
-        "function": params.function,
+        "line_from": resolved[0].line_from,
+        "line_to": resolved[0].line_to,
+        "function": resolved[0].function,
         "method": method,
         "url": url,
         "status": http.status,
@@ -403,6 +470,8 @@ def diff_entries(
                 "b_count": j2 - j1,
                 "a_sample": [entry.to_dict() for entry in before[i1 : min(i2, i1 + 3)]],
                 "b_sample": [entry.to_dict() for entry in after[j1 : min(j2, j1 + 3)]],
+                "a_operands": [operands(entry) for entry in before[i1 : min(i2, i1 + 3)]],
+                "b_operands": [operands(entry) for entry in after[j1 : min(j2, j1 + 3)]],
             }
         )
     counts = {
@@ -415,6 +484,8 @@ def diff_entries(
         "regions": regions[:max_regions],
         "region_count": len(regions),
         "counts": counts,
+        "operands_note": "Operands are provided as reference for the model; "
+                         "they never affect region kinds or counts.",
     }
 
 

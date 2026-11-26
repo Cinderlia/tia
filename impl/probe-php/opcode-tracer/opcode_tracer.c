@@ -45,17 +45,23 @@
 #define TRACE_DEFAULT_MAX_LINES 200000
 #define TRACE_DEFAULT_EXCLUDE "NOP,EXT_STMT,EXT_FCALL_BEGIN,EXT_FCALL_END,EXT_NOP,TICKS"
 #define TRACE_MAX_STRING 4096
+#define TRACE_MAX_TARGETS 16
 
 typedef struct {
     char file[PATH_MAX];
     char function[256];
-    char exclude[512];
-    char output[256];
     long line_from;
     long line_to;
+} trace_target;
+
+typedef struct {
+    char function[256];
+    char exclude[512];
+    char output[256];
     long max_depth;
     long max_lines;
-    zend_bool has_file;
+    trace_target targets[TRACE_MAX_TARGETS];
+    int target_count;
 } trace_config;
 
 static FILE *trace_fp = NULL;
@@ -164,17 +170,57 @@ static void trace_config_load(trace_config *cfg)
     fclose(fp);
     buf[n] = '\0';
 
-    if (json_get_string(buf, "file", cfg->file, sizeof(cfg->file)) && cfg->file[0]) {
-        cfg->has_file = 1;
+    /* A list of targets wins; otherwise fall back to a single file/range. */
+    const char *arr = json_find_key(buf, "targets");
+    if (arr && *arr == '[') {
+        const char *p = arr + 1;
+        while (cfg->target_count < TRACE_MAX_TARGETS) {
+            const char *open = strchr(p, '{');
+            if (!open) {
+                break;
+            }
+            const char *close = strchr(open, '}');
+            if (!close) {
+                break;
+            }
+            size_t item_len = (size_t)(close - open + 1);
+            if (item_len >= TRACE_MAX_STRING) {
+                item_len = TRACE_MAX_STRING - 1;
+            }
+            char item[TRACE_MAX_STRING];
+            memcpy(item, open, item_len);
+            item[item_len] = '\0';
+            trace_target *t = &cfg->targets[cfg->target_count];
+            if (json_get_string(item, "file", t->file, sizeof(t->file)) && t->file[0]) {
+                json_get_string(item, "function", t->function, sizeof(t->function));
+                t->line_from = json_get_long(item, "line_from", 0);
+                t->line_to = json_get_long(item, "line_to", 0);
+                if (t->line_from == 0 && t->line_to == 0) {
+                    long one = json_get_long(item, "line", 0);
+                    if (one > 0) {
+                        t->line_from = one;
+                        t->line_to = one;
+                    }
+                }
+                cfg->target_count++;
+            }
+            p = close + 1;
+        }
     }
-    json_get_string(buf, "function", cfg->function, sizeof(cfg->function));
+    if (cfg->target_count == 0) {
+        trace_target *t = &cfg->targets[0];
+        if (json_get_string(buf, "file", t->file, sizeof(t->file)) && t->file[0]) {
+            json_get_string(buf, "function", t->function, sizeof(t->function));
+            t->line_from = json_get_long(buf, "line_from", 0);
+            t->line_to = json_get_long(buf, "line_to", 0);
+            cfg->target_count = 1;
+        }
+    }
     json_get_string(buf, "exclude", cfg->exclude, sizeof(cfg->exclude));
     if (!cfg->exclude[0]) {
         snprintf(cfg->exclude, sizeof(cfg->exclude), "%s", TRACE_DEFAULT_EXCLUDE);
     }
     json_get_string(buf, "output", cfg->output, sizeof(cfg->output));
-    cfg->line_from = json_get_long(buf, "line_from", 0);
-    cfg->line_to = json_get_long(buf, "line_to", 0);
     cfg->max_depth = json_get_long(buf, "max_depth", 0);
     cfg->max_lines = json_get_long(buf, "max_lines", TRACE_DEFAULT_MAX_LINES);
     if (cfg->max_lines <= 0) {
@@ -199,9 +245,8 @@ static int trace_opcode_excluded(const char *opname)
     return 0;
 }
 
-static int trace_file_matches(const char *path)
+static int trace_file_matches(const char *path, const char *want)
 {
-    const char *want = trace_cfg.file;
     if (!want[0]) {
         return 1;
     }
@@ -211,6 +256,31 @@ static int trace_file_matches(const char *path)
     size_t path_len = strlen(path);
     size_t want_len = strlen(want);
     return path_len >= want_len && strcmp(path + path_len - want_len, want) == 0;
+}
+
+/* Return the index of the first configured target matching this opcode. */
+static int trace_target_index(const char *path, long line, const char *funcname)
+{
+    int i;
+    for (i = 0; i < trace_cfg.target_count; i++) {
+        const trace_target *t = &trace_cfg.targets[i];
+        if (!trace_file_matches(path, t->file)) {
+            continue;
+        }
+        if (t->line_from > 0 && line < t->line_from) {
+            continue;
+        }
+        if (t->line_to > 0 && line > t->line_to) {
+            continue;
+        }
+        if (t->function[0]) {
+            if (!funcname || strstr(funcname, t->function) == NULL) {
+                continue;
+            }
+        }
+        return i;
+    }
+    return -1;
 }
 
 static int trace_frame_depth(zend_execute_data *execute_data)
@@ -269,24 +339,14 @@ static int opcode_tracer_handler(zend_execute_data *execute_data)
     if (realpath(filename, resolved)) {
         path_out = resolved;
     }
-    if (!trace_file_matches(path_out)) {
-        return ZEND_USER_OPCODE_DISPATCH;
-    }
     long line = (long) opline->lineno;
-    if (trace_cfg.line_from > 0 && line < trace_cfg.line_from) {
-        return ZEND_USER_OPCODE_DISPATCH;
-    }
-    if (trace_cfg.line_to > 0 && line > trace_cfg.line_to) {
-        return ZEND_USER_OPCODE_DISPATCH;
-    }
     const char *funcname = NULL;
     if (execute_data->func->common.function_name) {
         funcname = ZSTR_VAL(execute_data->func->common.function_name);
     }
-    if (trace_cfg.function[0]) {
-        if (!funcname || strstr(funcname, trace_cfg.function) == NULL) {
-            return ZEND_USER_OPCODE_DISPATCH;
-        }
+    int target_index = trace_target_index(path_out, line, funcname);
+    if (target_index < 0) {
+        return ZEND_USER_OPCODE_DISPATCH;
     }
     int depth = trace_frame_depth(execute_data);
     if (trace_cfg.max_depth > 0 && depth > trace_cfg.max_depth) {
@@ -361,7 +421,8 @@ static int opcode_tracer_handler(zend_execute_data *execute_data)
 #endif
     }
 
-    fprintf(trace_fp, "%s:%ld | op=%s | pc=%ld | depth=%d", path_out, line, opname, opidx, depth);
+    fprintf(trace_fp, "%s:%ld | op=%s | pc=%ld | depth=%d | target=%d",
+            path_out, line, opname, opidx, depth, target_index);
     if (funcname) {
         fprintf(trace_fp, " | func=%s", funcname);
     }

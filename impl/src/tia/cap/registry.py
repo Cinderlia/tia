@@ -153,6 +153,22 @@ _TRACE_RUN_SCHEMA = {
         "line_from": {"type": "integer", "minimum": 0},
         "line_to": {"type": "integer", "minimum": 0},
         "function": {"type": "string", "description": "Keep frames whose function contains it"},
+        "targets": {
+            "type": "array",
+            "maxItems": 16,
+            "description": "Trace several files or line ranges in one request",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string"},
+                    "line_from": {"type": "integer", "minimum": 0},
+                    "line_to": {"type": "integer", "minimum": 0},
+                    "function": {"type": "string"},
+                },
+                "required": ["file"],
+                "additionalProperties": False,
+            },
+        },
         "max_depth": {"type": "integer", "minimum": 0},
         "max_lines": {"type": "integer", "minimum": 1, "maximum": 200000},
         "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"]},
@@ -163,7 +179,7 @@ _TRACE_RUN_SCHEMA = {
         "max_entries": {"type": "integer", "minimum": 1, "maximum": 300},
         "dedupe": {"type": "boolean"},
     },
-    "required": ["case_id", "url", "file"],
+    "required": ["case_id", "url"],
     "additionalProperties": False,
 }
 
@@ -207,6 +223,20 @@ _PROBE_ARM_SCHEMA = {
         "case_id": {"type": "string"},
         "file": {"type": "string", "description": "Target PHP file, relative to the application root or absolute"},
         "line": {"type": "integer", "minimum": 1, "description": "Line that issues, sources or reads the query"},
+        "targets": {
+            "type": "array",
+            "maxItems": 16,
+            "description": "Several (file, line) targets captured in the same request",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string"},
+                    "line": {"type": "integer", "minimum": 1},
+                },
+                "required": ["file", "line"],
+                "additionalProperties": False,
+            },
+        },
         "output": {"type": "string", "description": "Plain .json file name; defaults to <case_id>-<line>.json"},
         "match": {
             "type": "string",
@@ -214,7 +244,7 @@ _PROBE_ARM_SCHEMA = {
             "description": "Recorded as the caller's expectation; the probe itself reports how it matched",
         },
     },
-    "required": ["case_id", "file", "line"],
+    "required": ["case_id"],
     "additionalProperties": False,
 }
 

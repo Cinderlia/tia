@@ -97,17 +97,49 @@ def _normalize_query(query: dict[str, Any]) -> dict[str, Any]:
         "execute_time_ms": int(round(float(execute_ms))),
         "observed_at": now_iso(),
     }
+    target_index = query.get("target_index")
+    if isinstance(target_index, int) and target_index >= 0:
+        observed["target_index"] = target_index
+        observed["target_file"] = str(query.get("target_file") or "")
+        observed["target_line"] = int(query.get("target_line") or 0)
     if write:
         observed["write"] = write
     return observed
+
+
+class ProbeTargetInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    file: str
+    line: int = Field(ge=1)
+
+
+def _by_target(queries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group captures by the target that matched them."""
+
+    groups: dict[int, dict[str, Any]] = {}
+    for query in queries:
+        raw = query.get("target_index")
+        key = int(raw) if isinstance(raw, int) else -1
+        group = groups.setdefault(key, {
+            "target_index": key,
+            "target_file": str(query.get("target_file") or ""),
+            "target_line": int(query.get("target_line") or 0),
+            "queries": 0,
+            "rows": 0,
+        })
+        group["queries"] += 1
+        group["rows"] += int(query.get("row_count") or 0)
+    return [groups[key] for key in sorted(groups)]
 
 
 class ProbeArmInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     case_id: str
-    file: str
-    line: int = Field(ge=1)
+    file: str | None = None
+    line: int | None = Field(default=None, ge=1)
+    targets: list[ProbeTargetInput] = Field(default_factory=list)
     output: str | None = None
     match: str = "line"
 
@@ -116,31 +148,50 @@ async def probe_arm(arguments: dict[str, Any]) -> ToolOutput:
     params = _validate(ProbeArmInput, arguments)
     rt = get_runtime()
     require_case(rt.store, params.case_id)
-    target = _target_file(params.file)
+    requested: list[ProbeTargetInput] = list(params.targets)
+    if params.file is not None or params.line is not None:
+        if params.file is None or params.line is None:
+            raise _bad("file and line must be given together")
+        requested.append(ProbeTargetInput(file=params.file, line=params.line))
+    if not requested:
+        raise _bad("give at least one target", "Pass targets: [{file, line}, ...]")
+    seen: set[tuple[str, int]] = set()
+    targets: list[tuple[str, int]] = []
+    for item in requested:
+        resolved = _target_file(item.file)
+        key = (resolved, item.line)
+        if key in seen:
+            continue
+        seen.add(key)
+        targets.append(key)
     adapter = SqlProbeAdapter()
-    output = params.output or f"{params.case_id}-{params.line}.json"
+    output = params.output or f"{params.case_id}-{targets[0][1]}.json"
     previous = adapter.read_config()
     try:
-        config = adapter.arm(target, params.line, output)
+        config = adapter.arm(targets, output)
     except ProbeConfigError as exc:
         raise _bad(str(exc), "Use a plain .json file name without path separators") from exc
     warnings: list[str] = []
     if previous is not None and previous != config:
         warnings.append("PROBE_SLOT_REUSED")
-    probe_id = f"probe-{params.case_id}-{params.line}"
-    target_obj = {"file": target, "line": params.line, "match": params.match}
+    probe_id = f"probe-{params.case_id}-{targets[0][1]}"
+    target_list = [
+        {"file": file_name, "line": line, "match": params.match}
+        for file_name, line in targets
+    ]
     rt.store.add_probe(
         params.case_id,
         probe_id=probe_id,
         mode="read",
-        target=target_obj,
+        target={"targets": target_list},
         status="armed",
         body=config,
     )
     return ToolOutput(
         data={
             "probe_id": probe_id,
-            "target": target_obj,
+            "targets": target_list,
+            "target": target_list[0],
             "output": config["output"],
             "config_path": str(adapter.config_path),
             "armed_at": now_iso(),
@@ -180,12 +231,17 @@ async def probe_run(arguments: dict[str, Any]) -> ToolOutput:
     if not output:
         raise ToolError(ErrorCode.CONFLICT, "The armed probe has no output file")
 
+    headers = dict(params.headers)
+    if params.method.upper() != "GET" and params.body and not any(
+        key.lower() == "content-type" for key in headers
+    ):
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
     result = HttpClient().fetch(
         params.method,
         params.url,
         params=params.params or None,
         body=params.body,
-        headers=params.headers,
+        headers=headers,
         max_bytes=rt.settings.profile.max_http_bytes,
     )
     if params.wait_ms:
@@ -203,22 +259,37 @@ async def probe_run(arguments: dict[str, Any]) -> ToolOutput:
         )
     queries = [_normalize_query(query) for query in snapshot.output.get("queries") or []
                if isinstance(query, dict)]
+    raw_targets = config.get("targets") or []
+    config_targets = [
+        {"file": str(item.get("file") or ""), "line": int(item.get("line") or 0)}
+        for item in raw_targets
+        if isinstance(item, dict)
+    ]
+    if not config_targets:
+        config_targets = [{"file": str(config.get("file") or ""),
+                           "line": int(config.get("line") or 0)}]
+    first_line = config_targets[0]["line"] if config_targets else 0
+
     mode = "write" if any(query.get("affected_rows") or query.get("write") for query in queries) else "read"
     warnings: list[str] = []
     if not queries:
         warnings.append("PROBE_NO_MATCH")
+    elif len(config_targets) > 1:
+        matched = {int(query["target_index"]) for query in queries
+                   if isinstance(query.get("target_index"), int)}
+        missing = [index for index in range(len(config_targets)) if index not in matched]
+        if missing:
+            warnings.append("PROBE_TARGET_UNMATCHED")
     if snapshot.debug.get("matched_queries") == "0":
         warnings.append("PROBE_NO_MATCH")
     return ToolOutput(
         data={
-            "probe_id": f"probe-{params.case_id}-{config.get('line', 0)}",
+            "probe_id": f"probe-{params.case_id}-{first_line}",
             "mode": mode,
-            "target": {
-                "file": config.get("file", ""),
-                "line": int(config.get("line", 0)),
-                "match": "line",
-            },
+            "targets": config_targets,
+            "target": config_targets[0] if config_targets else {"file": "", "line": 0},
             "hit": bool(queries),
+            "by_target": _by_target(queries),
             "queries": queries,
             "http": {
                 "status": result.status,

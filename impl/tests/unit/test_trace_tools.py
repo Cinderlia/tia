@@ -112,8 +112,10 @@ async def _run(env: dict[str, Any], **overrides: Any) -> Any:
 async def test_run_arms_directed_config_and_dedupes(env: dict[str, Any]) -> None:
     out = await _run(env)
     config = FakeHttp.configs[-1]
-    assert config["file"].endswith("home.php")
-    assert config["line_from"] == 3 and config["line_to"] == 4
+    assert len(config["targets"]) == 1
+    assert config["targets"][0]["file"].endswith("home.php")
+    assert config["targets"][0]["line_from"] == 3
+    assert config["targets"][0]["line_to"] == 4
     assert config["max_lines"] == 20000
     # two identical adjacent entries collapse into one
     assert out.data["total_lines"] == 3
@@ -224,3 +226,49 @@ def test_diff_entries_counts_shared_prefix() -> None:
     assert diff["counts"]["only_before"] == 2
     assert diff["counts"]["only_after"] == 1
     assert diff["regions"][0]["kind"] == "replace"
+
+
+async def test_run_accepts_several_targets(env: dict[str, Any]) -> None:
+    (env["app_root"] / "second.php").write_text(SOURCE, encoding="utf-8")
+    out = await trace_run(
+        {
+            "case_id": env["case_id"],
+            "url": "http://127.0.0.1/xvwa/home.php",
+            "targets": [
+                {"file": "home.php", "line_from": 3, "line_to": 4},
+                {"file": "second.php", "line_from": 1, "line_to": 9},
+            ],
+        }
+    )
+    config = FakeHttp.configs[-1]
+    assert len(config["targets"]) == 2
+    assert config["targets"][1]["file"].endswith("second.php")
+    assert out.data["target_count"] == 2
+    assert len(out.data["targets"]) == 2
+
+
+async def test_diff_reports_operands_as_reference(env: dict[str, Any]) -> None:
+    first = await _run(env)
+    FakeHttp.lines = [
+        trace_line(3, "ZEND_POST_INC", pc=1),
+        trace_line(4, "ZEND_ECHO", pc=3, func="show"),
+    ]
+    second = await _run(env, output="second.log")
+    out = await trace_diff(
+        {
+            "case_id": env["case_id"],
+            "trace_a": first.data["trace_id"],
+            "trace_b": second.data["trace_id"],
+        }
+    )
+    assert "operands" in out.data["operands_note"].lower()
+    region = out.data["regions"][0]
+    assert region["a_operands"][0]["op"].startswith("ZEND_")
+    assert region["a_operands"][0]["o1"] == "CV:x"
+    assert "a_operands" not in out.data["counts"]
+
+
+def test_parse_trace_reads_target_index() -> None:
+    text = "/app/a.php:7 | op=ZEND_ECHO | pc=1 | depth=0 | target=2 | o1=CV:x"
+    entries, _markers = parse_trace(text)
+    assert entries[0].target == 2

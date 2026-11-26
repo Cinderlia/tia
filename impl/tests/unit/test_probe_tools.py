@@ -104,8 +104,9 @@ async def _arm(env: dict[str, Any], **overrides: Any) -> Any:
 async def test_arm_writes_config_and_records_probe(env: dict[str, Any]) -> None:
     out = await _arm(env)
     config = json.loads((env["probe_base"] / "sql_query.json").read_text())
-    assert config["line"] == 2
-    assert config["file"].endswith("home.php")
+    assert len(config["targets"]) == 1
+    assert config["targets"][0]["line"] == 2
+    assert config["targets"][0]["file"].endswith("home.php")
     assert config["output"] == f"{env['case_id']}-2.json"
     assert out.data["probe_id"] == f"probe-{env['case_id']}-2"
     assert out.data["target"]["match"] == "line"
@@ -230,3 +231,43 @@ async def test_disarm_removes_config_and_output(env: dict[str, Any]) -> None:
 async def test_disarm_with_nothing_armed(env: dict[str, Any]) -> None:
     out = await probe_disarm({"case_id": env["case_id"]})
     assert out.data["disarmed"] is False
+
+
+async def test_arm_accepts_several_targets(env: dict[str, Any]) -> None:
+    out = await probe_arm(
+        {
+            "case_id": env["case_id"],
+            "targets": [
+                {"file": "home.php", "line": 2},
+                {"file": "home.php", "line": 5},
+            ],
+        }
+    )
+    config = json.loads((env["probe_base"] / "sql_query.json").read_text())
+    assert [item["line"] for item in config["targets"]] == [2, 5]
+    assert len(out.data["targets"]) == 2
+    assert out.data["probe_id"].endswith("-2")
+
+
+async def test_run_reports_by_target_and_unmatched_targets(env: dict[str, Any]) -> None:
+    await probe_arm(
+        {
+            "case_id": env["case_id"],
+            "targets": [
+                {"file": "home.php", "line": 2},
+                {"file": "home.php", "line": 5},
+            ],
+        }
+    )
+    output_dir = env["probe_base"] / "sql"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    capture = json.loads(json.dumps(CAPTURE))
+    capture["queries"][0]["target_index"] = 0
+    capture["queries"][0]["target_file"] = "/app/home.php"
+    capture["queries"][0]["target_line"] = 2
+    (output_dir / f"{env['case_id']}-2.json").write_text(json.dumps(capture), encoding="utf-8")
+    (output_dir / "sqlquery_debug.log").write_text("matched_queries=1\n", encoding="utf-8")
+    out = await probe_run({"case_id": env["case_id"], "url": "http://127.0.0.1/xvwa/home.php"})
+    assert out.data["queries"][0]["target_index"] == 0
+    assert out.data["by_target"][0]["target_line"] == 2
+    assert "PROBE_TARGET_UNMATCHED" in out.warnings

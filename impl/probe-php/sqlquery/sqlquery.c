@@ -42,14 +42,21 @@
 #define SQLQ_CONFIG_PATH "/tmp/sql_query.json"
 #define SQLQ_OUTPUT_DIR  "/tmp/sql"
 
+#define SQLQ_MAX_TARGETS 16
+
 typedef struct {
-	bool active;
 	char *file;
 	char *file_real;
-	char *output_path;
+	zend_long line;
 	char *origin_sql;
 	size_t origin_sql_len;
-	zend_long line;
+} sqlq_target;
+
+typedef struct {
+	bool active;
+	sqlq_target targets[SQLQ_MAX_TARGETS];
+	int target_count;
+	char *output_path;
 } sqlq_config;
 
 typedef struct {
@@ -58,6 +65,7 @@ typedef struct {
 
 	bool prepared_match;
 	bool selected;
+	int target_index;
 	bool executed;
 	bool is_ps;
 	bool query_stack_match;
@@ -152,26 +160,32 @@ static char *sqlq_realpath_dup(const char *path)
 	return NULL;
 }
 
-static bool sqlq_path_matches(const char *runtime_file)
+static int sqlq_path_target(const char *runtime_file)
 {
 	char *real = NULL;
-	bool matched = false;
+	int i;
+	int found = -1;
 
-	if (runtime_file == NULL) {
-		return false;
+	if (runtime_file == NULL || cfg.target_count == 0) {
+		return -1;
 	}
-	if (strcmp(runtime_file, cfg.file) == 0) {
-		return true;
-	}
-	if (cfg.file_real == NULL) {
-		return false;
+	for (i = 0; i < cfg.target_count; i++) {
+		if (cfg.targets[i].file != NULL && strcmp(runtime_file, cfg.targets[i].file) == 0) {
+			return i;
+		}
 	}
 	real = sqlq_realpath_dup(runtime_file);
-	if (real != NULL) {
-		matched = (strcmp(real, cfg.file_real) == 0);
-		efree(real);
+	if (real == NULL) {
+		return -1;
 	}
-	return matched;
+	for (i = 0; i < cfg.target_count; i++) {
+		if (cfg.targets[i].file_real != NULL && strcmp(real, cfg.targets[i].file_real) == 0) {
+			found = i;
+			break;
+		}
+	}
+	efree(real);
+	return found;
 }
 
 /* Find the immediate userland frame that caused this internal call. */
@@ -190,7 +204,7 @@ static bool sqlq_get_user_frame(const char **file, uint32_t *line)
 	return false;
 }
 
-static bool sqlq_frame_matches(void)
+static int sqlq_frame_target(void)
 {
 	zend_execute_data *ex = EG(current_execute_data);
 
@@ -201,27 +215,28 @@ static bool sqlq_frame_matches(void)
 		if (ex->func != NULL && ex->func->type == ZEND_USER_FUNCTION && ex->opline != NULL) {
 			const char *file = ZSTR_VAL(ex->func->op_array.filename);
 			uint32_t line = ex->opline->lineno;
-			if (line == (uint32_t)cfg.line && sqlq_path_matches(file)) {
-				return true;
+			int idx = sqlq_path_target(file);
+			if (idx >= 0 && line == (uint32_t)cfg.targets[idx].line) {
+				return idx;
 			}
 		}
 		ex = ex->prev_execute_data;
 	}
-	return false;
+	return -1;
 }
 
-static bool sqlq_origin_matches(const char *sql, size_t len)
+static bool sqlq_origin_matches_target(const sqlq_target *t, const char *sql, size_t len)
 {
 	size_t i = 0, j = 0;
 
-	if (cfg.origin_sql == NULL || cfg.origin_sql_len == 0) {
+	if (t->origin_sql == NULL || t->origin_sql_len == 0) {
 		return false;
 	}
-	while (i < cfg.origin_sql_len) {
-		while (i < cfg.origin_sql_len && isspace((unsigned char)cfg.origin_sql[i])) {
+	while (i < t->origin_sql_len) {
+		while (i < t->origin_sql_len && isspace((unsigned char)t->origin_sql[i])) {
 			i++;
 		}
-		if (i >= cfg.origin_sql_len) {
+		if (i >= t->origin_sql_len) {
 			break;
 		}
 		while (j < len && isspace((unsigned char)sql[j])) {
@@ -230,7 +245,7 @@ static bool sqlq_origin_matches(const char *sql, size_t len)
 		if (j >= len) {
 			return false;
 		}
-		if (tolower((unsigned char)cfg.origin_sql[i]) != tolower((unsigned char)sql[j])) {
+		if (tolower((unsigned char)t->origin_sql[i]) != tolower((unsigned char)sql[j])) {
 			return false;
 		}
 		i++;
@@ -239,30 +254,80 @@ static bool sqlq_origin_matches(const char *sql, size_t len)
 	return true;
 }
 
-static bool sqlq_query_selected(const char *sql, size_t len, bool prepared_match,
-		bool *stack_match, bool *origin_match)
+static int sqlq_origin_target(const char *sql, size_t len)
 {
-	bool sm = sqlq_frame_matches();
-	bool om = sqlq_origin_matches(sql, len);
+	int i;
 
-	if (stack_match != NULL) {
-		*stack_match = sm;
+	for (i = 0; i < cfg.target_count; i++) {
+		if (sqlq_origin_matches_target(&cfg.targets[i], sql, len)) {
+			return i;
+		}
 	}
-	if (origin_match != NULL) {
-		*origin_match = om;
-	}
-	if (cfg.origin_sql != NULL) {
-		return om;
-	}
-	return prepared_match || sm;
+	return -1;
 }
 
 static bool sqlq_prepare_site_matches(void)
 {
+	int i;
+
 	if (!sqlq_in_pdo_execute || sqlq_pdo_execute_file == NULL) {
 		return false;
 	}
-	return (sqlq_pdo_execute_line == cfg.line) && sqlq_path_matches(sqlq_pdo_execute_file);
+	for (i = 0; i < cfg.target_count; i++) {
+		if (sqlq_pdo_execute_line == cfg.targets[i].line &&
+				sqlq_path_target(sqlq_pdo_execute_file) == i) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static int sqlq_prepare_site_target(void)
+{
+	int i;
+
+	if (!sqlq_in_pdo_execute || sqlq_pdo_execute_file == NULL) {
+		return -1;
+	}
+	for (i = 0; i < cfg.target_count; i++) {
+		if (sqlq_pdo_execute_line == cfg.targets[i].line &&
+				sqlq_path_target(sqlq_pdo_execute_file) == i) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+static int sqlq_query_selected(const char *sql, size_t len, bool prepared_match,
+		bool *stack_match, bool *origin_match)
+{
+	int sm = sqlq_frame_target();
+	int om = sqlq_origin_target(sql, len);
+	int i;
+	bool has_origin = false;
+
+	for (i = 0; i < cfg.target_count; i++) {
+		if (cfg.targets[i].origin_sql != NULL) {
+			has_origin = true;
+			break;
+		}
+	}
+	if (stack_match != NULL) {
+		*stack_match = sm >= 0;
+	}
+	if (origin_match != NULL) {
+		*origin_match = om >= 0;
+	}
+	if (has_origin) {
+		return om;
+	}
+	if (prepared_match) {
+		int pt = sqlq_prepare_site_target();
+		if (pt >= 0) {
+			return pt;
+		}
+	}
+	return sm;
 }
 
 static void sqlq_ctx_free(sqlq_ctx *ctx)
@@ -308,6 +373,7 @@ static sqlq_ctx *sqlq_ctx_new(const char *sql, size_t sql_len)
 {
 	sqlq_ctx *ctx = ecalloc(1, sizeof(sqlq_ctx));
 
+	ctx->target_index = -1;
 	if (sql != NULL) {
 		ctx->sql = estrndup(sql, sql_len);
 		ctx->sql_len = sql_len;
@@ -554,7 +620,7 @@ static char *sqlq_extract_sql_literal(const char *s, size_t len, size_t *out_len
 	return NULL;
 }
 
-static void sqlq_load_origin_sql(void)
+static void sqlq_load_origin_for(sqlq_target *t)
 {
 	char *data = NULL;
 	size_t len = 0;
@@ -566,10 +632,10 @@ static void sqlq_load_origin_sql(void)
 	size_t i;
 	zend_long target, min, idx;
 
-	if (cfg.file == NULL || cfg.line <= 0) {
+	if (t->file == NULL || t->line <= 0) {
 		return;
 	}
-	if (!sqlq_read_file(cfg.file, &data, &len)) {
+	if (!sqlq_read_file(t->file, &data, &len)) {
 		return;
 	}
 	for (i = 0; i < len; i++) {
@@ -587,11 +653,11 @@ static void sqlq_load_origin_sql(void)
 			start = i + 1;
 		}
 	}
-	if ((size_t)cfg.line > line) {
+	if ((size_t)t->line > line) {
 		goto done;
 	}
 
-	target = (zend_long)cfg.line - 1;
+	target = (zend_long)t->line - 1;
 	min = target > 200 ? target - 200 : 0;
 	for (idx = target; idx >= min; idx--) {
 		size_t idx_u = (size_t)idx;
@@ -607,8 +673,8 @@ static void sqlq_load_origin_sql(void)
 		}
 		lit = sqlq_extract_sql_literal(data + lstart, lend - lstart, &lit_len);
 		if (lit != NULL) {
-			cfg.origin_sql = lit;
-			cfg.origin_sql_len = lit_len;
+			t->origin_sql = lit;
+			t->origin_sql_len = lit_len;
 			break;
 		}
 	}
@@ -623,19 +689,32 @@ done:
 	efree(data);
 }
 
+static void sqlq_load_origin_sql(void)
+{
+	int i;
+
+	for (i = 0; i < cfg.target_count; i++) {
+		sqlq_load_origin_for(&cfg.targets[i]);
+	}
+}
+
 static void sqlq_reset_config(void)
 {
-	if (cfg.file != NULL) {
-		efree(cfg.file);
-	}
-	if (cfg.file_real != NULL) {
-		efree(cfg.file_real);
+	int i;
+
+	for (i = 0; i < cfg.target_count; i++) {
+		if (cfg.targets[i].file != NULL) {
+			efree(cfg.targets[i].file);
+		}
+		if (cfg.targets[i].file_real != NULL) {
+			efree(cfg.targets[i].file_real);
+		}
+		if (cfg.targets[i].origin_sql != NULL) {
+			efree(cfg.targets[i].origin_sql);
+		}
 	}
 	if (cfg.output_path != NULL) {
 		efree(cfg.output_path);
-	}
-	if (cfg.origin_sql != NULL) {
-		efree(cfg.origin_sql);
 	}
 	memset(&cfg, 0, sizeof(cfg));
 }
@@ -647,6 +726,7 @@ static bool sqlq_load_config(void)
 	zval root;
 	zval *zfile;
 	zval *zline;
+	zval *ztargets;
 	zval *zoutput;
 	const char *output_name = "sql_result.json";
 	char *output_base = NULL;
@@ -688,6 +768,7 @@ static bool sqlq_load_config(void)
 	if (zline == NULL) {
 		zline = sqlq_array_find(&root, "line_number", sizeof("line_number") - 1);
 	}
+	ztargets = sqlq_array_find(&root, "targets", sizeof("targets") - 1);
 	zoutput = sqlq_array_find(&root, "output", sizeof("output") - 1);
 	if (zoutput == NULL) {
 		zoutput = sqlq_array_find(&root, "out", sizeof("out") - 1);
@@ -696,23 +777,69 @@ static bool sqlq_load_config(void)
 		zoutput = sqlq_array_find(&root, "output_file", sizeof("output_file") - 1);
 	}
 
-	if (zfile == NULL || Z_TYPE_P(zfile) != IS_STRING || Z_STRLEN_P(zfile) == 0) {
-		zval_ptr_dtor(&root);
-		return false;
+	if (ztargets != NULL && Z_TYPE_P(ztargets) == IS_ARRAY) {
+		zval *zitem;
+		ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(ztargets), zitem) {
+			zval *zf = NULL;
+			zval *zl = NULL;
+			sqlq_target *t;
+			zend_long line;
+			if (cfg.target_count >= SQLQ_MAX_TARGETS) {
+				break;
+			}
+			if (Z_TYPE_P(zitem) != IS_ARRAY) {
+				continue;
+			}
+			zf = sqlq_array_find(zitem, "file", sizeof("file") - 1);
+			if (zf == NULL) {
+				zf = sqlq_array_find(zitem, "path", sizeof("path") - 1);
+			}
+			if (zf == NULL) {
+				zf = sqlq_array_find(zitem, "filename", sizeof("filename") - 1);
+			}
+			zl = sqlq_array_find(zitem, "line", sizeof("line") - 1);
+			if (zl == NULL) {
+				zl = sqlq_array_find(zitem, "lineno", sizeof("lineno") - 1);
+			}
+			if (zl == NULL) {
+				zl = sqlq_array_find(zitem, "line_number", sizeof("line_number") - 1);
+			}
+			if (zf == NULL || Z_TYPE_P(zf) != IS_STRING || Z_STRLEN_P(zf) == 0) {
+				continue;
+			}
+			if (zl == NULL || (Z_TYPE_P(zl) != IS_LONG && Z_TYPE_P(zl) != IS_STRING)) {
+				continue;
+			}
+			line = zval_get_long(zl);
+			if (line <= 0) {
+				continue;
+			}
+			t = &cfg.targets[cfg.target_count++];
+			t->file = estrndup(Z_STRVAL_P(zf), Z_STRLEN_P(zf));
+			t->line = line;
+			t->file_real = sqlq_realpath_dup(t->file);
+		} ZEND_HASH_FOREACH_END();
+	} else {
+		if (zfile == NULL || Z_TYPE_P(zfile) != IS_STRING || Z_STRLEN_P(zfile) == 0) {
+			zval_ptr_dtor(&root);
+			return false;
+		}
+		if (zline == NULL || (Z_TYPE_P(zline) != IS_LONG && Z_TYPE_P(zline) != IS_STRING)) {
+			zval_ptr_dtor(&root);
+			return false;
+		}
+		if (zval_get_long(zline) > 0) {
+			sqlq_target *t = &cfg.targets[cfg.target_count++];
+			t->file = estrndup(Z_STRVAL_P(zfile), Z_STRLEN_P(zfile));
+			t->line = zval_get_long(zline);
+			t->file_real = sqlq_realpath_dup(t->file);
+		}
 	}
-	if (zline == NULL || (Z_TYPE_P(zline) != IS_LONG && Z_TYPE_P(zline) != IS_STRING)) {
-		zval_ptr_dtor(&root);
-		return false;
-	}
-
-	cfg.file = estrndup(Z_STRVAL_P(zfile), Z_STRLEN_P(zfile));
-	cfg.line = zval_get_long(zline);
-	if (cfg.line <= 0) {
+	if (cfg.target_count == 0) {
 		sqlq_reset_config();
 		zval_ptr_dtor(&root);
 		return false;
 	}
-	cfg.file_real = sqlq_realpath_dup(cfg.file);
 
 	if (zoutput != NULL && Z_TYPE_P(zoutput) == IS_STRING && Z_STRLEN_P(zoutput) > 0) {
 		output_name = Z_STRVAL_P(zoutput);
@@ -1398,6 +1525,12 @@ static void sqlq_add_ctx_to_queries(zval *queries, sqlq_ctx *ctx, uint32_t call_
 	add_assoc_long(&q, "call_index", (zend_long)call_index);
 	add_assoc_stringl(&q, "sql", ctx->sql != NULL ? ctx->sql : "", ctx->sql_len);
 	add_assoc_string(&q, "kind", ctx->is_ps ? "prepared" : "query");
+	if (ctx->target_index >= 0 && ctx->target_index < cfg.target_count) {
+		add_assoc_long(&q, "target_index", ctx->target_index);
+		add_assoc_string(&q, "target_file",
+			cfg.targets[ctx->target_index].file != NULL ? cfg.targets[ctx->target_index].file : "");
+		add_assoc_long(&q, "target_line", cfg.targets[ctx->target_index].line);
+	}
 	add_assoc_bool(&q, "matched_at_prepare", ctx->prepared_match);
 	add_assoc_bool(&q, "matched_at_origin", ctx->matched_at_origin);
 	add_assoc_bool(&q, "matched_at_fetch", ctx->matched_at_fetch);
@@ -1461,8 +1594,24 @@ static uint32_t sqlq_flush_output(void)
 		return 0;
 	}
 
-	add_assoc_string(&root, "target_file", cfg.file != NULL ? cfg.file : "");
-	add_assoc_long(&root, "target_line", cfg.line);
+	{
+		zval targets;
+		int ti;
+		array_init(&targets);
+		for (ti = 0; ti < cfg.target_count; ti++) {
+			zval t;
+			array_init(&t);
+			add_assoc_string(&t, "file",
+				cfg.targets[ti].file != NULL ? cfg.targets[ti].file : "");
+			add_assoc_long(&t, "line", cfg.targets[ti].line);
+			add_next_index_zval(&targets, &t);
+		}
+		add_assoc_long(&root, "target_count", cfg.target_count);
+		add_assoc_zval(&root, "targets", &targets);
+	}
+	add_assoc_string(&root, "target_file",
+		cfg.target_count > 0 && cfg.targets[0].file != NULL ? cfg.targets[0].file : "");
+	add_assoc_long(&root, "target_line", cfg.target_count > 0 ? cfg.targets[0].line : 0);
 	add_assoc_long(&root, "query_count", (zend_long)count);
 	add_assoc_zval(&root, "queries", &queries);
 
@@ -1495,8 +1644,15 @@ static void sqlq_write_debug(uint32_t matched)
 	if (fp == NULL) {
 		return;
 	}
-	fprintf(fp, "target_file=%s\n", cfg.file != NULL ? cfg.file : "");
-	fprintf(fp, "target_line=%ld\n", (long)cfg.line);
+	fprintf(fp, "target_count=%d\n", cfg.target_count);
+	{
+		int ti;
+		for (ti = 0; ti < cfg.target_count; ti++) {
+			fprintf(fp, "target[%d]=%s:%ld\n", ti,
+				cfg.targets[ti].file != NULL ? cfg.targets[ti].file : "",
+				(long)cfg.targets[ti].line);
+		}
+	}
 	fprintf(fp, "output=%s\n", cfg.output_path);
 	fprintf(fp, "matched_queries=%u\n", matched);
 	if (matched == 0) {
@@ -1508,9 +1664,9 @@ static void sqlq_write_debug(uint32_t matched)
 				continue;
 			}
 			i++;
-			fprintf(fp, "[%u] kind=%s rows=%llu", i,
+			fprintf(fp, "[%u] kind=%s rows=%llu target=%d", i,
 				ctx->is_ps ? "prepared" : "query",
-				(unsigned long long)ctx->row_count);
+				(unsigned long long)ctx->row_count, ctx->target_index);
 			if (ctx->has_affected_rows) {
 				fprintf(fp, " affected_rows=%lld", (long long)ctx->affected_rows);
 			}
@@ -1547,7 +1703,7 @@ static enum_func_status sqlq_stmt_prepare(MYSQLND_STMT *const s, const char *con
 	state = ecalloc(1, sizeof(sqlq_ps_state));
 	state->sql = estrndup(query, query_len);
 	state->sql_len = query_len;
-	state->prepared_match = sqlq_frame_matches();
+	state->prepared_match = sqlq_frame_target() >= 0;
 	zend_hash_index_update_ptr(&sqlq_ps_states, key, state);
 
 	return ret;
@@ -1562,6 +1718,7 @@ static enum_func_status sqlq_stmt_execute(MYSQLND_STMT *const s)
 	zend_hrtime_t start;
 	bool prepared_match;
 	bool selected;
+	int target_idx;
 	bool stack_match = false;
 	bool origin_match = false;
 	const char *sql_text;
@@ -1589,13 +1746,15 @@ static enum_func_status sqlq_stmt_execute(MYSQLND_STMT *const s)
 	prepared_match = state != NULL ? state->prepared_match : false;
 	sql_text = state != NULL ? state->sql : "";
 	sql_text_len = state != NULL ? state->sql_len : 0;
-	selected = sqlq_query_selected(sql_text, sql_text_len, prepared_match,
+	target_idx = sqlq_query_selected(sql_text, sql_text_len, prepared_match,
 		&stack_match, &origin_match);
+	selected = target_idx >= 0;
 
 	ctx = sqlq_ctx_new(sql_text, sql_text_len);
 	ctx->is_ps = true;
 	ctx->prepared_match = prepared_match;
 	ctx->selected = selected;
+	ctx->target_index = target_idx;
 	ctx->query_stack_match = stack_match;
 	ctx->matched_at_origin = origin_match;
 	ctx->executed = true;
@@ -1620,9 +1779,9 @@ static enum_func_status sqlq_stmt_execute(MYSQLND_STMT *const s)
 static enum_func_status sqlq_conn_query(MYSQLND_CONN_DATA *conn, const char *const query, const size_t query_len)
 {
 	enum_func_status ret;
-	bool matched_by_frame;
 	bool matched_by_prepare;
 	bool selected;
+	int target_idx;
 	bool stack_match = false;
 	bool origin_match = false;
 	zend_hrtime_t start;
@@ -1634,10 +1793,10 @@ static enum_func_status sqlq_conn_query(MYSQLND_CONN_DATA *conn, const char *con
 	}
 
 	key = (zend_ulong)(uintptr_t)conn;
-	matched_by_frame = sqlq_frame_matches();
-	matched_by_prepare = !matched_by_frame && sqlq_prepare_site_matches();
-	selected = sqlq_query_selected(query, query_len, matched_by_prepare,
+	matched_by_prepare = sqlq_prepare_site_matches();
+	target_idx = sqlq_query_selected(query, query_len, matched_by_prepare,
 		&stack_match, &origin_match);
+	selected = target_idx >= 0;
 
 	start = zend_hrtime();
 	ret = sqlq_orig_conn_methods.query(conn, query, query_len);
@@ -1652,6 +1811,7 @@ static enum_func_status sqlq_conn_query(MYSQLND_CONN_DATA *conn, const char *con
 	ctx->is_ps = false;
 	ctx->prepared_match = matched_by_prepare;
 	ctx->selected = selected;
+	ctx->target_index = target_idx;
 	ctx->query_stack_match = stack_match;
 	ctx->matched_at_origin = origin_match;
 	ctx->executed = true;
@@ -1694,9 +1854,13 @@ static enum_func_status sqlq_res_fetch_row(MYSQLND_RES *result, zval **row_ptr,
 			ctx = NULL;
 		}
 		if (ctx != NULL) {
-			if (!ctx->selected && !ctx->query_stack_match && sqlq_frame_matches()) {
-				ctx->selected = true;
-				ctx->matched_at_fetch = true;
+			if (!ctx->selected && !ctx->query_stack_match) {
+				int fidx = sqlq_frame_target();
+				if (fidx >= 0) {
+					ctx->selected = true;
+					ctx->matched_at_fetch = true;
+					ctx->target_index = fidx;
+				}
 			}
 			if (ctx->selected) {
 				start = zend_hrtime();

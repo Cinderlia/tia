@@ -23,15 +23,21 @@ with `TRACE_QUERY_CONFIG`, the output directory with `TRACE_OUTPUT_DIR`):
 
 ```json
 {
-  "file": "/var/www/html/app/home.php",
-  "line_from": 40,
-  "line_to": 70,
-  "function": "",
+  "targets": [
+    {"file": "/var/www/html/app/home.php", "line_from": 40, "line_to": 70},
+    {"file": "/var/www/html/app/orders.php", "line_from": 1, "line_to": 120}
+  ],
   "max_depth": 0,
   "max_lines": 20000,
   "output": "trace-1.log"
 }
 ```
+
+Up to 16 `targets` can be traced in one request. Each target has its own
+`file`, optional `line_from`/`line_to` and optional `function`; the global
+`max_depth`, `max_lines` and `exclude` apply to all of them. The single-object
+form (`"file": ..., "line_from": ...`) still works and is treated as one
+target.
 
 The config is read on every request, so one request produces one trace file
 under the output directory. The file is truncated when the request starts and
@@ -47,5 +53,7 @@ the EXT_* bookkeeping opcodes); `output` must be a plain file name.
 Each line looks like:
 
 ```
-/var/www/html/app/home.php:55 | op=SEND_VAR | pc=118 | depth=0 | func= | o1=CV:comment
+/var/www/html/app/home.php:55 | op=SEND_VAR | pc=118 | depth=0 | target=0 | func= | o1=CV:comment
 ```
+
+`target` is the index of the configured target that matched the line.

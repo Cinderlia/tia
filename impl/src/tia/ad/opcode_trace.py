@@ -26,24 +26,38 @@ DEFAULT_MAX_LINES = 20000
 
 
 @dataclass(frozen=True)
-class TraceRequest:
-    """Directed trace parameters, one request per arm."""
+class TraceTarget:
+    """One directed region: a file plus an optional line range and function."""
 
     file: str
-    output: str
     line_from: int = 0
     line_to: int = 0
     function: str = ""
+
+    def to_config(self) -> dict[str, Any]:
+        item: dict[str, Any] = {"file": self.file}
+        if self.line_from:
+            item["line_from"] = self.line_from
+        if self.line_to:
+            item["line_to"] = self.line_to
+        if self.function:
+            item["function"] = self.function
+        return item
+
+
+@dataclass(frozen=True)
+class TraceRequest:
+    """Directed trace parameters, one request per arm."""
+
+    output: str
+    targets: tuple[TraceTarget, ...] = ()
     max_depth: int = 0
     max_lines: int = DEFAULT_MAX_LINES
     exclude: str = ""
 
     def to_config(self) -> dict[str, Any]:
         config: dict[str, Any] = {
-            "file": self.file,
-            "line_from": self.line_from,
-            "line_to": self.line_to,
-            "function": self.function,
+            "targets": [target.to_config() for target in self.targets],
             "max_depth": self.max_depth,
             "max_lines": self.max_lines,
             "output": self.output,

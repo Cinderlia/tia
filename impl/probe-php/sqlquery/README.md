@@ -35,16 +35,45 @@ Accepted field aliases:
 Only the file-name part of `output` is used; every capture lands in `/tmp/sql/`.
 A missing `.json` suffix is appended automatically.
 
+### Several targets in one request
+
+A single configuration can observe up to 16 `(file, line)` targets, and one
+request matches all of them:
+
+```json
+{
+  "targets": [
+    {"file": "/app/shop/cart.php", "line": 48},
+    {"file": "/app/shop/cart.php", "line": 55},
+    {"file": "/app/shop/orders.php", "line": 91}
+  ],
+  "output": "cart.json"
+}
+```
+
+Each record carries `target_index`, `target_file` and `target_line`; the
+top-level object repeats the configured list under `targets` and keeps the
+first target in `target_file` / `target_line` for compatibility.
+
+The single `file` + `line` form above remains supported and is treated as a
+one-element target list.
+
 ## Output format
 
 ```json
 {
+  "target_count": 2,
+  "targets": [
+    {"file": "...", "line": 48},
+    {"file": "...", "line": 56}
+  ],
   "target_file": "...",
-  "target_line": 56,
+  "target_line": 48,
   "query_count": 2,
   "queries": [
     {
       "call_index": 1,
+      "target_index": 0,
       "sql": "select user,comment,date from comments",
       "kind": "query",
       "matched_at_prepare": false,
