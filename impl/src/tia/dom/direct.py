@@ -19,11 +19,12 @@ import string
 from typing import Any
 from urllib.parse import urlencode
 
+from tia.ad.llm import LlmClient
+from tia.cap.delivery import DeliveryAttempt, deliver
 from tia.cap.domscan import parse
 from tia.cap.entry import (
     EntryPlan,
     derive_payload_constraints,
-    entry_candidates,
     infer_entry,
 )
 from tia.cap.forms import (
@@ -33,13 +34,12 @@ from tia.cap.forms import (
     forms_from_formparse,
     merge_forms,
 )
-from tia.cap.payloads import render, shapes_for
 from tia.dom.trigger import _POST_VAR_RE, StageRecord, TriggerResult, normalize_slice
 from tia.inf.reports import write_case_report
 from tia.inf.runtime import get_runtime
 from tia.orch.judge import judge_direct
 from tia.orch.kernel import Kernel, LocalToolClient, ToolCallError, ToolClient
-from tia.orch.learning import hints_for, order_shapes, record_case
+from tia.orch.learning import hints_for, record_case
 
 
 def _attempts() -> int:
@@ -147,56 +147,87 @@ async def run_direct(
     }
     stages.append(StageRecord("D3", True, f"maxlength={maxlength} allowed={allowed}"))
 
-    # D4 Bounded exploration, trigger-style: a tag probe learns the context,
-    # then shapes for that context are tried. Entry candidates from
-    # ``entry_candidates`` rank how to fill the other fields.
+    # D4 The model plans the request from the page itself; delivery sends it and
+    # turns a failed response into the observation for the next round. No local
+    # payload shape list and no local field whitelist: both are the model's job.
     tag = _tag()
-    candidates = await entry_candidates(
-        plan,
-        tag=tag,
-        row={},
-        pk_columns=[],
-        context=text,
-        client=None,
-        limit=2,
-    )
-    notes["entry_candidates"] = [
-        {"method": item.method, "values": item.values, "confidence": item.confidence, "basis": item.basis}
-        for item in candidates
-    ]
     hints = hints_for(get_runtime().store, raw)
     notes["learning"] = hints
-    attempts: list[dict[str, Any]] = []
-    budget_left = _attempts()
-    for candidate in [*candidates, None]:
-        if budget_left <= 0:
-            break
-        probe_tag = _tag()
-        probe = await _deliver_and_verify(
-            kernel, form, param, render("tag", probe_tag), candidate, probe_tag
+    constraints = f"max payload length {allowed} characters" if allowed else ""
+
+    async def _send(method: str, values: dict[str, str], files: dict[str, str]) -> dict[str, Any]:
+        request: dict[str, Any] = {"method": method, "url": form.action}
+        if method == "POST":
+            request["body"] = urlencode(values)
+            request["headers"] = {"Content-Type": form.enctype}
+        else:
+            request["params"] = values
+        if files:
+            request["files"] = files
+        result = await kernel.call("http_request", request)
+        return {
+            "status": result.get("status"),
+            "body": str(result.get("body") or ""),
+            "content_type": str(result.get("content_type") or "text/html"),
+            "probe_hit": False,
+        }
+
+    async def _accept(attempt: DeliveryAttempt, page: dict[str, Any]) -> bool:
+        verify = await kernel.call(
+            "verify_tag",
+            {
+                "html": attempt.html,
+                "content_type": attempt.content_type or "text/html",
+                "tag": tag,
+                "payload": attempt.payload,
+            },
         )
-        budget_left -= 1
-        attempts.append(probe)
-        if probe.get("executable"):
-            break
-        context_kind = str(probe.get("context_kind") or "")
-        for shape in order_shapes(shapes_for(context_kind), hints):
-            if budget_left <= 0:
-                break
-            tag = _tag()
-            payload = render(shape, tag)
-            if allowed and len(payload) > allowed:
-                payload = render("tag", tag)
-                shape = "tag"
-            attempt = await _deliver_and_verify(kernel, form, param, payload, candidate, tag, shape)
-            budget_left -= 1
-            attempts.append(attempt)
-            if attempt.get("executable"):
-                break
-        if any(item.get("executable") for item in attempts):
-            break
+        attempt.extra = {"verify": verify, "shape": _shape_of(attempt.payload, tag)}
+        return bool(verify.get("found") and (verify.get("best") or {}).get("executable"))
+
+    delivery = await deliver(
+        client=LlmClient.from_env(),
+        goal=(
+            "submit the form so this page echoes the tag into the sink named above; "
+            "the payload must be HTML/JavaScript for a reflected XSS sink (not SQL), "
+            "contain the tag verbatim and land in an executable context"
+        ),
+        page_url=form.action,
+        forms=[form],
+        html=body,
+        source_text=text,
+        tag=tag,
+        sink=f"{file}:{line}\n{sink_code}",
+        payload=tag,
+        hint=_HINT,
+        constraints=constraints,
+        fallback_fields={item.name: item.value for item in form.fields},
+        fallback_method=form.method.upper(),
+        max_rounds=_attempts(),
+        send=_send,
+        accept=_accept,
+    )
+    notes["delivery"] = {
+        "plan": delivery.plan.to_dict() if delivery.plan is not None else None,
+        "attempts": [item.to_dict() for item in delivery.attempts],
+    }
+    attempts = [
+        {
+            "shape": item.extra.get("shape"),
+            "payload": item.payload,
+            "delivered": not item.error,
+            "status": item.status,
+            "found": bool((item.extra.get("verify") or {}).get("found")),
+            "executable": bool(((item.extra.get("verify") or {}).get("best") or {}).get("executable")),
+            "context_kind": ((item.extra.get("verify") or {}).get("best") or {}).get("context_kind"),
+            "verify": item.extra.get("verify"),
+            "warnings": item.warnings,
+            "error": item.error,
+        }
+        for item in delivery.attempts
+    ]
     notes["attempts"] = attempts
-    stages.append(StageRecord("D4", True, f"attempts={len(attempts)} budget_left={budget_left}"))
+    stages.append(StageRecord("D4", True, f"attempts={len(attempts)}"))
 
     verdict, explanation = judge_direct(attempts)
     notes["explanation"] = explanation
@@ -217,6 +248,26 @@ async def run_direct(
             "maxlength": maxlength,
         }
     return await _finish(kernel, case_id, verdict, stages, notes)
+
+
+_HINT = (
+    "use the form fields the page shows and any extra field the source expects; "
+    "put an HTML/JavaScript (XSS) payload containing the tag in the parameter that "
+    "reaches the sink; never a SQL statement"
+)
+
+
+def _shape_of(payload: str, tag: str) -> str:
+    lowered = payload.lower()
+    if "onerror" in lowered:
+        return "img_onerror"
+    if "<script" in lowered:
+        return "script_tag"
+    if "on" in lowered and "=" in lowered:
+        return "attr_event"
+    if payload == tag:
+        return "tag"
+    return "custom"
 
 
 async def _deliver_and_verify(

@@ -73,6 +73,7 @@ def _prompt(
     constraints: str = "",
     html: str = "",
     tag: str = "",
+    sink: str = "",
 ) -> str:
     shape = []
     for index, item in enumerate(forms):
@@ -102,6 +103,7 @@ def _prompt(
         f"PAGE: {page_url}\n"
         f"HINT: {hint}\n"
         f"STORAGE COLUMNS: {constraints[:1200]}\n"
+        f"SLICE SINK (build the payload for THIS context, not for any SQL nearby): {sink[:1500]}\n"
         f"LAST ATTEMPT OBSERVATION: {observation[:800]}\n"
         f"TAG: {tag}\n"
         f"PAYLOAD SEED: {payload!r}\n"
@@ -149,6 +151,7 @@ async def plan_request(
     constraints: str = "",
     html: str = "",
     tag: str = "",
+    sink: str = "",
     fallback_fields: dict[str, str] | None = None,
     fallback_method: str = "POST",
 ) -> PlannedRequest | None:

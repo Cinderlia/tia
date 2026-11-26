@@ -342,6 +342,46 @@ async def run_trigger(
     column_type = {c["name"]: str(c.get("type") or "") for c in table_meta["columns"]}
     payload_column = value_columns[0] if value_columns else ""
 
+    # The model picks the storage column and shapes the payload for the sink
+    # context; the local candidate list stays only as a fallback when no model
+    # is configured. The write itself still happens through ``db_write``.
+    selection = await plan_request(
+        client=LlmClient.from_env(),
+        goal=(
+            "choose which column stores the payload so it is later rendered at the "
+            "sink, and construct a stored XSS payload (HTML/JavaScript, never SQL) "
+            "that executes there; the tag must survive verbatim"
+        ),
+        page_url=base_url,
+        forms=[
+            PageForm(
+                action=base_url,
+                method="post",
+                fields=[FormField(name=name) for name in value_columns],
+            )
+        ],
+        source_text=source_text,
+        payload=payloads[0][1] if payloads else f"{payload_base}{tag}",
+        hint=(
+            "pick one storage column; the read page echoes it without encoding. "
+            "The payload is HTML/JavaScript for an XSS sink, not a SQL statement."
+        ),
+        constraints=", ".join(
+            f"{name}: {column_type.get(name, '')} len={column_length.get(name)}"
+            for name in value_columns
+        ),
+        tag=tag,
+        sink=f"{sink.get('file')}:{sink.get('line')}\n{sink.get('code')}",
+        fallback_fields={name: f"tia-{tag}" for name in value_columns},
+    )
+    if selection is not None:
+        notes["payload_plan"] = selection.to_dict()
+        if selection.payload and tag in selection.payload:
+            payloads = [(f"model:{selection.source}", selection.payload), *payloads]
+        if selection.column and selection.column in value_columns:
+            payload_column = selection.column
+            notes["column_chosen_by"] = "llm"
+
     change: dict[str, Any] | None = None
     db_error: str | None = None
     verify: dict[str, Any] | None = None

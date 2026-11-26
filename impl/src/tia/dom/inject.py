@@ -17,6 +17,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 from tia.ad.llm import LlmClient
+from tia.cap.delivery import DeliveryAttempt, deliver
 from tia.cap.domscan import Document, parse
 from tia.cap.entry import (
     EntryPlan,
@@ -398,8 +399,6 @@ async def run_inject(
                 parts.append("the case tag does not appear in the response")
         return "; ".join(parts)
 
-    uploads: dict[str, str] = {}
-    values: dict[str, str] = fallback
     observation = ""
     submitted: dict[str, Any] = {}
     armed = False
@@ -408,130 +407,118 @@ async def run_inject(
         arm_targets.append({"file": sink_file, "line": insert_line})
     if read_file and read_line and (read_file, read_line) != (sink_file, insert_line):
         arm_targets.append({"file": read_file, "line": read_line})
-    for attempt_index in range(WRITE_ATTEMPTS):
-        if attempt_index == 0 and arm_targets:
-            try:
-                await call(
-                    "probe_arm",
-                    {
-                        "case_id": result.case_id,
-                        "targets": arm_targets,
-                        "output": f"inject-{tag}.json",
-                    },
-                )
-                armed = True
-            except ToolCallError as exc:
-                notes["probe_error"] = str(
-                    exc.envelope.error.message if exc.envelope.error else exc
-                )
-        request_plan = await plan_request(
-            client=LlmClient.from_env(),
-            goal=(
-                "submit this form so the application inserts the payload into "
-                f"{target['table']}.{chosen_column} via the code at line {target.get('line')}"
-            ),
-            page_url=base_url,
-            forms=plan_forms,
-            source_text=text,
-            payload=payload,
-            hint=f"payload must be written through parameter {field_name}",
-            constraints=", ".join(f"{name}: {kind}" for name, kind in column_limits.items()),
-            observation=observation,
-            fallback_fields=fallback,
-        )
-        if request_plan is not None and request_plan.source == "rejected":
-            notes["request_plan_rejection"] = request_plan.rejection
-            stage("I4", False, f"plan rejected: {request_plan.rejection[:200]}")
-            observation = f"local validator rejected the plan: {request_plan.rejection}"
-            request_plan = None
-        if request_plan is not None:
-            notes["request_plan"] = request_plan.to_dict()
-            if request_plan.warnings:
-                notes["request_plan_warnings"] = request_plan.warnings
-            if request_plan.url and request_plan.url != base_url:
-                for candidate_form in forms:
-                    if candidate_form.action == request_plan.url:
-                        form = candidate_form
-                        break
-            if request_plan.payload:
-                payload = request_plan.payload
-                notes["payload"] = payload
-            if request_plan.column and request_plan.column in widths:
-                width = widths.get(request_plan.column)
-                if width is None or len(payload) <= int(width):
-                    chosen_column = request_plan.column
-                    target["column"] = chosen_column
-                    notes["column_chosen_by"] = "llm"
-                else:
-                    notes["column_rejected"] = (
-                        f"{request_plan.column} holds {width} chars, payload needs {len(payload)}"
-                    )
-            values = dict(request_plan.values)
-            if request_plan.payload_field:
-                values[request_plan.payload_field] = payload
-            if request_plan.files:
-                uploads = dict(request_plan.files)
-            elif form.files:
-                uploads = {name: f"tia-{tag}.png" for name in form.files}
-            notes["entry"] = {
-                "url": request_plan.url or form.action,
-                "method": request_plan.method.lower(),
-                "field": request_plan.payload_field or field_name,
-                "fields": dict(form.fields),
-                "planned_by": request_plan.source,
-            }
-        else:
-            values = fallback
-            uploads = {name: f"tia-{tag}.png" for name in form.files}
+    async def _send(method: str, values: dict[str, str], files: dict[str, str]) -> dict[str, Any]:
         body = urlencode(values)
-        try:
-            if armed:
-                submitted = await call(
-                    "probe_run",
-                    {
-                        "case_id": result.case_id,
-                        "url": form.action,
-                        "method": "POST",
-                        "body": body,
-                        "headers": {"Content-Type": "application/x-www-form-urlencoded"},
-                        "capture_html": True,
-                        "files": uploads,
-                    },
-                )
-            else:
-                submitted = await call(
-                    "http_request",
-                    {
-                        "method": "POST",
-                        "url": form.action,
-                        "body": body,
-                        "headers": {"Content-Type": "application/x-www-form-urlencoded"},
-                        "files": uploads,
-                    },
-                )
-        except ToolCallError as exc:
-            observation = str(exc.envelope.error.message if exc.envelope.error else exc)
-            notes.setdefault("write_attempts", []).append(
-                {"values": values, "upload": bool(uploads), "error": observation}
+        if armed:
+            page = await call(
+                "probe_run",
+                {
+                    "case_id": result.case_id,
+                    "url": form.action,
+                    "method": method,
+                    "body": body,
+                    "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+                    "capture_html": True,
+                    "files": files,
+                },
             )
-            continue
-        status = submitted.get("http", {}).get("status") if armed else submitted.get("status")
-        queries = submitted.get("queries") or []
-        probe_hit = any(int(query.get("affected_rows") or 0) > 0 for query in queries)
-        page_html = str((submitted.get("http") or {}).get("html") or "")
-        notes.setdefault("write_attempts", []).append(
-            {
-                "values": values,
-                "upload": bool(uploads),
-                "status": status,
-                "probe_hit": probe_hit,
+            http = page.get("http") or {}
+            queries = page.get("queries") or []
+            hit = any(int(query.get("affected_rows") or 0) > 0 for query in queries)
+            return {
+                "status": http.get("status"),
+                "body": str(http.get("html") or ""),
+                "content_type": str(http.get("content_type") or "text/html"),
+                "probe_hit": hit,
+                "raw": page,
             }
+        page = await call(
+            "http_request",
+            {
+                "method": method,
+                "url": form.action,
+                "body": body,
+                "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+                "files": files,
+            },
         )
-        if int(status or 0) < 400 and (not armed or probe_hit):
-            break
-        observation = _diagnose(page_html, status, probe_hit)
-        stage("I5", False, f"POST {form.action} → {status}; retrying with feedback")
-    else:
+        return {
+            "status": page.get("status"),
+            "body": str(page.get("body") or ""),
+            "content_type": str(page.get("content_type") or "text/html"),
+            "probe_hit": False,
+            "raw": page,
+        }
+
+    async def _accept(attempt: DeliveryAttempt, page: dict[str, Any]) -> bool:
+        attempt.extra["raw"] = page.get("raw") or {}
+        status = int(attempt.status or 0)
+        return status < 400 and (not armed or attempt.probe_hit)
+
+    if arm_targets:
+        try:
+            await call(
+                "probe_arm",
+                {
+                    "case_id": result.case_id,
+                    "targets": arm_targets,
+                    "output": f"inject-{tag}.json",
+                },
+            )
+            armed = True
+        except ToolCallError as exc:
+            notes["probe_error"] = str(exc.envelope.error.message if exc.envelope.error else exc)
+    delivery = await deliver(
+        client=LlmClient.from_env(),
+        goal=(
+            "submit this form so the application inserts the payload into "
+            f"{target['table']}.{chosen_column} via the code at line {target.get('line')}"
+        ),
+        page_url=base_url,
+        forms=plan_forms,
+        html=str(notes.get("page_html") or ""),
+        source_text=text,
+        tag=tag,
+        payload=payload,
+        hint=f"payload must be written through parameter {field_name}",
+        constraints=", ".join(f"{name}: {kind}" for name, kind in column_limits.items()),
+        fallback_fields=fallback,
+        max_rounds=WRITE_ATTEMPTS,
+        send=_send,
+        accept=_accept,
+    )
+    notes["write_attempts"] = [item.to_dict() for item in delivery.attempts]
+    if delivery.plan is not None:
+        notes["request_plan"] = delivery.plan.to_dict()
+        if delivery.plan.warnings:
+            notes["request_plan_warnings"] = delivery.plan.warnings
+        if delivery.plan.payload:
+            payload = delivery.plan.payload
+            notes["payload"] = payload
+        if delivery.plan.column and delivery.plan.column in widths:
+            width = widths.get(delivery.plan.column)
+            if width is None or len(payload) <= int(width):
+                chosen_column = delivery.plan.column
+                target["column"] = chosen_column
+                notes["column_chosen_by"] = "llm"
+            else:
+                notes["column_rejected"] = (
+                    f"{delivery.plan.column} holds {width} chars, payload needs {len(payload)}"
+                )
+        notes["entry"] = {
+            "url": delivery.plan.url or form.action,
+            "method": delivery.plan.method.lower(),
+            "field": delivery.plan.payload_field or field_name,
+            "fields": dict(form.fields),
+            "planned_by": delivery.plan.source,
+        }
+    accepted = delivery.last is not None and int(delivery.last.status or 0) < 400 and (
+        not armed or delivery.last.probe_hit
+    )
+    submitted = dict((delivery.last.extra.get("raw") if delivery.last else {}) or {})
+    if delivery.last is not None and not submitted:
+        submitted = {"http": {"status": delivery.last.status, "html": delivery.last.html}}
+    if not accepted:
         if armed:
             with contextlib.suppress(ToolCallError):
                 await call("probe_disarm", {"case_id": result.case_id})
@@ -593,7 +580,7 @@ async def run_inject(
             },
         )
         notes["verify_on"] = "probe_page"
-        notes["verify_attempts"] = [{"values": values, "source": "probe_page",
+        notes["verify_attempts"] = [{"values": dict(delivery.plan.values) if delivery.plan else {}, "source": "probe_page",
                                      "found": bool(verify.get("found"))}]
     elif verify_url and verify_url != form.action and verify_entry:
         entry_method = str(verify_entry.get("method") or "POST").upper()
@@ -670,6 +657,7 @@ async def run_inject(
             source_text=str(notes.get("read_sink_code") or text),
             payload=tag,
             tag=tag,
+            sink=str(notes.get("read_sink_code") or ""),
             constraints=", ".join(f"{name}: {kind}" for name, kind in column_limits.items()),
             hint="choose the parameters that make this page query the row that contains the tag",
             fallback_fields=attempt_values[0] if attempt_values else {},
