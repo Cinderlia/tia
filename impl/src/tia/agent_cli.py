@@ -171,6 +171,11 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Derive the page URL from each slice's sink directory",
     )
+    pipeline.add_argument(
+        "--reports",
+        default=None,
+        help="Report directory for this run (default: <store dir>/reports)",
+    )
     pipeline.add_argument("--json", action="store_true")
     return parser
 
@@ -463,6 +468,8 @@ def _run_pipeline(args: argparse.Namespace) -> int:
     if args.mode != "direct" and not args.write_slices:
         raise SystemExit(f"--mode {args.mode} needs --write-slices (injection slices)")
 
+    if args.reports:
+        os.environ["TIA_REPORTS"] = args.reports
     _configure(args, "main")
     store = get_runtime().store
     trigger_slices = _load_slices(args.slices) if args.slices else []
@@ -504,8 +511,10 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         "stop_reason": result.stop_reason,
         "rounds": result.rounds,
         "outcomes": [item.model_dump() for item in result.outcomes],
+        "report_path": result.report_path,
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
+    print(f"[report] {result.report_path}", file=sys.stderr)
     if not args.json:
         print(result.report)
     return 0

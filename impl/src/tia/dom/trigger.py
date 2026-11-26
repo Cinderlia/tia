@@ -26,6 +26,7 @@ from tia.cap.entry import (
     entry_candidates,
     infer_entry,
 )
+from tia.inf.reports import write_case_report
 from tia.inf.runtime import get_runtime
 from tia.inf.store import now_iso
 from tia.orch.judge import judge_trigger
@@ -452,6 +453,8 @@ async def run_trigger(
 
     rt.store.set_case_verdict(case_id, str(verdict), ceiling="EXECUTABLE")
     report = await kernel.report()
+    rt.store.set_case_report(case_id, report)
+    write_case_report(rt.store, case_id)
     stages.append(StageRecord("P6", True, "Report generated"))
     notes["observed_at"] = now_iso()
     return done(

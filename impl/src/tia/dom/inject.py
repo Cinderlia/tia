@@ -27,6 +27,7 @@ from tia.cap.entry import (
 from tia.cap.forms import forms_from_document
 from tia.cap.payloads import render as render_shape
 from tia.dom.trigger import StageRecord
+from tia.inf.reports import write_case_report
 from tia.inf.runtime import get_runtime
 from tia.orch.judge import judge_inject
 from tia.orch.kernel import Kernel, LocalToolClient, ToolCallError, ToolClient
@@ -642,6 +643,9 @@ async def _finish(kernel: Kernel, result: InjectResult, cleanup: bool = True) ->
     except ToolCallError:
         report = ""
     result.report = report
+    if result.case_id and report:
+        get_runtime().store.set_case_report(result.case_id, report)
+        write_case_report(get_runtime().store, result.case_id)
     result.trace = kernel.trace
     return result
 

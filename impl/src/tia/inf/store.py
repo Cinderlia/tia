@@ -293,6 +293,14 @@ class Store:
                 (verdict, ceiling, report, now_iso(), case_id),
             )
 
+    def set_case_report(self, case_id: str, report: str) -> None:
+        """Store the Markdown report generated at the end of a case."""
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE case_file SET report=?, updated_at=? WHERE id=?",
+                (report, now_iso(), case_id),
+            )
+
     def set_write_targets(self, case_id: str, targets: list[dict[str, Any]]) -> None:
         with self._conn() as conn:
             conn.execute(

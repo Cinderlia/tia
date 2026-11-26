@@ -35,6 +35,7 @@ from tia.cap.forms import (
 )
 from tia.cap.payloads import render, shapes_for
 from tia.dom.trigger import _POST_VAR_RE, StageRecord, TriggerResult, normalize_slice
+from tia.inf.reports import write_case_report
 from tia.inf.runtime import get_runtime
 from tia.orch.judge import judge_direct
 from tia.orch.kernel import Kernel, LocalToolClient, ToolCallError, ToolClient
@@ -318,6 +319,8 @@ async def _finish(
     store.set_case_verdict(case_id, verdict, ceiling="EXECUTABLE")
     record_case(store, {"sinkFile": str(notes.get("sink_file") or "")}, verdict, notes)
     report = await kernel.report()
+    store.set_case_report(case_id, report)
+    write_case_report(store, case_id)
     stages.append(StageRecord("D6", True, "report generated"))
     return TriggerResult(
         case_id=case_id,

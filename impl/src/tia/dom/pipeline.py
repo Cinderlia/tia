@@ -12,6 +12,7 @@ timeout. Pairing/verdict failures are data for the report, not loop ends.
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -23,6 +24,7 @@ from tia.dom.inject import run_inject
 from tia.dom.main import seed_queue
 from tia.dom.pairing_agent import PairingConfig, build_pairing_queue
 from tia.dom.trigger import normalize_slice, run_trigger
+from tia.inf.reports import RunReports
 from tia.inf.runtime import get_runtime
 from tia.orch.kernel import ToolCallError, ToolClient
 from tia.orch.learning import hints_for
@@ -89,6 +91,7 @@ class PipelineResult:
     outcomes: list[CaseOutcome] = field(default_factory=list)
     stop_reason: str = "DONE"
     report: str = ""
+    report_path: str = ""
 
 
 MODES = ("direct", "second", "direct-first", "second-first", "hybrid")
@@ -160,6 +163,7 @@ async def run_pipeline(
     if mode not in MODES:
         raise ValueError(f"unknown mode: {mode!r} (expected one of {MODES})")
     result = PipelineResult()
+    reports = RunReports(store, trigger_run_id)
     if mode != "direct":
         seed_queue(store, trigger_run_id, trigger_slices, order_mode="second")
     if mode != "second" and direct_slices:
@@ -188,7 +192,7 @@ async def run_pipeline(
             result.stop_reason = "EXHAUSTED" if result.rounds else "NO_TRIGGER_SLICE"
             break
         if family == "direct":
-            await _run_direct_round(store, result, leased, base_url, url_for)
+            await _run_direct_round(store, result, leased, base_url, url_for, reports)
             continue
 
         round_index = len(result.rounds)
@@ -231,6 +235,7 @@ async def run_pipeline(
                 duration_ms=0,
             )
         )
+        reports.add(trigger.case_id, "trigger", trigger.verdict, _slice_label(raw))
         record: dict[str, Any] = {
             "round": round_index,
             "trigger_slice": str(leased["id"]),
@@ -281,8 +286,17 @@ async def run_pipeline(
             {"item": item.slice_id, "verdict": item.verdict} for item in injected.outcomes
         ]
         result.outcomes.extend(injected.outcomes)
+        for outcome in injected.outcomes:
+            reports.add(
+                outcome.case_id,
+                "inject",
+                outcome.verdict,
+                f"{outcome.notes.get('table', '?')}.{_columns_label(outcome.notes.get('columns'))}",
+            )
         result.rounds.append(record)
 
+    index = reports.finish(result.stop_reason, len(result.rounds), len(result.outcomes))
+    result.report_path = str(index)
     result.report = _report(result)
     return result
 
@@ -293,6 +307,7 @@ async def _run_direct_round(
     leased: dict[str, Any],
     base_url: str,
     url_for: Callable[[dict[str, Any]], str] | None,
+    reports: RunReports,
 ) -> None:
     """One first-order round: direct agent, no pairing, no injection queue."""
     round_index = len(result.rounds)
@@ -321,6 +336,7 @@ async def _run_direct_round(
         )
         return
     store.archive_slice(str(leased["id"]), direct.verdict, case_id=direct.case_id)
+    reports.add(direct.case_id, "direct", direct.verdict, _slice_label(raw))
     result.outcomes.append(
         CaseOutcome(
             slice_id=str(leased["id"]),
@@ -467,6 +483,28 @@ async def walk_injection_queue(
             )
         )
     return result
+
+
+def _columns_label(value: Any) -> str:
+    """Render a column set compactly (it may arrive as JSON text or a list)."""
+    if isinstance(value, list):
+        return ",".join(str(item) for item in value)
+    text = str(value or "?")
+    try:
+        parsed = json.loads(text.replace("'", '"'))
+    except (ValueError, TypeError):
+        return text
+    if isinstance(parsed, list):
+        return ",".join(str(item) for item in parsed)
+    return text
+
+
+def _slice_label(raw: dict[str, Any]) -> str:
+    """Short human label for a slice in the run index."""
+    sink = raw.get("sink")
+    if isinstance(sink, dict):
+        return f"{sink.get('file', '?')}:{sink.get('line', '?')}"
+    return str(raw.get("sinkFile") or raw.get("sink") or "?")
 
 
 def _report(result: PipelineResult) -> str:
