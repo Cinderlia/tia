@@ -62,7 +62,7 @@ def _request(notes: dict[str, Any]) -> tuple[str, str]:
     if isinstance(entry, dict) and entry.get("url"):
         method = str(entry.get("method") or "post").upper()
         url = str(entry.get("url"))
-        field = str(entry.get("field") or "")
+        field = str(entry.get("field") or entry.get("param") or "")
         payload = str(notes.get("payload") or "")
         detail = f"{method} {url}"
         if field:

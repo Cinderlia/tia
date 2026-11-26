@@ -95,6 +95,7 @@ async def run_direct(
     notes.update(
         {
             "sink_file": file,
+            "sink": f"{file}:{line}",
             "sink_code": sink_code,
             "source_window_sha256": window.get("sha256"),
             "entry_plan": {"method": plan.method, "has_filter": plan.has_filter},
