@@ -1,7 +1,8 @@
-"""Direct (first-order) agent tests: candidate delivery and the verdict matrix.
+"""Direct (first-order) agent tests.
 
-The mock client keeps the flow decisions (attempt order, when to stop, what
-verdict) independent from any live page.
+The mock client mirrors the real tool surface (``form_parse``, ``budget_solve``,
+``verify_tag``) so the flow — candidate ranking, tag probe, shape escalation,
+verdict — is exercised without a live page.
 """
 
 from __future__ import annotations
@@ -11,23 +12,34 @@ from typing import Any
 
 import pytest
 
-from tia.dom.direct import _PAYLOADS, run_direct
+from tia.dom.direct import run_direct
 from tia.dom.pipeline import pick_family
 from tia.inf.config import Settings
 from tia.inf.runtime import configure, reset_runtime
+from tia.inf.store import Store
 from tia.schemas.envelope import Envelope
 
 SOURCE = """
-$target = $_REQUEST["target"];
+$target = $_POST["target"];
 $cmd = shell_exec("ping " . $target);
 echo "<pre>" . $cmd . "</pre>";
 """
 
+FORM = {
+    "index": 0,
+    "action": "http://127.0.0.1/xvwa/vulnerabilities/cmdi/",
+    "method": "post",
+    "enctype": "application/x-www-form-urlencoded",
+    "fields": [{"name": "target", "type": "text", "maxlength": 100}],
+    "csrf_candidates": [],
+    "field_names": ["target"],
+}
+
 
 class DirectClient:
-    def __init__(self, *, executable_at: int | None = 0, found: bool = True) -> None:
+    def __init__(self, *, executable_after: int | None = None, found: bool = True) -> None:
         self.calls: list[str] = []
-        self.executable_at = executable_at
+        self.executable_after = executable_after
         self.found = found
         self.page_fetched = False
 
@@ -59,14 +71,20 @@ class DirectClient:
                 self.page_fetched = True
                 return {
                     "status": 200,
-                    "body": '<form action="home.php" method="post"><input name="target"></form>',
+                    "body": '<form action="" method="post"><input name="target" maxlength="100"></form>',
                     "content_type": "text/html",
                 }
-            return {"status": 200, "body": "<html><body>echo</body></html>", "content_type": "text/html"}
+            return {"status": 200, "body": "<html><body><pre>pong</pre></body></html>", "content_type": "text/html"}
+        if tool == "form_parse":
+            return {"forms": [FORM], "form_count": 1, "base_url": "http://127.0.0.1/xvwa/"}
+        if tool == "budget_solve":
+            return {"limit": 100, "max_payload_len": 96, "fits": True, "limiting_factor": "maxlength"}
         if tool == "verify_tag":
             nth = sum(1 for item in self.calls if item == "verify_tag") - 1
             executable = (
-                self.found and self.executable_at is not None and nth >= self.executable_at
+                self.found
+                and self.executable_after is not None
+                and nth >= self.executable_after
             )
             return {
                 "found": self.found,
@@ -97,33 +115,40 @@ SLICE = {
     "sinkFile": "vulnerabilities/cmdi/home.php",
     "sinkLine": 40,
     "sinkCode": 'echo "<pre>" . $cmd . "</pre>"',
-    "sources": [{"file": "vulnerabilities/cmdi/home.php", "line": 33, "code": '$_REQUEST["target"]', "param": "target"}],
+    "sources": [{"file": "vulnerabilities/cmdi/home.php", "line": 33, "code": '$_POST["target"]', "param": "target"}],
     "nodes": [],
 }
 
 
 @pytest.mark.asyncio
-async def test_direct_executable(runtime: Any) -> None:
-    client = DirectClient(executable_at=0)
-    result = await run_direct(SLICE, base_url="http://127.0.0.1/xvwa/vulnerabilities/cmdi/", client=client)
+async def test_direct_probe_executable(runtime: Any) -> None:
+    client = DirectClient(executable_after=0)
+    result = await run_direct(
+        SLICE, base_url="http://127.0.0.1/xvwa/vulnerabilities/cmdi/", client=client
+    )
     assert result.verdict == "EXECUTED"
-    assert result.notes["attempts"]
     assert result.notes["entry"]["param"] == "target"
-    assert "verify_tag" in client.calls
+    assert result.notes["payload_constraints"]["context_kind"] == "html_text"
+    assert "form_parse" in client.calls and "budget_solve" in client.calls
 
 
 @pytest.mark.asyncio
 async def test_direct_reflected_but_inert(runtime: Any) -> None:
-    client = DirectClient(executable_at=None)
-    result = await run_direct(SLICE, base_url="http://127.0.0.1/xvwa/vulnerabilities/cmdi/", client=client)
+    client = DirectClient(executable_after=None)
+    result = await run_direct(
+        SLICE, base_url="http://127.0.0.1/xvwa/vulnerabilities/cmdi/", client=client
+    )
     assert result.verdict == "REFLECTED_INERT"
-    assert len(result.notes["attempts"]) == min(6, len(_PAYLOADS))
+    assert len(result.notes["attempts"]) <= 8
+    assert len(result.notes["attempts"]) > 1
 
 
 @pytest.mark.asyncio
 async def test_direct_not_reflected(runtime: Any) -> None:
     client = DirectClient(found=False)
-    result = await run_direct(SLICE, base_url="http://127.0.0.1/xvwa/vulnerabilities/cmdi/", client=client)
+    result = await run_direct(
+        SLICE, base_url="http://127.0.0.1/xvwa/vulnerabilities/cmdi/", client=client
+    )
     assert result.verdict == "READ_NOT_REFLECTED"
 
 
@@ -141,22 +166,15 @@ async def test_direct_page_error(runtime: Any) -> None:
 
 @pytest.mark.asyncio
 async def test_store_keeps_families_apart(runtime: Any) -> None:
-    store = runtime_store(runtime)
+    store = Store(runtime.store_path)
     store.seed_slices("run-x", [SLICE], order_mode="direct")
-    second = {**SLICE, "sinkLine": 77}
-    store.seed_slices("run-x", [second], order_mode="second")
+    store.seed_slices("run-x", [{**SLICE, "sinkLine": 77}], order_mode="second")
     assert store.count_pending("run-x", "direct") == 1
     assert store.count_pending("run-x", "second") == 1
     direct_row = store.next_slice(run_id="run-x", order_mode="direct")
     assert direct_row is not None and direct_row["order_mode"] == "direct"
     second_row = store.next_slice(run_id="run-x", order_mode="second")
     assert second_row is not None and second_row["order_mode"] == "second"
-
-
-def runtime_store(runtime: Any) -> Any:
-    from tia.inf.store import Store
-
-    return Store(runtime.store_path)
 
 
 def test_pick_family_modes() -> None:

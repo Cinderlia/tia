@@ -14,7 +14,7 @@ import secrets
 import string
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import urlencode, urljoin
+from urllib.parse import urlencode
 
 from tia.ad.llm import LlmClient
 from tia.cap.domscan import Document, parse
@@ -24,6 +24,7 @@ from tia.cap.entry import (
     entry_field,
     resolve_values_with_guess,
 )
+from tia.cap.forms import forms_from_document
 from tia.dom.trigger import StageRecord
 from tia.inf.runtime import get_runtime
 from tia.orch.judge import judge_inject
@@ -66,25 +67,15 @@ def _walk(document: Document) -> list[Any]:
 
 
 def _forms(document: Document, page_url: str) -> list[_Form]:
-    forms: list[_Form] = []
-    for node in document.nodes:
-        if node.tag != "form":
-            continue
-        action = node.attrs.get("action", "")
-        method = (node.attrs.get("method") or "get").lower()
-        fields: dict[str, str] = {}
-        stack = list(node.children)
-        while stack:
-            child = stack.pop()
-            if child.tag in {"input", "textarea", "select"}:
-                name = child.attrs.get("name")
-                if name:
-                    kind = (child.attrs.get("type") or "").lower()
-                    if kind not in {"submit", "button", "reset", "file", "image"}:
-                        fields[name] = child.attrs.get("value", "")
-            stack.extend(child.children)
-        forms.append(_Form(action=urljoin(page_url, action or page_url), method=method, fields=fields))
-    return forms
+    """Page forms via the shared parser, preserving the inject agent's dict view."""
+    return [
+        _Form(
+            action=form.action,
+            method=form.method,
+            fields={field.name: field.value for field in form.fields},
+        )
+        for form in forms_from_document(document, page_url)
+    ]
 
 
 _INSERT_RE = re.compile(

@@ -41,6 +41,34 @@ def judge_trigger(
     return TriggerVerdict.REFLECTED_INERT, f"Hit but not judged executable: {reason}"
 
 
+def judge_direct(attempts: list[dict[str, Any]]) -> tuple[TriggerVerdict, str]:
+    """Direct agent verdicts from its bounded delivery attempts.
+
+    The trigger judge's facts are the same (found / best.executable), only the
+    "written" step is the HTTP delivery itself, so direct maps onto the same
+    TriggerVerdict vocabulary the pipeline already consumes.
+    """
+    if not attempts:
+        return TriggerVerdict.NOT_EXECUTED, "No delivery attempt was made"
+    executable = [item for item in attempts if item.get("executable")]
+    if executable:
+        best = executable[0]
+        return (
+            TriggerVerdict.EXECUTED,
+            f"Hit {best.get('context_kind')}, executable ({best.get('reason')})",
+        )
+    reflected = [item for item in attempts if item.get("found")]
+    if not reflected:
+        return TriggerVerdict.READ_NOT_REFLECTED, "Payload never appeared in the response"
+    reasons = {str(item.get("reason")) for item in reflected}
+    if "ENCODED_ONLY" in reasons:
+        return TriggerVerdict.REFLECTED_ENCODED, "Hit is encoded and cannot be restored"
+    if reasons & {"CSP_BLOCKED", "SANDBOXED"}:
+        blocked = sorted(reasons & {"CSP_BLOCKED", "SANDBOXED"})[0]
+        return TriggerVerdict.BLOCKED_CSP, f"Context reachable but blocked: {blocked}"
+    return TriggerVerdict.REFLECTED_INERT, "Payload reflected but no shape was executable"
+
+
 def judge_inject(
     tag_in_db: bool, tag_in_page: bool, executable: bool
 ) -> tuple[str, str]:
