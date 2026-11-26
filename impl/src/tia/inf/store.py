@@ -19,6 +19,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from tia.orch.identity import identity_of
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS case_file (
     id            TEXT PRIMARY KEY,
@@ -208,9 +210,25 @@ class Store:
                 ("reasons", "ALTER TABLE slice ADD COLUMN reasons TEXT NOT NULL DEFAULT '[]'"),
                 ("digest", "ALTER TABLE slice ADD COLUMN digest TEXT NOT NULL DEFAULT '{}'"),
                 ("order_mode", "ALTER TABLE slice ADD COLUMN order_mode TEXT NOT NULL DEFAULT 'second'"),
+                ("identity", "ALTER TABLE slice ADD COLUMN identity TEXT NOT NULL DEFAULT ''"),
+                ("duplicate_of", "ALTER TABLE slice ADD COLUMN duplicate_of TEXT"),
             ):
                 if name not in columns:
                     conn.execute(ddl)
+            queue_columns = {row["name"] for row in conn.execute("PRAGMA table_info(injection_queue)")}
+            for name, ddl in (
+                ("read_identity", "ALTER TABLE injection_queue ADD COLUMN read_identity TEXT NOT NULL DEFAULT ''"),
+                ("write_identity", "ALTER TABLE injection_queue ADD COLUMN write_identity TEXT NOT NULL DEFAULT ''"),
+                ("alternates", "ALTER TABLE injection_queue ADD COLUMN alternates TEXT NOT NULL DEFAULT '[]'"),
+            ):
+                if name not in queue_columns:
+                    conn.execute(ddl)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS conclusion ("
+                " pair_key TEXT PRIMARY KEY, read_identity TEXT NOT NULL,"
+                " write_identity TEXT NOT NULL, verdict TEXT NOT NULL,"
+                " case_id TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL)"
+            )
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
@@ -628,6 +646,7 @@ class Store:
             if not sink_file:
                 continue
             slice_id = str(raw.get("slice_id") or f"slice-{uuid.uuid4().hex[:8]}")
+            identity = identity_of(raw, order_mode)
             with self._conn() as conn:
                 exists = conn.execute(
                     "SELECT id FROM slice WHERE run_id=? AND sink_file=? AND sink_line=?"
@@ -637,9 +656,16 @@ class Store:
                 if exists is not None:
                     seeded.append(str(exists["id"]))
                     continue
+                canonical = conn.execute(
+                    "SELECT id FROM slice WHERE run_id=? AND identity=? AND duplicate_of IS NULL"
+                    " AND status IN ('pending','running') ORDER BY id LIMIT 1",
+                    (run_id, identity),
+                ).fetchone()
+                duplicate_of = str(canonical["id"]) if canonical is not None else None
                 conn.execute(
                     "INSERT INTO slice (id, run_id, kind, sink_file, sink_line, slice_json,"
-                    " order_mode, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                    " order_mode, identity, duplicate_of, created_at, updated_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         slice_id,
                         run_id,
@@ -648,6 +674,8 @@ class Store:
                         sink_line,
                         json.dumps(raw, ensure_ascii=False),
                         order_mode,
+                        identity,
+                        duplicate_of,
                         ts,
                         ts,
                     ),
@@ -671,7 +699,10 @@ class Store:
         if order_mode:
             sql += " AND order_mode=?"
             args.append(order_mode)
-        sql += " ORDER BY score DESC, attempts, kind, sink_file, sink_line LIMIT 1"
+        sql += (
+            " ORDER BY (duplicate_of IS NULL) DESC, score DESC, attempts, kind,"
+            " sink_file, sink_line LIMIT 1"
+        )
         with self._conn() as conn:
             row = conn.execute(sql, tuple(args)).fetchone()
             if row is None:
@@ -860,8 +891,9 @@ class Store:
             for rank, item in enumerate(items):
                 conn.execute(
                     "INSERT INTO injection_queue (item_id, run_id, rank, write_slice_id, read_slice_id,"
-                    " pair_id, table_name, columns, score, direction, reasons, status, created_at, updated_at)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,'pending',?,?)",
+                    " pair_id, table_name, columns, score, direction, reasons, status,"
+                    " read_identity, write_identity, alternates, created_at, updated_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?,?)",
                     (
                         str(item["item_id"]),
                         run_id,
@@ -874,6 +906,9 @@ class Store:
                         int(item.get("score") or 0),
                         str(item.get("direction") or ""),
                         json.dumps(item.get("reasons") or [], ensure_ascii=False),
+                        str(item.get("read_identity") or ""),
+                        str(item.get("write_identity") or ""),
+                        json.dumps(item.get("alternates") or [], ensure_ascii=False),
                         now,
                         now,
                     ),
@@ -942,7 +977,42 @@ class Store:
             "status": row["status"],
             "verdict": row["verdict"],
             "case_id": row["case_id"],
+            "read_identity": row["read_identity"],
+            "write_identity": row["write_identity"],
+            "alternates": json.loads(row["alternates"] or "[]"),
         }
+
+    # -- identity-level conclusions --------------------------------------
+
+    def record_conclusion(
+        self, read_identity: str, write_identity: str, verdict: str, case_id: str = ""
+    ) -> None:
+        key = f"{read_identity}||{write_identity}"
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO conclusion (pair_key, read_identity, write_identity, verdict,"
+                " case_id, updated_at) VALUES (?,?,?,?,?,?)"
+                " ON CONFLICT(pair_key) DO UPDATE SET verdict=excluded.verdict,"
+                " case_id=excluded.case_id, updated_at=excluded.updated_at",
+                (key, read_identity, write_identity, verdict, case_id, now_iso()),
+            )
+
+    def get_conclusion(self, read_identity: str, write_identity: str) -> dict[str, Any] | None:
+        key = f"{read_identity}||{write_identity}"
+        with self._conn() as conn:
+            row = conn.execute("SELECT * FROM conclusion WHERE pair_key=?", (key,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def close_identity_group(self, identity: str, verdict: str, case_id: str, keep: str = "") -> int:
+        """Close every still-open slice that shares an identity with a concluded one."""
+
+        with self._conn() as conn:
+            cursor = conn.execute(
+                "UPDATE slice SET status='executed', verdict=?, notes=?, updated_at=?"
+                " WHERE identity=? AND status IN ('pending','running') AND id<>?",
+                (verdict, f"group closed by {case_id}", now_iso(), identity, keep),
+            )
+            return int(cursor.rowcount or 0)
 
     @staticmethod
     def _pair_row(row: sqlite3.Row) -> dict[str, Any]:

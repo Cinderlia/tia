@@ -28,6 +28,11 @@ from tia.orch.kernel import ToolCallError, ToolClient
 from tia.orch.learning import hints_for
 from tia.schemas.objects import CaseOutcome
 
+_RETRYABLE_INJECT = frozenset(
+    {"WRITE_NOT_REACHED", "WRITE_NOT_REACHED_ENV", "ENV_ERROR", "TIMEOUT", "PATH_UNREACHABLE"}
+)
+
+
 
 def _read_target(raw: dict[str, Any] | None) -> dict[str, Any] | None:
     """Return the (file, line) the trigger agent proved reachable, if known."""
@@ -376,13 +381,27 @@ async def walk_injection_queue(
             "confidence": item["score"],
             "direction": item["direction"],
         }
+        # Duplicate slices of the same site stay as alternates: if the primary
+        # attempt fails before reaching the sink, one alternate gets a chance.
+        hints = [hint]
+        for alternate in (item.get("alternates") or [])[:1]:
+            hints.append(
+                {
+                    "pair_id": alternate.get("pair_id") or item["pair_id"],
+                    "table": item["table"],
+                    "columns": item["columns"],
+                    "confidence": alternate.get("score") or item["score"],
+                    "direction": item["direction"],
+                    "alternate_write_slice_id": alternate.get("write_slice_id"),
+                }
+            )
         inject = await run_inject(
             write_raw,
             base_url=write_url,
             payload_base=payload_base,
             budget=min(budget, 40),
             client=inject_client,
-            pair_hints=[hint],
+            pair_hints=hints[:1],
             verify_url=read_url,
             verify_entry=entry,
             payload_constraints=payload_constraints,
@@ -390,8 +409,47 @@ async def walk_injection_queue(
             learning=hints_for(store, read_raw or write_raw),
             read_target=_read_target(read_raw),
         )
+        if (
+            len(hints) > 1
+            and inject.verdict in _RETRYABLE_INJECT
+            and hints[1].get("alternate_write_slice_id")
+        ):
+            alternate_raw = store.get_slice(str(hints[1]["alternate_write_slice_id"]))
+            if alternate_raw is not None:
+                retry = await run_inject(
+                    dict(alternate_raw["slice"]),
+                    base_url=write_url,
+                    payload_base=payload_base,
+                    budget=min(budget, 40),
+                    client=inject_client,
+                    pair_hints=hints[1:],
+                    verify_url=read_url,
+                    verify_entry=entry,
+                    payload_constraints=payload_constraints,
+                    slice_id=str(hints[1]["alternate_write_slice_id"]),
+                    learning=hints_for(store, read_raw or write_raw),
+                    read_target=_read_target(read_raw),
+                )
+                inject.notes["alternate_attempt"] = {
+                    "slice_id": hints[1]["alternate_write_slice_id"],
+                    "verdict": retry.verdict,
+                }
+                if retry.verdict in ("EXECUTABLE", "EXECUTED"):
+                    inject = retry
+                store.archive_slice(
+                    str(hints[1]["alternate_write_slice_id"]), retry.verdict,
+                    case_id=retry.case_id,
+                )
         store.archive_injection_item(str(item["item_id"]), inject.verdict, case_id=inject.case_id)
         store.archive_slice(str(item["write_slice_id"]), inject.verdict, case_id=inject.case_id)
+        read_identity = str(item.get("read_identity") or "")
+        write_identity = str(item.get("write_identity") or "")
+        if inject.verdict in ("EXECUTABLE", "EXECUTED") and read_identity and write_identity:
+            store.record_conclusion(read_identity, write_identity, inject.verdict, inject.case_id)
+            store.close_identity_group(read_identity, inject.verdict, inject.case_id,
+                                       keep=str(item["read_slice_id"]))
+            store.close_identity_group(write_identity, inject.verdict, inject.case_id,
+                                       keep=str(item["write_slice_id"]))
         result.outcomes.append(
             CaseOutcome(
                 slice_id=str(item["item_id"]),

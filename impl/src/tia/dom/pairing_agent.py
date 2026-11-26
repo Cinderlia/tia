@@ -26,6 +26,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from tia.orch.identity import identity_of
+from tia.orch.identity import write_identity as write_identity_of
 from tia.orch.pairing import (
     DbOp,
     Reader,
@@ -37,6 +39,8 @@ from tia.orch.pairing import (
     resolve_entry,
 )
 from tia.orch.slicing import score_slice
+
+_SUCCESS_VERDICTS = frozenset({"EXECUTABLE", "EXECUTED"})
 
 Modeler = Callable[[str], list[DbOp]]
 
@@ -231,27 +235,95 @@ def build_pairing_queue(
         )
     )
 
-    # R4: rank write slices (the injection side) and cap the queue.
-    ranked: list[dict[str, Any]] = []
-    per_write: dict[str, int] = {}
+    # R4: fold duplicate slices into one candidate each, keep the rest as
+    # alternates, then rank and cap the queue.
+    write_identity: dict[str, str] = {}
+    write_raw: dict[str, dict[str, Any]] = {}
+    for slice_id, raw in zip(seeded_ids, usable, strict=False):
+        write_identity[slice_id] = identity_of(raw, "second")
+        write_raw[slice_id] = raw
+    read_identity: dict[str, str] = {}
+    read_raw_by_id: dict[str, dict[str, Any]] = {}
+    for row in proven_reads:
+        slice_id = str(row.get("id") or "")
+        raw_value = row.get("slice")
+        read_raw: dict[str, Any] = raw_value if isinstance(raw_value, dict) else row
+        if slice_id:
+            read_identity[slice_id] = identity_of(read_raw, "second")
+            read_raw_by_id[slice_id] = read_raw
+
+    groups: dict[str, dict[str, Any]] = {}
+    skipped_concluded = 0
     for pair in pairs:
         write_id = str(pair["write_slice_id"])
+        read_id = str(pair["read_slice_id"])
+        # Only a proven trigger slice may stand on the read side, and only a
+        # seeded injection slice on the write side.
+        if read_id not in read_identity or write_id not in write_identity:
+            continue
+        rid = read_identity.get(read_id) or identity_of(
+            read_raw_by_id.get(read_id, {}), "second"
+        )
+        wid = write_identity.get(write_id) or write_identity_of(
+            write_raw.get(write_id, {"sinkFile": write_id})
+        )
+        key = f"{rid}||{wid}"
+        candidate = {
+            "pair_id": str(pair["pair_id"]),
+            "read_slice_id": read_id,
+            "write_slice_id": write_id,
+            "table": str(pair.get("table") or ""),
+            "columns": list(pair.get("columns") or []),
+            "score": int(pair.get("confidence") or 0),
+            "direction": str(pair.get("direction") or ""),
+            "reasons": list(pair.get("reasons") or []),
+        }
+        existing = groups.get(key)
+        if existing is None:
+            conclusion = store.get_conclusion(rid, wid)
+            if conclusion is not None and str(conclusion.get("verdict")) in _SUCCESS_VERDICTS:
+                skipped_concluded += 1
+                continue
+            groups[key] = {"primary": candidate, "alternates": [], "read_identity": rid,
+                           "write_identity": wid}
+        else:
+            if candidate["score"] > existing["primary"]["score"]:
+                existing["alternates"].append(existing["primary"])
+                existing["primary"] = candidate
+            else:
+                existing["alternates"].append(candidate)
+
+    ranked: list[dict[str, Any]] = []
+    per_write: dict[str, int] = {}
+    for key, group in groups.items():
+        primary = group["primary"]
+        write_id = str(primary["write_slice_id"])
         if per_write.get(write_id, 0) >= cfg.per_write_fanout:
             continue
         per_write[write_id] = per_write.get(write_id, 0) + 1
-        confidence = int(pair.get("confidence") or 0)
-        digest = hashlib.sha1(f"{run_id}|{pair['pair_id']}".encode()).hexdigest()[:10]
+        digest = hashlib.sha1(f"{run_id}|{key}".encode()).hexdigest()[:10]
         ranked.append(
             {
                 "item_id": f"iq-{digest}",
                 "write_slice_id": write_id,
-                "read_slice_id": str(pair["read_slice_id"]),
-                "pair_id": str(pair["pair_id"]),
-                "table": str(pair.get("table") or ""),
-                "columns": list(pair.get("columns") or []),
-                "score": confidence,
-                "direction": str(pair.get("direction") or ""),
-                "reasons": list(pair.get("reasons") or []),
+                "read_slice_id": str(primary["read_slice_id"]),
+                "pair_id": str(primary["pair_id"]),
+                "table": str(primary["table"]),
+                "columns": list(primary["columns"]),
+                "score": int(primary["score"]),
+                "direction": str(primary["direction"]),
+                "reasons": list(primary["reasons"]),
+                "read_identity": group["read_identity"],
+                "write_identity": group["write_identity"],
+                "alternates": [
+                    {
+                        "read_slice_id": alt["read_slice_id"],
+                        "write_slice_id": alt["write_slice_id"],
+                        "pair_id": alt["pair_id"],
+                        "score": alt["score"],
+                    }
+                    for alt in group["alternates"][:5]
+                ],
             }
         )
     ranked.sort(key=lambda item: (-int(item["score"]), item["item_id"]))
@@ -283,5 +355,7 @@ def build_pairing_queue(
         "queue_basis": basis,
         "source_reads": result.n_source_reads,
         "modeled": result.n_modeled,
+        "deduped_pairs": len(pairs) - len(groups),
+        "skipped_concluded": skipped_concluded,
     }
     return result
