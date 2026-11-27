@@ -115,6 +115,7 @@ class _FakeTrigger:
         self.case_id = "case-trigger"
         self.trace: list[Any] = []
         self.stages: list[Any] = []
+        self.notes: dict[str, Any] = {}
 
 
 class _FakeInject:

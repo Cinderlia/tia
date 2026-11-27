@@ -222,8 +222,35 @@ def _load_slice(path: str, index: int) -> dict[str, Any]:
     raise SystemExit("Slice file must be an object or array")
 
 
-def _load_slices(path: str) -> list[dict[str, Any]]:
-    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+def _load_slices(path: str, family: str | None = None) -> list[dict[str, Any]]:
+    """Load slices from a JSON file (legacy) or a NAVI chain output directory.
+
+    A directory is resolved with the NAVI chain contract: one graph file per
+    chain, ``xss-direct`` feeding the direct family and ``xss-second-order``
+    the second family.  Files keep the legacy ``{sinks|slices: [...]}`` shape.
+    """
+
+    target = Path(path)
+    if target.is_dir():
+        try:
+            if family is None:
+                from tia.inf.navi import load_navi
+
+                grouped = load_navi(target)
+                return grouped["direct"] + grouped["second"]
+            from tia.inf.navi import family_slices, present_chains
+
+            found = family_slices(target, family)
+        except Exception as exc:  # pragma: no cover - reported to the operator
+            raise SystemExit(str(exc)) from exc
+        if not found:
+            chains = ", ".join(present_chains(target)) or "none"
+            print(
+                f"warning: no {family} slices in {target} (chains present: {chains})",
+                file=sys.stderr,
+            )
+        return found
+    raw = json.loads(target.read_text(encoding="utf-8"))
     if isinstance(raw, list):
         return [dict(item) for item in raw]
     if isinstance(raw, dict):
@@ -335,9 +362,9 @@ def _run_inject(args: argparse.Namespace) -> int:
 
 def _run_main(args: argparse.Namespace) -> int:
     _configure(args, "main")
-    slices = _load_slices(args.slices)
+    slices = _load_slices(args.slices, family="second")
     if getattr(args, "write_slices", None):
-        slices = slices + _load_slices(args.write_slices)
+        slices = slices + _load_slices(args.write_slices, family="write")
     run_id = args.run_id or f"run-{int(time.time())}"
     def url_for(raw: dict[str, Any]) -> str:
         parent = str(Path(str(raw.get("sinkFile") or "")).parent).strip(".")
@@ -409,7 +436,7 @@ def _run_pairing(args: argparse.Namespace) -> int:
 
     _configure(args, "main")
     store = get_runtime().store
-    writes = _load_slices(args.write_slices)
+    writes = _load_slices(args.write_slices, family="write")
     proven = store.list_slice_rows(args.read_run_id, verdicts=("EXECUTED", "EXECUTABLE"))
     run_id = args.run_id or f"pair-{int(time.time())}"
 
@@ -506,9 +533,9 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         os.environ["TIA_REPORTS"] = args.reports
     _configure(args, "main")
     store = get_runtime().store
-    trigger_slices = _load_slices(args.slices) if args.slices else []
-    write_slices = _load_slices(args.write_slices) if args.write_slices else []
-    direct_slices = _load_slices(args.direct_slices) if args.direct_slices else []
+    trigger_slices = _load_slices(args.slices, family="second") if args.slices else []
+    write_slices = _load_slices(args.write_slices, family="write") if args.write_slices else []
+    direct_slices = _load_slices(args.direct_slices, family="direct") if args.direct_slices else []
     run_id = args.run_id or f"pipe-{int(time.time())}"
 
     def url_for(raw: dict[str, Any]) -> str:

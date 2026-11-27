@@ -197,7 +197,7 @@ async def run_injection_queue(
                 learning=hints_for(queue_store, read_raw),
                 pair_hints=[hint],
                 slice_id=str(item["write_slice_id"]),
-                read_target=_read_target(read_raw),
+                read_target=_read_target(read_raw, trigger.notes),
             )
             inject_verdict = inject.verdict
             case_id = inject.case_id
@@ -264,7 +264,10 @@ def _source_reader() -> Reader | None:
     return read
 
 
-def _read_target(raw: dict[str, Any] | None) -> dict[str, Any] | None:
+def _read_target(
+    raw: dict[str, Any] | None,
+    notes: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     """Return the trigger-proven (file, line), if the slice carries one."""
 
     if not raw:
@@ -279,11 +282,16 @@ def _read_target(raw: dict[str, Any] | None) -> dict[str, Any] | None:
         path, _, number = str(raw.get("sink")).rpartition(":")
         file = path
         line = int(number) if number.isdigit() else 0
-    if isinstance(probe_cfg, dict) and probe_cfg.get("line") and file:
-        # The navi slice may carry the SQL read line; keep the app-relative file
-        # from the slice because the analysis path is not mounted in the target.
+    if not file:
+        return None
+    from_notes = int((notes or {}).get("read_line") or 0)
+    if from_notes > 0:
+        return {"file": file, "line": from_notes}
+    if isinstance(probe_cfg, dict) and probe_cfg.get("line"):
+        # Debug dumps carry the SQL read line; keep the app-relative file from
+        # the slice because the analysis path is not mounted in the target.
         return {"file": file, "line": int(probe_cfg["line"])}
-    if not file or not line:
+    if not line:
         return None
     return {"file": file, "line": line}
 

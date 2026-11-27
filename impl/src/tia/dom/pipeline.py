@@ -37,8 +37,16 @@ _RETRYABLE_INJECT = frozenset(
 
 
 
-def _read_target(raw: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Return the (file, line) the trigger agent proved reachable, if known."""
+def _read_target(
+    raw: dict[str, Any] | None,
+    notes: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Return the (file, line) the trigger agent proved reachable, if known.
+
+    The NAVI chain contract no longer ships the debug ``sqlProbe`` block, so the
+    read line recorded by the trigger agent (``notes["read_line"]``) is the
+    primary source; the debug hint stays as a fallback for old dumps.
+    """
 
     if not raw:
         return None
@@ -52,11 +60,16 @@ def _read_target(raw: dict[str, Any] | None) -> dict[str, Any] | None:
         path, _, number = str(raw.get("sink")).rpartition(":")
         file = path
         line = int(number) if number.isdigit() else 0
-    if isinstance(probe_cfg, dict) and probe_cfg.get("line") and file:
+    if not file:
+        return None
+    from_notes = int((notes or {}).get("read_line") or 0)
+    if from_notes > 0:
+        return {"file": file, "line": from_notes}
+    if isinstance(probe_cfg, dict) and probe_cfg.get("line"):
         # The navi slice may carry the SQL read line; keep the app-relative file
         # from the slice because the analysis path is not mounted in the target.
         return {"file": file, "line": int(probe_cfg["line"])}
-    if not file or not line:
+    if not line:
         return None
     return {"file": file, "line": line}
 
@@ -281,6 +294,7 @@ async def run_pipeline(
                 payload_constraints=(trigger.notes or {}).get("payload_constraints"),
                 constraint_plan=(trigger.notes or {}).get("constraint_plan"),
                 read_values=(trigger.notes or {}).get("read_entry_values"),
+                read_notes=trigger.notes or {},
             )
         except ToolCallError as exc:
             record["stopped_at"] = "inject_error"
@@ -438,6 +452,7 @@ async def walk_injection_queue(
     payload_constraints: dict[str, Any] | None = None,
     read_values: dict[str, str] | None = None,
     constraint_plan: dict[str, Any] | None = None,
+    read_notes: dict[str, Any] | None = None,
 ) -> PipelineResult:
     """Inject every candidate in queue order; the read side is already proven."""
     result = PipelineResult()
@@ -497,7 +512,7 @@ async def walk_injection_queue(
             payload_constraints=payload_constraints,
             slice_id=str(item["write_slice_id"]),
             learning=hints_for(store, read_raw or write_raw),
-            read_target=_read_target(read_raw),
+            read_target=_read_target(read_raw, read_notes),
             constraint_plan=constraint_plan,
             pair_candidates=pair_map,
         )
@@ -521,7 +536,7 @@ async def walk_injection_queue(
                     payload_constraints=payload_constraints,
                     slice_id=str(hints[1]["alternate_write_slice_id"]),
                     learning=hints_for(store, read_raw or write_raw),
-                    read_target=_read_target(read_raw),
+                    read_target=_read_target(read_raw, read_notes),
                     constraint_plan=constraint_plan,
                     pair_candidates=pair_map,
                 )
