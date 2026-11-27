@@ -25,6 +25,9 @@ class XssSinkClass:
     name = "xss"
     site_kinds = frozenset({"Xss", "SqlInjection"})
 
+    def writes_database(self) -> bool:
+        return True
+
     def channels(self) -> frozenset[str]:
         return frozenset({"page", "browser"})
 

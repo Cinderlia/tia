@@ -272,6 +272,28 @@ async def run_flow_queue(
         residue = trigger.residue or 0
         refs = list(probe.evidence_refs)
         success = trigger.verdict == "EXECUTED" and residue == 0
+        # No writer step in this flow: the prover is the whole proof, nothing to replay.
+        if not list(flow.get("writer_slice_ids") or []):
+            store.archive_flow(
+                str(flow["flow_id"]),
+                "reported" if success else "failed",
+                verdict,
+                case_id=case_id,
+                notes={"flow_class": "sqli"},
+            )
+            reports.add(case_id, "sqli", verdict, str(flow["flow_id"]))
+            result.outcomes.append(
+                CaseOutcome(
+                    slice_id=str(flow["flow_id"]),
+                    case_id=case_id,
+                    verdict=verdict,
+                    evidence_refs=refs,
+                    residue=residue,
+                    notes={"flow_class": "sqli"},
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                )
+            )
+            continue
         if success:
             writer_raw, writer_id = target_raw, str(flow["target_slice_id"])
             for candidate_id in flow.get("writer_slice_ids") or []:

@@ -48,6 +48,10 @@ class SinkClass(Protocol):
 
     def channels(self) -> frozenset[str]: ...
 
+    def writes_database(self) -> bool:
+        """True when reaching the sink requires a value stored in the database."""
+        ...
+
     def context(self, site: dict[str, Any], code: str) -> str: ...
 
     def shapes(self, context: str) -> list[str]: ...
@@ -75,6 +79,10 @@ _TRIGGER_LEVELS = {
     "REFLECTED_INERT": "REFLECTED_INERT",
     "BLOCKED_CSP": "BLOCKED_CSP",
     "SQL_ERROR": "SQL_ERROR",
+    "SQLI_CONFIRMED": "EXECUTED",
+    "SQLI_NOT_CONFIRMED": "NOT_EXECUTED",
+    "NO_DB_OBSERVATION": "NOT_EXECUTED",
+    "NOT_CONFIRMED": "NOT_EXECUTED",
 }
 
 _INJECT_LEVELS = {

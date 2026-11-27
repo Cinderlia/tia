@@ -8,6 +8,7 @@ when the page merely contains the text.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from tia.sinks.base import Observation, Outcome
@@ -16,6 +17,9 @@ from tia.sinks.base import Observation, Outcome
 class SqliSinkClass:
     name = "sqli"
     site_kinds = frozenset({"SqlInjection", "SqlRead", "SqlWriteLoose"})
+
+    def writes_database(self) -> bool:
+        return False
 
     def channels(self) -> frozenset[str]:
         return frozenset({"sql_probe", "page", "timing"})
@@ -29,6 +33,10 @@ class SqliSinkClass:
             return "limit"
         if "like" in lowered:
             return "like_string"
+        # ``= ".$item`` / ``= $item`` concatenates unquoted: the value lands as a
+        # number, so the useful candidates are numeric, not quoted strings.
+        if re.search(r"=\s*[\"']?\s*\.\s*\$", text) or re.search(r"=\s*\$\w+", text):
+            return "numeric"
         return "string_literal"
 
     def shapes(self, context: str) -> list[str]:
@@ -56,10 +64,10 @@ class SqliSinkClass:
         payload_base: str = "",
     ) -> list[tuple[str, str]]:
         out: list[tuple[str, str]] = []
-        if payload_base:
-            out.append(("custom", f"{payload_base}{tag}"))
         for shape in self.shapes(context):
             out.append((shape, self.render(shape, tag)))
+        if payload_base:
+            out.append(("custom", f"{payload_base}{tag}"))
         return out
 
     def accept(self, observation: Observation, context: str) -> Outcome:

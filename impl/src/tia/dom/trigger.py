@@ -378,6 +378,19 @@ async def run_trigger(
 ) -> TriggerResult:
     rt = get_runtime()
     slice_doc = normalize_slice(raw_slice)
+    sink_class = sink_class_for(str(slice_doc.get("kind") or ""))
+    if not sink_class.writes_database():
+        from tia.dom.request_prover import run_request_prover
+
+        return await run_request_prover(
+            raw_slice,
+            base_url=base_url,
+            payload_base=payload_base,
+            budget=budget,
+            client=client,
+            slice_id=slice_id,
+            flow=flow,
+        )
     sink = slice_doc["sink"]
     sink_file, sink_line = sink["file"], sink["line"]
     params = [str(p) for p in (slice_doc.get("params") or [])]
