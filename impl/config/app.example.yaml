@@ -1,0 +1,29 @@
+# Target application and local runtime. Copy to impl/config/local/app.yaml.
+# The local file is git-ignored; this template keeps only placeholders.
+
+app_root: /app/xvwa
+
+# Container paths (the agents run inside the container).
+store: /home/so/tia/impl/var/tia.db
+reports: /home/so/tia/impl/var/reports
+accounts: /home/so/tia/impl/var/accounts.yaml
+default_account: ""
+
+# Pinned browser used for execution confirmation (empty = downloaded build).
+chrome: /usr/bin/google-chrome
+
+db:
+  host: 127.0.0.1
+  port: 3306
+  name: xvwa
+  user: tia_xvwa
+  password: "<change-me>"
+  charset: utf8mb4
+
+# Bounded exploration budgets (env TIA_<NAME>_ATTEMPTS still overrides).
+attempts:
+  entry: 8
+  verify: 4
+  payload: 3
+  write: 2
+  direct: 8

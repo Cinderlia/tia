@@ -13,6 +13,8 @@ from typing import Any
 
 import yaml
 
+from tia.inf import settings as file_settings
+
 #: This file is located at ``impl/src/tia/inf/config.py``.
 _IMPL_ROOT = Path(__file__).resolve().parents[3]
 
@@ -88,6 +90,8 @@ class Settings:
     profile: ProfileConfig
     accounts_path: Path
     default_account: str = ""
+    chrome: str = ""
+    reports_path: Path | None = None
 
     @classmethod
     def load(
@@ -100,20 +104,34 @@ class Settings:
         app_root: Path | None = None,
         store_path: Path | None = None,
     ) -> Settings:
-        name = (db_name if db_name is not None else _env("TIA_DB_NAME")).strip()
-        user = db_user if db_user is not None else _env("TIA_DB_USER", f"tia_{name}" if name else "")
-        password = db_password if db_password is not None else _env("TIA_DB_PASSWORD", "tia-dev-pass")
+        app: dict[str, Any] = file_settings.settings_file("app.yaml")
+        raw_db = app.get("db")
+        file_db: dict[str, Any] = raw_db if isinstance(raw_db, dict) else {}
+        name = (db_name if db_name is not None else _env("TIA_DB_NAME", str(file_db.get("name") or ""))).strip()
+        user = db_user if db_user is not None else _env(
+            "TIA_DB_USER", str(file_db.get("user") or (f"tia_{name}" if name else ""))
+        )
+        password = db_password if db_password is not None else _env(
+            "TIA_DB_PASSWORD", str(file_db.get("password") or "tia-dev-pass")
+        )
         db = DbConfig(
-            host=_env("TIA_DB_HOST", "127.0.0.1"),
-            port=int(_env("TIA_DB_PORT", "3306")),
+            host=_env("TIA_DB_HOST", str(file_db.get("host") or "127.0.0.1")),
+            port=int(_env("TIA_DB_PORT", str(file_db.get("port") or 3306))),
             user=user,
             password=password,
             name=name,
-            charset=_env("TIA_DB_CHARSET", "utf8mb4"),
+            charset=_env("TIA_DB_CHARSET", str(file_db.get("charset") or "utf8mb4")),
         )
-        root = Path(_env("TIA_APP_ROOT", str(app_root or "/app"))).resolve()
-        store = Path(store_path or _env("TIA_STORE", str(_IMPL_ROOT / "var" / "tia.db")))
-        accounts = Path(_env("TIA_ACCOUNTS", str(store.parent / "accounts.yaml")))
+        root = Path(
+            _env("TIA_APP_ROOT", str(app_root or app.get("app_root") or "/app"))
+        ).resolve()
+        store = Path(
+            store_path
+            or _env("TIA_STORE", str(app.get("store") or str(_IMPL_ROOT / "var" / "tia.db")))
+        )
+        accounts = Path(
+            _env("TIA_ACCOUNTS", str(app.get("accounts") or str(store.parent / "accounts.yaml")))
+        )
         return cls(
             impl_root=_IMPL_ROOT,
             app_root=root,
@@ -121,7 +139,13 @@ class Settings:
             db=db,
             profile=ProfileConfig.load(profile),
             accounts_path=accounts,
-            default_account=_env("TIA_ACCOUNT", ""),
+            default_account=_env("TIA_ACCOUNT", str(app.get("default_account") or "")),
+            chrome=_env("TIA_CHROME", str(app.get("chrome") or "")),
+            reports_path=(
+                Path(_env("TIA_REPORTS", str(app.get("reports"))))
+                if (_env("TIA_REPORTS", "") or app.get("reports"))
+                else None
+            ),
         )
 
     def with_db_name(self, name: str) -> Settings:

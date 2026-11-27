@@ -59,6 +59,32 @@ Database credentials and the target application root are passed through environm
 (`TIA_DB_HOST`, `TIA_DB_PORT`, `TIA_DB_NAME`, `TIA_DB_USER`, `TIA_DB_PASSWORD`,
 `TIA_APP_ROOT`, `TIA_STORE`). Never commit credentials.
 
+## Configuration
+
+Runtime settings live in `impl/config/local/`, which is git-ignored; only the two
+templates in `impl/config/` are committed:
+
+```bash
+cp impl/config/app.example.yaml impl/config/local/app.yaml
+cp impl/config/llm.example.yaml impl/config/local/llm.yaml
+```
+
+- `app.yaml` — target application root, database connection, store/report paths,
+  Chrome binary, attempt budgets (`entry/verify/payload/write/direct`).
+- `llm.yaml` — model endpoints. It ships with a local Qwen profile and a
+  DeepSeek profile (`https://api.deepseek.com/v1`, model `deepseek-flash`) whose
+  key is left empty; either fill `api_key`, or set `key_env: DEEPSEEK_API_KEY`.
+
+Values are resolved as CLI argument > environment variable > `app.yaml` > built-in
+default, so a run needs no `TIA_*` variables once the files are in place. Pick a
+model per run with `--llm-profile deepseek`, and inspect the result with:
+
+```bash
+uv run tia-agent llm
+```
+
+Never commit `impl/config/local/` or any real key; the templates keep placeholders only.
+
 ## Development
 
 ```bash

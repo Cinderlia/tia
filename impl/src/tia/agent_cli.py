@@ -48,6 +48,11 @@ def _add_common(parser: argparse.ArgumentParser, *, base_url_required: bool) -> 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tia-agent", description="TIA agent")
     parser.add_argument("--version", action="store_true")
+    parser.add_argument(
+        "--llm-profile",
+        default=None,
+        help="Model profile from config/local/llm.yaml (default: its active profile)",
+    )
     sub = parser.add_subparsers(dest="command")
 
     trigger = sub.add_parser("trigger", help="Execute P0–P6 trigger forensics on the slice")
@@ -194,6 +199,9 @@ def _parser() -> argparse.ArgumentParser:
         help="Report directory for this run (default: <store dir>/reports)",
     )
     pipeline.add_argument("--json", action="store_true")
+
+    llm = sub.add_parser("llm", help="List model profiles from config/local/llm.yaml")
+    llm.add_argument("--json", action="store_true")
     return parser
 
 
@@ -610,6 +618,8 @@ def _run_login(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
+    if getattr(args, "llm_profile", None):
+        os.environ["TIA_LLM_PROFILE"] = args.llm_profile
     if args.version:
         print(f"tia-agent {__version__}")
         return 0
@@ -629,8 +639,24 @@ def main(argv: list[str] | None = None) -> int:
         "login": _run_login,
         "browser-install": _run_browser_install,
         "browser-check": _run_browser_check,
+        "llm": _run_llm,
     }
     return handlers[args.command](args)
+
+
+def _run_llm(args: argparse.Namespace) -> int:
+    from tia.ad.llm import LlmClient
+    from tia.inf.settings import active_llm_profile, config_dir, load_llm_profiles
+
+    profiles = load_llm_profiles()
+    payload = {
+        "active": active_llm_profile(),
+        "config_dir": str(config_dir()),
+        "profiles": [profiles[name].public() for name in sorted(profiles)],
+        "client_ready": LlmClient.from_env() is not None,
+    }
+    print(json.dumps(payload, indent=2))
+    return 0 if payload["client_ready"] else 1
 
 
 def _run_browser_install(args: argparse.Namespace) -> int:

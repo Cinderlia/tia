@@ -1,0 +1,25 @@
+# Model endpoints. Copy to impl/config/local/llm.yaml (git-ignored).
+#
+# active: profile used by default; switch per run with --llm-profile, or
+# globally with TIA_LLM_PROFILE. A key may be written here (dev) or supplied
+# through key_env (the intended production form). Never commit the real file.
+
+active: qwen
+
+profiles:
+  qwen:
+    base_url: http://172.28.8.100:8000/v1
+    model: Qwen3.8-27B
+    api_key: "<your-local-key>"
+    timeout: 120
+    max_tokens: 4096
+    enable_thinking: false
+
+  deepseek:
+    base_url: https://api.deepseek.com/v1
+    model: deepseek-flash
+    api_key: ""
+    key_env: DEEPSEEK_API_KEY
+    timeout: 120
+    max_tokens: 4096
+    enable_thinking: false

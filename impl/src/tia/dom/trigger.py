@@ -31,15 +31,16 @@ from tia.cap.payloads import infer_sink_context, render, shapes_for
 from tia.cap.request_plan import plan_request
 from tia.inf.reports import write_case_report
 from tia.inf.runtime import get_runtime
+from tia.inf.settings import attempt_limit
 from tia.inf.store import now_iso
 from tia.orch.judge import judge_trigger
 from tia.orch.kernel import Kernel, LocalToolClient, StepRecord, ToolCallError, ToolClient
 from tia.orch.learning import record_case
 
 #: Exploration budget: enough attempts for complex entry pages, still bounded.
-ENTRY_ATTEMPTS = max(1, int(os.environ.get("TIA_ENTRY_ATTEMPTS", "8")))
+ENTRY_ATTEMPTS = attempt_limit("entry", 8)
 #: How many payload shapes one slice may try before the slice is judged.
-PAYLOAD_ATTEMPTS = max(1, int(os.environ.get("TIA_PAYLOAD_ATTEMPTS", "3")))
+PAYLOAD_ATTEMPTS = attempt_limit("payload", 3)
 
 _INSERT_RE = re.compile(r"insert\s+into\s+`?(\w+)`?\s*\(([^)]*)\)", re.IGNORECASE)
 _SELECT_TABLE_RE = re.compile(r"\bfrom\s+`?(\w+)`?", re.IGNORECASE)

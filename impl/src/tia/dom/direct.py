@@ -37,13 +37,14 @@ from tia.cap.forms import (
 from tia.dom.trigger import _POST_VAR_RE, StageRecord, TriggerResult, normalize_slice
 from tia.inf.reports import write_case_report
 from tia.inf.runtime import get_runtime
+from tia.inf.settings import attempt_limit
 from tia.orch.judge import judge_direct
 from tia.orch.kernel import Kernel, LocalToolClient, ToolCallError, ToolClient
 from tia.orch.learning import hints_for, record_case
 
 
 def _attempts() -> int:
-    return max(1, int(os.environ.get("TIA_DIRECT_ATTEMPTS", "8")))
+    return attempt_limit("direct", 8)
 
 
 def _tag() -> str:

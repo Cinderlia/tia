@@ -40,12 +40,18 @@ class LlmClient:
 
     @classmethod
     def from_env(cls) -> LlmClient | None:
-        """Build a client from ``TIA_LLM_*``; return None when unconfigured."""
-        base = os.environ.get("TIA_LLM_BASE", "").strip()
-        model = os.environ.get("TIA_LLM_MODEL", "").strip()
+        """Build a client from ``llm.yaml`` (``TIA_LLM_*`` overrides it)."""
+        from tia.inf.settings import llm_profile
+
+        profile = llm_profile()
+        base = os.environ.get("TIA_LLM_BASE", "").strip() or (profile.base_url if profile else "")
+        model = os.environ.get("TIA_LLM_MODEL", "").strip() or (profile.model if profile else "")
         if not base or not model:
             return None
-        return cls(base, model, os.environ.get("TIA_LLM_KEY") or None)
+        key = os.environ.get("TIA_LLM_KEY", "").strip() or (profile.resolved_key() if profile else "")
+        timeout = profile.timeout if profile else 30.0
+        max_tokens = profile.max_tokens if profile else 512
+        return cls(base, model, key or None, timeout=timeout, max_tokens=max_tokens)
 
     async def complete_json(self, system: str, user: str) -> dict[str, Any]:
         """Ask for one JSON object; return ``{}`` on any transport/parse failure."""

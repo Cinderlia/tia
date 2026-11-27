@@ -58,3 +58,4 @@ Thumbs.db
 # ---- Collector build artifacts ----
 impl/probe-php/vendor/
 *.phar
+impl/config/local/

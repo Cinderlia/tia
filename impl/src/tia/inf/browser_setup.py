@@ -74,7 +74,11 @@ def _binary_relative(platform_tag_: str) -> Path:
 
 def chrome_binary(version: str | None = None) -> Path | None:
     """Return ``TIA_CHROME`` when set, otherwise the pinned downloaded build."""
-    override = os.environ.get("TIA_CHROME", "").strip()
+    from tia.inf.settings import settings_file
+
+    override = os.environ.get("TIA_CHROME", "").strip() or str(
+        settings_file("app.yaml").get("chrome") or ""
+    )
     if override:
         path = Path(override).expanduser()
         return path if path.is_file() else None

@@ -31,6 +31,7 @@ from tia.cap.request_plan import plan_request
 from tia.dom.trigger import StageRecord
 from tia.inf.reports import write_case_report
 from tia.inf.runtime import get_runtime
+from tia.inf.settings import attempt_limit
 from tia.orch.judge import judge_inject
 from tia.orch.kernel import Kernel, LocalToolClient, ToolCallError, ToolClient
 from tia.orch.learning import preferred_payload_shape, record_case
@@ -38,8 +39,8 @@ from tia.orch.learning import preferred_payload_shape, record_case
 DEFAULT_PAYLOAD = "<script>alert(1)</script>"
 
 #: Verification attempts on the read page: bounded exploration, not one shot.
-VERIFY_ATTEMPTS = max(1, int(os.environ.get("TIA_VERIFY_ATTEMPTS", "4")))
-WRITE_ATTEMPTS = max(1, int(os.environ.get("TIA_WRITE_ATTEMPTS", "2")))
+VERIFY_ATTEMPTS = attempt_limit("verify", 4)
+WRITE_ATTEMPTS = attempt_limit("write", 2)
 _TAG_RE = re.compile(r"<tia-([a-z0-9]{4})>")
 _POST_VAR_RE = re.compile(r"\$_POST\[\s*[\'\"]([A-Za-z_][\w]*)[\'\"]\s*\]")
 
