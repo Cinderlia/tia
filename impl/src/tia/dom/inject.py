@@ -18,7 +18,14 @@ from typing import Any
 from urllib.parse import urlencode
 
 from tia.ad.llm import LlmClient
-from tia.cap.cleanup import cleanup_tagged_rows
+from tia.cap.cleanup import (
+    cleanup_new_rows,
+    cleanup_tagged_rows,
+    key_snapshot,
+    max_key,
+    parent_links,
+    remove_orphan_parents,
+)
 from tia.cap.delivery import DeliveryAttempt, deliver
 from tia.cap.domscan import Document, echo_snapshot, parse
 from tia.cap.entry import (
@@ -48,34 +55,36 @@ _ACTIVE_CLEANUP: ContextVar[dict[str, Any] | None] = ContextVar(
 
 
 async def _cleanup_tagged_rows(kernel: Kernel, state: dict[str, Any]) -> int:
-    """Delete every row carrying this run's tag; return how many rows remain."""
+    """Delete every row this run left behind, whoever wrote it.
+
+    The tag covers rows the application created, the insert ids the probe
+    reported cover parent rows that carry no tag, and the foreign keys of the
+    target table cover the parents those insert ids could not name.
+    """
     case_id = str(state.get("case_id") or "")
+    tag = str(state.get("tag") or "")
+    links = [dict(link) for link in state.get("parents") or []]
+    tables = [
+        str(state.get("table") or ""),
+        *[str(table or "") for table in state.get("extra_tables") or []],
+        *[str(link.get("table") or "") for link in links],
+    ]
     related = [
         str(row.get("table") or "") for row in state.get("extra_rows") or []
-    ] + [str(table or "") for table in state.get("extra_tables") or []]
+    ]
     if case_id:
         targets = get_runtime().store.write_targets(case_id)
         known = {str(target.get("table") or "") for target in targets}
         added = [
             {"table": table, "mode": "delete"}
-            for table in dict.fromkeys(related)
+            for table in dict.fromkeys([*tables, *related])
             if table and table not in known
         ]
-        if added:
-            # A cleanup may have to remove a parent row the application created
-            # in another table; register those tables for the same case.
-            kernel.set_write_targets(targets + added)
-    columns = list(state.get("columns") or [])
-    if not columns and state.get("column"):
-        columns = [str(state["column"])]
-    residue = await cleanup_tagged_rows(
-        kernel,
-        case_id=str(state.get("case_id") or ""),
-        table=str(state.get("table") or ""),
-        columns=columns,
-        tag=str(state.get("tag") or ""),
-    )
-    tag = str(state.get("tag") or "")
+        register = getattr(kernel, "set_write_targets", None)
+        if added and callable(register):
+            # A cleanup may have to remove a row the application created in
+            # another table; register those tables for the same case.
+            register(targets + added)
     for row in state.get("extra_rows") or []:
         # A parent row created by the request carries no tag of its own; it is
         # identified by the insert id the probe reported for its statement.
@@ -84,8 +93,8 @@ async def _cleanup_tagged_rows(kernel: Kernel, state: dict[str, Any]) -> int:
             schema = await kernel.call("db_schema", {"table": table})
         except ToolCallError:
             continue
-        tables = schema.get("tables") or []
-        keys = (tables[0].get("primary_key") if tables else []) or []
+        found = schema.get("tables") or []
+        keys = (found[0].get("primary_key") if found else []) or []
         if not keys:
             continue
         try:
@@ -96,41 +105,38 @@ async def _cleanup_tagged_rows(kernel: Kernel, state: dict[str, Any]) -> int:
                         f"DELETE FROM `{table}` WHERE `{keys[0]}` = "
                         f"{int(row.get('id') or 0)}"
                     ),
-                    "case_id": str(state.get("case_id") or ""),
+                    "case_id": case_id,
                     "allow_multi": True,
                 },
             )
         except ToolCallError:
             continue
-    for table in state.get("extra_tables") or []:
-        # The application may write more than the modelled table (a parent row
-        # beside the record that stores the payload); sweep every related table
-        # the request touched, using its own text columns.
-        try:
-            schema = await kernel.call("db_schema", {"table": str(table)})
-        except ToolCallError:
-            continue
-        tables = schema.get("tables") or []
-        if not tables:
-            continue
-        text_columns = [
-            str(item.get("name"))
-            for item in tables[0].get("columns") or []
-            if "char" in _column_type(tables[0], str(item.get("name")))
-            or "text" in _column_type(tables[0], str(item.get("name")))
-        ]
-        if not text_columns:
-            continue
-        residue = max(
-            residue,
-            await cleanup_tagged_rows(
-                kernel,
-                case_id=str(state.get("case_id") or ""),
-                table=str(table),
-                columns=text_columns,
-                tag=tag,
-            ),
+    snapshots = dict(state.get("snapshots") or {})
+    table = str(state.get("table") or "")
+    if table in snapshots:
+        # The snapshot turns the tag lookup into an indexed key range: only the
+        # rows created after the request are examined at all.
+        residue = await cleanup_new_rows(
+            kernel, case_id=case_id, snapshots=snapshots, tag=tag
         )
+    else:
+        columns = [str(column) for column in state.get("columns") or [] if str(column)]
+        if not columns and state.get("column"):
+            columns = [str(state["column"])]
+        residue = await cleanup_tagged_rows(
+            kernel,
+            case_id=case_id,
+            table=table,
+            columns=columns,
+            tag=tag,
+        )
+    snapshot = {
+        str(table): int(value)
+        for table, value in (state.get("parent_max") or {}).items()
+    }
+    await remove_orphan_parents(
+        kernel, case_id=case_id, links=links, snapshot=snapshot
+    )
     return residue
 
 #: Verification attempts on the read page: bounded exploration, not one shot.
@@ -221,6 +227,23 @@ def _insert_line(lines: list[dict[str, Any]]) -> int | None:
             if isinstance(number, int):
                 return number
     return None
+
+
+_INSERT_TABLE_RE = re.compile(
+    r"INSERT\s+INTO\s+[`'\"]?([A-Za-z_][\w]*)", re.IGNORECASE
+)
+
+
+def _insert_tables(lines: list[dict[str, Any]], limit: int = 4) -> list[str]:
+    """Tables the source window inserts into (a request may write several)."""
+    found: list[str] = []
+    for item in lines:
+        for name in _INSERT_TABLE_RE.findall(str(item.get("text", ""))):
+            if name not in found:
+                found.append(name)
+        if len(found) >= limit:
+            break
+    return found
 
 
 def _insert_lines(lines: list[dict[str, Any]], limit: int = 4) -> list[int]:
@@ -507,6 +530,17 @@ async def _run_inject(
     target["column"] = chosen_column
     notes["entry"] = {"url": form.action, "method": form.method, "field": field_name, "fields": form.fields}
     notes["payload"] = payload
+    links = parent_links(str(target.get("table") or ""))
+    parent_max = {
+        str(link["table"]): await max_key(kernel, str(link["table"]), str(link["parent_column"]))
+        for link in links
+    }
+    write_tables = [str(target.get("table") or "")]
+    write_tables += [str(link.get("table") or "") for link in links]
+    write_tables += _insert_tables(
+        [item for item in source.get("lines") or [] if isinstance(item, dict)]
+    )
+    snapshots = await key_snapshot(kernel, write_tables)
     state: dict[str, Any] = {
         "kernel": kernel,
         "case_id": result.case_id,
@@ -514,6 +548,9 @@ async def _run_inject(
         "column": chosen_column,
         "tag": tag,
         "pending": False,
+        "parents": links,
+        "parent_max": parent_max,
+        "snapshots": snapshots,
     }
     _ACTIVE_CLEANUP.set(state)
     notes["_cleanup_needed"] = True

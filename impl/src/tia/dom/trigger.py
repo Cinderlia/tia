@@ -20,7 +20,7 @@ from urllib.parse import urlencode
 
 from tia.ad.llm import LlmClient
 from tia.cap.case import parse_sink
-from tia.cap.cleanup import cleanup_tagged_rows
+from tia.cap.cleanup import cleanup_new_rows, cleanup_tagged_rows, key_snapshot
 from tia.cap.entry import (
     EntryCandidate,
     derive_payload_constraints,
@@ -475,12 +475,21 @@ async def _sweep_tagged_rows(state: dict[str, Any] | None) -> None:
     """Delete every row carrying this run's tag, whoever wrote it."""
     if not state or state.get("kernel") is None:
         return
+    kernel = state["kernel"]
+    case_id = str(state.get("case_id") or "")
+    tag = str(state.get("tag") or "")
+    snapshots = dict(state.get("snapshots") or {})
+    if str(state.get("table") or "") in snapshots:
+        await cleanup_new_rows(
+            kernel, case_id=case_id, snapshots=snapshots, tag=tag
+        )
+        return
     await cleanup_tagged_rows(
-        state["kernel"],
-        case_id=str(state.get("case_id") or ""),
+        kernel,
+        case_id=case_id,
         table=str(state.get("table") or ""),
         columns=[str(column) for column in state.get("columns") or []],
-        tag=str(state.get("tag") or ""),
+        tag=tag,
     )
 
 
@@ -676,12 +685,16 @@ async def _run_trigger(
     # The application writes rows as well (the verification POST submits the
     # form), so tag-based cleanup covers both our direct writes and the app's.
     if case is not None:
+        # Record the keys before the payload write so cleanup can delete by key
+        # range instead of scanning the whole table for the tag.
+        snapshots = await key_snapshot(kernel, [table])
         case["cleanup"] = {
             "kernel": kernel,
             "case_id": case_id,
             "table": table,
             "columns": value_columns,
             "tag": tag,
+            "snapshots": snapshots,
         }
 
     # The model picks the storage column and shapes the payload for the sink
