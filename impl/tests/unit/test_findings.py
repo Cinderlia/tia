@@ -107,3 +107,27 @@ def test_first_order_finding(tmp_path: Path, monkeypatch) -> None:
     assert "Confirmed first-order XSS" in text
     assert "GET http://127.0.0.1/xvwa/vulnerabilities/reflected_xss/" in text
     assert os.environ["TIA_REPORTS"] in str(path)
+
+
+def test_second_order_finding_lists_constraint_prerequisites(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("TIA_REPORTS", str(tmp_path / "reports"))
+    store = Store(tmp_path / "tia.db")
+    notes = dict(SECOND)
+    notes["constraints"] = [
+        {
+            "constraint_id": "dc-1",
+            "table": "posts",
+            "column": "status",
+            "value": "publish",
+            "predicate": "page lists the post only when it is published",
+            "replay": "app_request",
+        }
+    ]
+    case_id = _case(store, notes)
+    path = finding_second_order(store, case_id)
+    assert path is not None
+    text = path.read_text(encoding="utf-8")
+    assert "## Prerequisites (database constraints)" in text
+    assert "`posts`.`status` must equal `publish`" in text
+    assert "## Reproduction order" in text
+    assert "Rewrite `posts`.`status` to `publish`" in text

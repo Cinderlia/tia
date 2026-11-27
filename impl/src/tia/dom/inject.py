@@ -585,10 +585,10 @@ async def run_inject(
         step["write_slice_id"] = str(chosen.get("write_slice_id"))
         step["page_url"] = str(chosen.get("page_url") or base_url)
         try:
-            window = await call(
+            constraint_window = await call(
                 "source_read", {"file": c_file, "around": {"line": c_line, "n": 40}}
             )
-            c_text = "\n".join(item["text"] for item in window.get("lines") or [])
+            c_text = "\n".join(item["text"] for item in constraint_window.get("lines") or [])
         except ToolCallError as exc:
             step["error"] = f"source_read failed: {exc}"
             constraint_steps.append(step)
@@ -598,9 +598,9 @@ async def run_inject(
         col_params = _column_params(c_text)
         step["parameter"] = col_params.get(c_column) or c_column
         try:
-            page = await call("http_request", {"method": "GET", "url": str(step["page_url"])})
+            constraint_page = await call("http_request", {"method": "GET", "url": str(step["page_url"])})
             c_forms = forms_from_document(
-                parse(str(page.get("body") or "")), str(step["page_url"])
+                parse(str(constraint_page.get("body") or "")), str(step["page_url"])
             )
         except ToolCallError as exc:
             c_forms = []
@@ -614,13 +614,13 @@ async def run_inject(
             stage("I5.5", False, f"CONSTRAINT_REPLAY_FAILED {c_table}.{c_column}")
             result.verdict = "CONSTRAINT_REPLAY_FAILED"
             return await _finish(kernel, result)
-        values = {
+        replay_values = {
             item.name: str(item.value or "tia")
             for item in c_form.fields
             if item.type not in {"submit", "button", "checkbox", "radio"}
         }
-        values[str(step["parameter"])] = c_value
-        step["values"] = dict(values)
+        replay_values[str(step["parameter"])] = c_value
+        step["values"] = dict(replay_values)
         armed_now = False
         try:
             await call(
@@ -641,7 +641,7 @@ async def run_inject(
                     "case_id": result.case_id,
                     "url": c_form.action,
                     "method": "POST",
-                    "body": urlencode(values),
+                    "body": urlencode(replay_values),
                     "headers": {"Content-Type": "application/x-www-form-urlencoded"},
                     "capture_html": True,
                 },
@@ -653,8 +653,8 @@ async def run_inject(
             if armed_now:
                 with contextlib.suppress(ToolCallError):
                     await call("probe_disarm", {"case_id": result.case_id})
-        queries = replay.get("queries") or []
-        step["affected"] = sum(int(q.get("affected_rows") or 0) for q in queries)
+        replay_queries = replay.get("queries") or []
+        step["affected"] = sum(int(q.get("affected_rows") or 0) for q in replay_queries)
         step["probe_hit"] = step["affected"] > 0
         payload_column = str(target.get("column") or "")
         value_ok = False
@@ -1019,7 +1019,8 @@ async def run_inject(
     if executable and verify is not None:
         try:
             if notes.get("verify_on") == "probe_page":
-                method, target_url, fields = "POST", form.action, dict(values)
+                page_values = dict(delivery.plan.values) if delivery.plan else {}
+                method, target_url, fields = "POST", form.action, page_values
             else:
                 attempts = notes.get("verify_attempts") or []
                 last = attempts[-1] if attempts else {}

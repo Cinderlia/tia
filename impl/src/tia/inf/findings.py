@@ -138,6 +138,44 @@ def _entry_pairs(entry: dict[str, Any], field: str, payload: str) -> list[tuple[
     return pairs
 
 
+
+def _constraint_section(notes: dict[str, Any], kind: str) -> list[str]:
+    """Replay prerequisites trigger discovered as database-only branch conditions."""
+    if kind != "second_order":
+        return []
+    constraints = [item for item in notes.get("constraints") or [] if isinstance(item, dict)]
+    if not constraints:
+        return []
+    lines = ["", "## Prerequisites (database constraints)", ""]
+    for index, item in enumerate(constraints, 1):
+        table = item.get("table") or "?"
+        column = item.get("column") or "?"
+        value = item.get("value")
+        predicate = item.get("predicate") or "the application branch reads this condition"
+        lines.append(
+            f"{index}. `{table}`.`{column}` must equal `{value}` — {predicate}"
+        )
+    lines += ["", "## Reproduction order", ""]
+    step = 1
+    entry = notes.get("entry") if isinstance(notes.get("entry"), dict) else {}
+    field = (entry or {}).get("field") or "the payload field"
+    url = (entry or {}).get("url") or "the injection page"
+    lines.append(f"{step}. Open `{url}` and submit the payload in `{field}`.")
+    for item in constraints:
+        step += 1
+        table = item.get("table") or "?"
+        column = item.get("column") or "?"
+        value = item.get("value")
+        replay = item.get("replay") or "app_request"
+        lines.append(
+            f"{step}. Rewrite `{table}`.`{column}` to `{value}` through the application "
+            f"(replay: {replay})."
+        )
+    step += 1
+    lines.append(f"{step}. Open the read page; the payload is rendered there.")
+    return lines
+
+
 def _verify_section(notes: dict[str, Any], kind: str) -> list[str]:
     """Steps a human can execute in a browser (URL, plus a form for POST)."""
 
@@ -260,6 +298,7 @@ def write_finding(
             "",
             "This value was written to the database directly (no HTTP request was confirmed to store it).",
         ]
+    lines += _constraint_section(notes, kind)
     lines += _verify_section(notes, kind)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
