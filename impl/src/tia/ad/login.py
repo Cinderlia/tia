@@ -9,7 +9,7 @@ and trace tools unchanged.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 
@@ -18,6 +18,19 @@ from tia.cap.forms import PageForm, forms_from_document
 from tia.inf.accounts import Account
 
 _MAX_VISIBLE_FIELDS = 10
+
+# A login redirect is a success signal; the landing page itself can be slow
+# (dashboards that call out to remote services), so it is fetched with a short
+# deadline and a timeout is not treated as a failed login.
+_LANDING_TIMEOUT = 5.0
+
+
+def _same_page(left: str, right: str) -> bool:
+    """True when two URLs point at the same page (query and fragment ignored)."""
+
+    a = urlsplit(left)
+    b = urlsplit(right)
+    return (a.scheme, a.netloc, a.path or "/") == (b.scheme, b.netloc, b.path or "/")
 
 
 @dataclass(slots=True)
@@ -123,12 +136,28 @@ def login(
                 data=None if method == "GET" else values,
                 params=values if method == "GET" else None,
             )
+            cookies = {name: value for name, value in client.cookies.items()}
             hops = 0
+            left_login_page = False
             while response.is_redirect and hops < max_redirects:
                 location = response.headers.get("location", "")
-                response = client.get(urljoin(str(response.url), location))
+                target = urljoin(str(response.url), location)
+                left_login_page = left_login_page or not _same_page(target, account.login_url)
+                try:
+                    response = client.get(target, timeout=min(timeout, _LANDING_TIMEOUT))
+                except httpx.TimeoutException:
+                    if left_login_page and cookies:
+                        return LoginResult(
+                            True,
+                            302,
+                            target,
+                            "LOGGED_IN_TIMEOUT",
+                            cookies,
+                            action,
+                            list(values),
+                        )
+                    raise
                 hops += 1
-            cookies = {name: value for name, value in client.cookies.items()}
             url = str(response.url)
             if response.status_code >= 400:
                 return LoginResult(

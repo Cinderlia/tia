@@ -654,6 +654,25 @@ async def _run_trigger(
     column_length = {c["name"]: c.get("length") for c in table_meta["columns"]}
     column_type = {c["name"]: str(c.get("type") or "") for c in table_meta["columns"]}
     payload_column = value_columns[0] if value_columns else ""
+    # Prefer changing one column of an existing row: an INSERT must satisfy every
+    # NOT NULL column (foreign keys included), while an UPDATE of a row the read
+    # path already returns needs only the row key. db_write records the before
+    # image, so undo restores the previous value.
+    write_mode = "insert"
+    update_row: dict[str, Any] | None = None
+    if pk_columns and value_columns:
+        order_by = ", ".join(f"`{c}` DESC" for c in pk_columns)
+        try:
+            existing = await kernel.call(
+                "db_read", {"sql": f"SELECT * FROM `{table}` ORDER BY {order_by} LIMIT 1"}
+            )
+            candidate = (existing.get("rows") or [None])[0]
+            if candidate and all(candidate.get(c) is not None for c in pk_columns):
+                update_row = candidate
+                write_mode = "update"
+        except ToolCallError:
+            update_row = None
+    notes["write_mode"] = write_mode
     # The application writes rows as well (the verification POST submits the
     # form), so tag-based cleanup covers both our direct writes and the app's.
     if case is not None:
@@ -725,10 +744,17 @@ async def _run_trigger(
         written_columns = [col for col, value in zip(value_columns, values, strict=True) if value == payload]
         if written_columns:
             payload_column = written_columns[0]
-        sql = (
-            f"INSERT INTO `{table}` ({', '.join(f'`{c}`' for c in value_columns)}) "
-            f"VALUES ({', '.join(_sql_literal(v) for v in values)})"
-        )
+        if write_mode == "update" and update_row is not None:
+            where = " AND ".join(f"`{c}` = {_sql_literal(update_row[c])}" for c in pk_columns)
+            sql = (
+                f"UPDATE `{table}` SET `{payload_column}` = {_sql_literal(payload)}"
+                f" WHERE {where}"
+            )
+        else:
+            sql = (
+                f"INSERT INTO `{table}` ({', '.join(f'`{c}`' for c in value_columns)}) "
+                f"VALUES ({', '.join(_sql_literal(v) for v in values)})"
+            )
         try:
             written = await kernel.call("db_write", {"sql": sql})
         except ToolCallError as exc:
@@ -740,6 +766,7 @@ async def _run_trigger(
         change = written.get("change") if isinstance(written, dict) else None
         change_id = change.get("change_id") if change else None
         notes["change_id"] = change_id
+        notes["write_sql"] = sql
         notes["insert_sql"] = sql
         payload_attempts.append({"shape": shape, "payload": payload, "written": True})
 
@@ -1174,6 +1201,6 @@ async def _run_trigger(
     )
 
 
-def _sql_literal(value: str) -> str:
-    escaped = value.replace("\\", "\\\\").replace("'", "\\'")
+def _sql_literal(value: object) -> str:
+    escaped = str(value).replace("\\", "\\\\").replace("'", "\\'")
     return f"'{escaped}'"

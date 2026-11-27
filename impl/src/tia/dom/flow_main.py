@@ -11,6 +11,7 @@ just another ``sink_class`` on the same queue.
 
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -23,6 +24,7 @@ from tia.dom.main import MainResult, _read_target, _report
 from tia.dom.prover import run_flow_prover
 from tia.inf.findings import finding_db_only, finding_first_order, finding_second_order
 from tia.inf.reports import RunReports
+from tia.inf.runtime import get_runtime
 from tia.orch.flow import READ, Site, build_flows, site_role
 from tia.orch.identity import direct_identity, identity_of
 from tia.orch.kernel import ToolClient
@@ -44,7 +46,7 @@ class FlowSeedResult:
 def _table_columns(raw: dict[str, Any], index: int, role: str, reader: Reader | None) -> tuple[str, tuple[str, ...]]:
     entry = resolve_entry(raw, index, reader=reader)
     if entry is None or not entry.ops:
-        return "", ()
+        return _read_identity_from_code(raw) if role == READ else ("", ())
     preferred = "insert" if role == "write" else "select"
     for op in entry.ops:
         if op.op == preferred and op.table:
@@ -52,7 +54,57 @@ def _table_columns(raw: dict[str, Any], index: int, role: str, reader: Reader | 
     for op in entry.ops:
         if op.table:
             return op.table, tuple(op.columns)
+    if role == READ:
+        return _read_identity_from_code(raw)
     return "", ()
+
+
+_COLUMN_ACCESS = re.compile(r"\$[A-Za-z_]\w*\s*\[\s*['\"]([A-Za-z_]\w*)['\"]\s*\]")
+_PROPERTY_ACCESS = re.compile(r"\$[A-Za-z_]\w*->([A-Za-z_]\w*)")
+
+
+def _columns_in_code(code: str) -> list[str]:
+    """Column-looking names a sink expression reads from a row/array."""
+
+    found = _COLUMN_ACCESS.findall(code) + _PROPERTY_ACCESS.findall(code)
+    return list(dict.fromkeys(name for name in found if name))
+
+
+def _read_identity_from_code(raw: dict[str, Any]) -> tuple[str, tuple[str, ...]]:
+    """Infer the table a second-order sink reads from its own expression.
+
+    A template sink often has no SQL of its own (the query lives in the module
+    that includes it), so the only identity available at seeding time is the
+    column names the expression touches. Resolve them against the schema and
+    pick the table that carries the most of them.
+    """
+
+    sink = raw.get("sink")
+    sink_data: dict[str, Any] = sink if isinstance(sink, dict) else {}
+    code = str(raw.get("sinkCode") or sink_data.get("code") or "")
+    columns = _columns_in_code(code)
+    if not columns:
+        return "", ()
+    try:
+        rows = get_runtime().mysql.select(
+            "SELECT TABLE_NAME AS table_name, COLUMN_NAME AS column_name"
+            " FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()"
+        ).rows
+    except Exception:  # noqa: BLE001 - schema lookup is best effort
+        return "", ()
+    by_table: dict[str, set[str]] = {}
+    for row in rows:
+        by_table.setdefault(str(row["table_name"]), set()).add(str(row["column_name"]).lower())
+    wanted = {column.lower() for column in columns}
+    ranked = sorted(
+        ((len(wanted & owned), name) for name, owned in by_table.items()),
+        key=lambda item: (-item[0], item[1]),
+    )
+    if not ranked or ranked[0][0] == 0:
+        return "", ()
+    table = ranked[0][1]
+    matched = tuple(column for column in columns if column.lower() in by_table[table])
+    return table, matched
 
 
 def seed_flow_queue(
@@ -170,7 +222,7 @@ def _constraint_candidates(
             {
                 "write_slice_id": str(writer_id),
                 "score": int(flow.get("score") or 60),
-                "table": flow.get("table") or "",
+                "table": flow.get("table_name") or flow.get("table") or "",
                 "columns": list(flow.get("columns") or []),
                 "page_url": url_for(raw) if url_for is not None else base_url,
             }
@@ -312,7 +364,7 @@ async def run_flow_queue(
             pair_map = _constraint_candidates(flow, plan, store, url_for, base_url)
             hint = {
                 "pair_id": str(flow["flow_id"]),
-                "table": flow.get("table") or "",
+                "table": flow.get("table_name") or flow.get("table") or "",
                 "columns": list(flow.get("columns") or []),
                 "confidence": int(flow.get("score") or 60),
                 "direction": "write_then_read",

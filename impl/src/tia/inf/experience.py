@@ -17,6 +17,27 @@ from tia.inf.store import Store, now_iso
 RAW_LIMIT = 262_144
 
 
+def _error_summary(error: dict[str, Any] | None) -> dict[str, Any]:
+    """Keep the actionable part of a failure (code + message + hint) in the trace.
+
+    A bare code (``{"error": "ENV_ERROR"}``) tells the agent nothing about why a
+    call failed, so the reason from the tool (for example a database constraint)
+    is carried into the compact summary the next agent reads.
+    """
+
+    body = error or {}
+    summary: dict[str, Any] = {"error": body.get("code")}
+    message = str(body.get("message") or "").strip()
+    if message:
+        summary["message"] = message[:400]
+    hint = str(body.get("hint") or "").strip()
+    if hint:
+        summary["hint"] = hint[:240]
+    if body.get("retryable"):
+        summary["retryable"] = True
+    return summary
+
+
 def summarize(tool: str, data: Any) -> dict[str, Any]:
     """Return a compact, agent-readable gist of one tool result (never the raw body)."""
     if not isinstance(data, dict):
@@ -104,7 +125,7 @@ class ExperienceRecorder:
             arguments=_bounded(arguments),
             ok=ok,
             cost_ms=cost_ms,
-            summary=summarize(tool, data) if ok else {"error": (error or {}).get("code")},
+            summary=summarize(tool, data) if ok else _error_summary(error),
             error_code=(error or {}).get("code") if not ok else None,
             observed_at=now_iso(),
         )

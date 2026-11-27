@@ -49,16 +49,89 @@ _ACTIVE_CLEANUP: ContextVar[dict[str, Any] | None] = ContextVar(
 
 async def _cleanup_tagged_rows(kernel: Kernel, state: dict[str, Any]) -> int:
     """Delete every row carrying this run's tag; return how many rows remain."""
+    case_id = str(state.get("case_id") or "")
+    related = [
+        str(row.get("table") or "") for row in state.get("extra_rows") or []
+    ] + [str(table or "") for table in state.get("extra_tables") or []]
+    if case_id:
+        targets = get_runtime().store.write_targets(case_id)
+        known = {str(target.get("table") or "") for target in targets}
+        added = [
+            {"table": table, "mode": "delete"}
+            for table in dict.fromkeys(related)
+            if table and table not in known
+        ]
+        if added:
+            # A cleanup may have to remove a parent row the application created
+            # in another table; register those tables for the same case.
+            kernel.set_write_targets(targets + added)
     columns = list(state.get("columns") or [])
     if not columns and state.get("column"):
         columns = [str(state["column"])]
-    return await cleanup_tagged_rows(
+    residue = await cleanup_tagged_rows(
         kernel,
         case_id=str(state.get("case_id") or ""),
         table=str(state.get("table") or ""),
         columns=columns,
         tag=str(state.get("tag") or ""),
     )
+    tag = str(state.get("tag") or "")
+    for row in state.get("extra_rows") or []:
+        # A parent row created by the request carries no tag of its own; it is
+        # identified by the insert id the probe reported for its statement.
+        table = str(row.get("table") or "")
+        try:
+            schema = await kernel.call("db_schema", {"table": table})
+        except ToolCallError:
+            continue
+        tables = schema.get("tables") or []
+        keys = (tables[0].get("primary_key") if tables else []) or []
+        if not keys:
+            continue
+        try:
+            await kernel.call(
+                "db_write",
+                {
+                    "sql": (
+                        f"DELETE FROM `{table}` WHERE `{keys[0]}` = "
+                        f"{int(row.get('id') or 0)}"
+                    ),
+                    "case_id": str(state.get("case_id") or ""),
+                    "allow_multi": True,
+                },
+            )
+        except ToolCallError:
+            continue
+    for table in state.get("extra_tables") or []:
+        # The application may write more than the modelled table (a parent row
+        # beside the record that stores the payload); sweep every related table
+        # the request touched, using its own text columns.
+        try:
+            schema = await kernel.call("db_schema", {"table": str(table)})
+        except ToolCallError:
+            continue
+        tables = schema.get("tables") or []
+        if not tables:
+            continue
+        text_columns = [
+            str(item.get("name"))
+            for item in tables[0].get("columns") or []
+            if "char" in _column_type(tables[0], str(item.get("name")))
+            or "text" in _column_type(tables[0], str(item.get("name")))
+        ]
+        if not text_columns:
+            continue
+        residue = max(
+            residue,
+            await cleanup_tagged_rows(
+                kernel,
+                case_id=str(state.get("case_id") or ""),
+                table=str(table),
+                columns=text_columns,
+                tag=tag,
+            ),
+        )
+    return residue
 
 #: Verification attempts on the read page: bounded exploration, not one shot.
 VERIFY_ATTEMPTS = attempt_limit("verify", 4)
@@ -150,6 +223,19 @@ def _insert_line(lines: list[dict[str, Any]]) -> int | None:
     return None
 
 
+def _insert_lines(lines: list[dict[str, Any]], limit: int = 4) -> list[int]:
+    """Every INSERT statement line in the window (a request may write several tables)."""
+    found: list[int] = []
+    for item in lines:
+        if _INSERT_RE.search(str(item.get("text", ""))):
+            number = item.get("n")
+            if isinstance(number, int) and number not in found:
+                found.append(number)
+        if len(found) >= limit:
+            break
+    return found
+
+
 def _infer_target(source_text: str, sink_code: str, params: list[str]) -> dict[str, Any] | None:
     """Infer INSERT target table and columns from source; return None if unavailable."""
     insert = _INSERT_RE.search(source_text)
@@ -172,6 +258,41 @@ def _best_pair_hint(pair_hints: list[dict[str, Any]] | None) -> dict[str, Any] |
         if hint.get("table"):
             return hint
     return None
+
+
+def _column_type(table: dict[str, Any], column: str) -> str:
+    for item in table.get("columns") or []:
+        if str(item.get("name")) == column:
+            return str(item.get("type") or "")
+    return ""
+
+
+async def _count_tagged_rows(kernel: Any, table: str, tag: str, *, max_columns: int = 8) -> int:
+    """Count rows of ``table`` whose text columns already carry the tag.
+
+    The application, not the agent, decides which statement and which columns a
+    form writes; this looks at the stored data instead of the statement.
+    """
+
+    schema = await kernel.call("db_schema", {"table": table})
+    tables = schema.get("tables") or []
+    if not tables:
+        return 0
+    columns = [
+        str(item.get("name"))
+        for item in tables[0].get("columns") or []
+        if "char" in _column_type(tables[0], str(item.get("name")))
+        or "text" in _column_type(tables[0], str(item.get("name")))
+    ][:max_columns]
+    if not columns:
+        return 0
+    where = " OR ".join(f"`{name}` LIKE '%{tag}%'" for name in columns)
+    found = await kernel.call("db_read", {"sql": f"SELECT COUNT(*) AS n FROM `{table}` WHERE {where}"})
+    rows = found.get("rows") or []
+    try:
+        return int((rows[0] or {}).get("n") or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 async def _run_inject(
@@ -268,15 +389,16 @@ async def _run_inject(
         notes["params_from_source"] = params
     target = _infer_target(text, str(raw_slice.get("sinkCode") or sink), params)
     hint = _best_pair_hint(pair_hints)
+    inferred_table = str((target or {}).get("table") or "")
     if hint is not None:
-        # The pairing prior names the write target directly; source inference is
-        # the fallback when the slice carries no usable SQL literal.
+        # The pairing prior names the storage the read path renders; the write
+        # path only has to be a form the application accepts. Prefer the read
+        # side's table/columns over whatever INSERT the source window shows first.
         hint_columns = [str(item) for item in hint.get("columns") or []]
-        base_columns = list(target["columns"]) if target else []
         column = hint_columns[0] if hint_columns else str((target or {}).get("column") or "")
         target = {
             "table": str(hint["table"]),
-            "columns": base_columns or hint_columns or [column],
+            "columns": hint_columns or ([column] if column else []),
             "column": column,
             "source": "pair_hint",
         }
@@ -292,9 +414,11 @@ async def _run_inject(
         result.verdict = "WRITE_NOT_REACHED"
         return await _finish(kernel, result)
     notes["target"] = target
-    insert_line = _insert_line([item for item in source.get("lines") or [] if isinstance(item, dict)])
-    if insert_line is not None:
-        target["line"] = insert_line
+    insert_line: int | None = None
+    if hint is None or inferred_table == str(target["table"]):
+        insert_line = _insert_line([item for item in source.get("lines") or [] if isinstance(item, dict)])
+        if insert_line is not None:
+            target["line"] = insert_line
     kernel.set_write_targets([{"table": target["table"], "column": target["column"], "mode": "delete"}])
     stage(
         "I1",
@@ -443,9 +567,15 @@ async def _run_inject(
     submitted: dict[str, Any] = {}
     armed = False
     arm_targets: list[dict[str, Any]] = []
-    if insert_line is not None:
-        arm_targets.append({"file": sink_file, "line": insert_line})
-    if read_file and read_line and (read_file, read_line) != (sink_file, insert_line):
+    # A single request can insert into several tables (a parent row plus the row
+    # that stores the payload), so arm every INSERT in the window, not just the
+    # first one, plus the read site when it lives in another file.
+    window = [item for item in source.get("lines") or [] if isinstance(item, dict)]
+    for number in _insert_lines(window):
+        arm_targets.append({"file": sink_file, "line": number})
+    if read_file and read_line and (read_file, read_line) not in {
+        (sink_file, number) for number in _insert_lines(window)
+    }:
         arm_targets.append({"file": read_file, "line": read_line})
     async def _send(method: str, values: dict[str, str], files: dict[str, str]) -> dict[str, Any]:
         body = urlencode(values)
@@ -511,8 +641,10 @@ async def _run_inject(
     delivery = await deliver(
         client=LlmClient.from_env(),
         goal=(
-            "submit this form so the application inserts the payload into "
-            f"{target['table']}.{chosen_column} via the code at line {target.get('line')}"
+            "submit this form so the application stores the payload as a record of "
+            f"{target['table']} (creating a new row is expected); the application's "
+            "own write path decides the columns, the payload only has to end up in "
+            "the column the read path renders"
         ),
         page_url=base_url,
         forms=plan_forms,
@@ -520,7 +652,10 @@ async def _run_inject(
         source_text=text,
         tag=tag,
         payload=payload,
-        hint=f"payload must be written through parameter {field_name}",
+        hint=(
+            f"send the payload through parameter {field_name}; a new record is the "
+            "normal outcome, do not try to reproduce a specific SQL statement"
+        ),
         constraints=", ".join(f"{name}: {kind}" for name, kind in column_limits.items()),
         fallback_fields=fallback,
         observation="\n".join(kernel.tool_errors[-3:]),
@@ -553,8 +688,22 @@ async def _run_inject(
             "fields": dict(form.fields),
             "planned_by": delivery.plan.source,
         }
-    accepted = delivery.last is not None and int(delivery.last.status or 0) < 400 and (
-        not armed or delivery.last.probe_hit
+    probed = armed and delivery.last is not None and bool(delivery.last.probe_hit)
+    stored = 0
+    if delivery.last is not None and int(delivery.last.status or 0) < 400 and not probed:
+        # The application may write a different statement than the modelled one
+        # (or a new row); look for the tag in the stored data instead.
+        try:
+            stored = await _count_tagged_rows(kernel, str(target["table"]), tag)
+        except ToolCallError:
+            stored = 0
+    accepted = (
+        delivery.last is not None
+        and int(delivery.last.status or 0) < 400
+        and (not armed or probed or stored > 0)
+    )
+    notes["write_signal"] = (
+        "probe" if probed else ("db_read" if stored > 0 else ("status" if not armed else "none"))
     )
     submitted = dict((delivery.last.extra.get("raw") if delivery.last else {}) or {})
     if delivery.last is not None and not submitted:
@@ -571,6 +720,21 @@ async def _run_inject(
             await call("probe_disarm", {"case_id": result.case_id})
     state["pending"] = True
     state["column"] = str(target.get("column") or chosen_column)
+    state["columns"] = [str(c) for c in target.get("columns") or [] if str(c)]
+    extra_tables: list[str] = []
+    extra_rows: list[dict[str, Any]] = []
+    for query in submitted.get("queries") or []:
+        write = query.get("write") or {}
+        table = str(write.get("table") or "")
+        if not table or table == str(target["table"]):
+            continue
+        if table not in extra_tables:
+            extra_tables.append(table)
+        insert_id = query.get("last_insert_id")
+        if insert_id:
+            extra_rows.append({"table": table, "id": insert_id})
+    state["extra_tables"] = extra_tables
+    state["extra_rows"] = extra_rows
     status = submitted.get("http", {}).get("status") if armed else submitted.get("status")
     stage("I5", True, f"POST {form.action} → {status} probe={armed}")
     if armed and (submitted.get("queries") or []):

@@ -78,7 +78,10 @@ class TrackedClient:
         if tool == "db_write":
             sql = str(args.get("sql") or "")
             if sql.upper().startswith("UPDATE"):
-                self.published = self.publishable
+                # Only a status change makes the page render the row; updating
+                # the payload column itself does not.
+                if "`status`" in sql:
+                    self.published = self.publishable
                 return {"change": {"change_id": "ch-update", "affected": 1, "undo_sql": "UPDATE posts SET status='pending'"}}
             return {"change": {"change_id": "ch-insert", "affected": 1, "undo_sql": "DELETE FROM posts WHERE id=7"}}
         if tool == "db_undo":
