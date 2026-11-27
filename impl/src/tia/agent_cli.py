@@ -203,6 +203,11 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Schedule attack flows (target site + writers) instead of single slices",
     )
+    pipeline.add_argument(
+        "--db-snapshot",
+        default=None,
+        help="Dump the target database to this file before the run and restore it afterwards",
+    )
     pipeline.add_argument("--json", action="store_true")
 
     llm = sub.add_parser("llm", help="List model profiles from config/local/llm.yaml")
@@ -566,18 +571,31 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         ] + [{"raw": raw, "family": "second", "role": "write"} for raw in write_slices]
         reader = _reader()
         seeded = seed_flow_queue(store, run_id, sites, family=family, reader=reader)
-        flow_result = asyncio.run(
-            run_flow_queue(
-                store,
-                args.base_url,
-                run_id,
-                limit=args.limit or 1000,
-                payload_base=args.payload,
-                budget=args.budget,
-                url_for=url_for_fn,
-                reader=reader,
+        snapshot_path = Path(args.db_snapshot) if args.db_snapshot else None
+        if snapshot_path is not None:
+            from tia.inf.snapshot import snapshot_database
+
+            snapshot_database(get_runtime().settings.db, snapshot_path)
+            print(f"[db] snapshot {snapshot_path}", file=sys.stderr)
+        try:
+            flow_result = asyncio.run(
+                run_flow_queue(
+                    store,
+                    args.base_url,
+                    run_id,
+                    limit=args.limit or 1000,
+                    payload_base=args.payload,
+                    budget=args.budget,
+                    url_for=url_for_fn,
+                    reader=reader,
+                )
             )
-        )
+        finally:
+            if snapshot_path is not None:
+                from tia.inf.snapshot import restore_database
+
+                restore_database(get_runtime().settings.db, snapshot_path)
+                print(f"[db] restored {snapshot_path}", file=sys.stderr)
         for item in flow_result.outcomes:
             print(f"[flow] [{item.slice_id}] {item.verdict}", file=sys.stderr)
         summary = {
