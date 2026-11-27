@@ -9,7 +9,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import parse_qsl, urljoin
+from urllib.parse import parse_qsl, urljoin, urlsplit, urlunsplit
 
 import httpx
 
@@ -27,6 +27,25 @@ class HttpResult:
     body: str = ""
     truncated: bool = False
     elapsed_ms: float = 0.0
+
+
+def merge_query(url: str, params: dict[str, Any] | None) -> str:
+    """Attach request parameters without dropping the query already in ``url``.
+
+    ``httpx`` treats ``params`` as the whole query string of the request, which
+    silently discards an action such as ``?action=set_flag`` when the caller also
+    passes the action's fields separately. Merging here keeps both.
+    """
+
+    if not params:
+        return url
+    parts = urlsplit(url)
+    pairs = [(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True)]
+    overridden = {str(key) for key in params}
+    pairs = [(key, value) for key, value in pairs if key not in overridden]
+    pairs.extend((str(key), str(value)) for key, value in params.items())
+    query = "&".join(f"{key}={value}" for key, value in pairs)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
 
 
 class HttpClient:
@@ -61,12 +80,12 @@ class HttpClient:
                 cookies=cookies or {},
             ) as client:
                 for _ in range(max_redirects + 1):
+                    target = merge_query(current, params)
                     if files:
                         form_data = dict(parse_qsl(body or ""))
                         response = client.request(
                             method,
-                            current,
-                            params=params,
+                            target,
                             data=form_data or None,
                             files=files,
                             headers={
@@ -78,8 +97,7 @@ class HttpClient:
                     else:
                         response = client.request(
                             method,
-                            current,
-                            params=params,
+                            target,
                             content=body.encode() if body is not None else None,
                             headers=request_headers,
                         )
