@@ -6,6 +6,7 @@ When following redirects, this adapter manually requests hop-by-hop and records 
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import parse_qsl, urljoin
@@ -25,6 +26,7 @@ class HttpResult:
     body_bytes: int = 0
     body: str = ""
     truncated: bool = False
+    elapsed_ms: float = 0.0
 
 
 class HttpClient:
@@ -48,6 +50,7 @@ class HttpClient:
         files: dict[str, tuple[str, bytes]] | None = None,
     ) -> HttpResult:
         chain: list[dict[str, Any]] = []
+        started = time.perf_counter()
         current = url
         request_headers = dict(headers or {})
         request_headers.setdefault("User-Agent", "tia-agent/0.1")
@@ -99,6 +102,7 @@ class HttpClient:
                         body_bytes=len(raw),
                         body=_window(text, marker, around, max_bytes),
                         truncated=len(text.encode()) > max_bytes,
+                        elapsed_ms=round((time.perf_counter() - started) * 1000.0, 2),
                     )
         except httpx.HTTPError as exc:
             raise ToolError(

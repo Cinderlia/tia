@@ -292,3 +292,29 @@ async def test_run_reports_by_target_and_unmatched_targets(env: dict[str, Any]) 
     assert out.data["queries"][0]["target_index"] == 0
     assert out.data["by_target"][0]["target_line"] == 2
     assert "PROBE_TARGET_UNMATCHED" in out.warnings
+
+
+async def test_run_reports_timing_and_error_fields(env: dict[str, Any]) -> None:
+    await _arm(env)
+    output_dir = env["probe_base"] / "sql"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / f"{env['case_id']}-2.json").write_text(json.dumps(CAPTURE), encoding="utf-8")
+    (output_dir / "sqlquery_debug.log").write_text("matched_queries=1\n", encoding="utf-8")
+    out = await probe_run(
+        {"case_id": env["case_id"], "url": "http://127.0.0.1/xvwa/home.php"}
+    )
+    query = out.data["queries"][0]
+    assert query["fetch_time_ms"] >= 0
+    assert query["total_time_ms"] >= query["execute_time_ms"]
+    assert query["error"] == ""
+    assert out.data["error"] == ""
+    assert set(out.data["timing"]) == {"http_ms", "capture_read_ms", "total_ms"}
+    assert "elapsed_ms" in out.data["http"]
+
+
+def test_sql_error_extracts_the_snippet() -> None:
+    from tia.cap.probe import _sql_error
+
+    assert "SQL syntax" in _sql_error("<b>You have an error in your SQL syntax near ...</b>")
+    assert "UNCAUGHT" in _sql_error("Fatal error: Uncaught mysqli_sql_exception").upper()
+    assert _sql_error("everything is fine") == ""

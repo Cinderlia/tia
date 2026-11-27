@@ -62,6 +62,31 @@ def _target_file(raw: str) -> str:
     return str(resolved)
 
 
+
+_SQL_ERROR_HINTS = (
+    "sql syntax",
+    "sqlstate[",
+    "you have an error in your sql",
+    "mysqli_sql_exception",
+    "pdoexception",
+    "uncaught mysqli",
+    "uncaught pdoexception",
+    "unknown column",
+    "fatal error:",
+    "syntax error at or near",
+)
+
+
+def _sql_error(body: str) -> str:
+    """Best-effort SQL error text from the response, for the agent's diagnosis."""
+    lowered = body.lower()
+    for hint in _SQL_ERROR_HINTS:
+        index = lowered.find(hint)
+        if index >= 0:
+            snippet = " ".join(body[max(0, index - 80) : index + 240].split())
+            return snippet[:400]
+    return ""
+
 def _matched_at(query: dict[str, Any]) -> str:
     if query.get("matched_at_prepare"):
         return "prepare"
@@ -97,6 +122,16 @@ def _normalize_query(query: dict[str, Any]) -> dict[str, Any]:
         "last_insert_id": int(query.get("last_insert_id") or 0),
         "matched_at": _matched_at(query),
         "execute_time_ms": int(round(float(execute_ms))),
+        "fetch_time_ms": int(round(float(query.get("fetch_time_ms") or 0))),
+        "total_time_ms": int(
+            round(float(execute_ms) + float(query.get("fetch_time_ms") or 0))
+        ),
+        "error": str(
+            query.get("error")
+            or query.get("error_message")
+            or (write.get("error") if write else "")
+            or ""
+        ),
         "observed_at": now_iso(),
     }
     target_index = query.get("target_index")
@@ -245,6 +280,7 @@ async def probe_run(arguments: dict[str, Any]) -> ToolOutput:
     session_id, cookies, warnings = await resolve_session(
         params.session_id, params.url, params.account_label
     )
+    started = time.perf_counter()
     result = HttpClient().fetch(
         params.method,
         params.url,
@@ -271,8 +307,10 @@ async def probe_run(arguments: dict[str, Any]) -> ToolOutput:
         )
     if params.wait_ms:
         time.sleep(params.wait_ms / 1000)
-
+    http_ms = round((time.perf_counter() - started) * 1000.0, 1)
+    capture_started = time.perf_counter()
     snapshot = adapter.snapshot(output)
+    capture_ms = round((time.perf_counter() - capture_started) * 1000.0, 1)
     if snapshot.output is None:
         raise ToolError(
             ErrorCode.NOT_FOUND,
@@ -321,8 +359,15 @@ async def probe_run(arguments: dict[str, Any]) -> ToolOutput:
                 "content_type": result.content_type,
                 "redirect_chain": result.redirect_chain,
                 "bytes": result.body_bytes,
+                "elapsed_ms": round(float(getattr(result, "elapsed_ms", 0.0)), 2),
                 **({"html": result.body} if params.capture_html else {}),
             },
+            "timing": {
+                "http_ms": http_ms,
+                "capture_read_ms": capture_ms,
+                "total_ms": round(http_ms + capture_ms, 1),
+            },
+            "error": _sql_error(result.body),
             "debug": snapshot.debug,
             "observed_at": now_iso(),
         },
