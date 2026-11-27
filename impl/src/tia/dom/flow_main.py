@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from tia.cap.entry import infer_read_entry
+from tia.cap.read_evidence import collect_read_sql
+from tia.dom.constraint_steps import build_steps
 from tia.dom.direct import run_direct
 from tia.dom.inject import run_inject
 from tia.dom.main import MainResult, _read_target, _report
@@ -27,7 +29,7 @@ from tia.inf.reports import RunReports
 from tia.inf.runtime import get_runtime
 from tia.orch.flow import READ, Site, build_flows, site_role
 from tia.orch.identity import direct_identity, identity_of
-from tia.orch.kernel import ToolClient
+from tia.orch.kernel import LocalToolClient, ToolClient
 from tia.orch.learning import hints_for
 from tia.orch.pairing import Reader, resolve_entry
 from tia.orch.slicing import score_slice
@@ -360,6 +362,77 @@ async def run_flow_queue(
             write_url = url_for(writer_raw) if url_for is not None else base_url
             raw_plan = (probe.notes or {}).get("constraint_plan")
             plan: dict[str, Any] = raw_plan if isinstance(raw_plan, dict) else {}
+            client = inject_client or trigger_client or LocalToolClient("inject")
+
+            async def _call(
+                name: str,
+                arguments: dict[str, Any],
+                _client: Any = client,
+            ) -> dict[str, Any]:
+                envelope = await _client.call(name, arguments)
+                data = getattr(envelope, "data", envelope)
+                return dict(data or {})
+
+            read_sql = ""
+            if not plan.get("constraints"):
+                # The template shows a row; the query that selected it lives one
+                # level up. Trace points at the executed lines and the probe
+                # reports the statement itself, so the condition comes from what
+                # the engine ran rather than from a source-level guess.
+                try:
+                    evidence = await collect_read_sql(
+                        _call,
+                        case_id=case_id,
+                        url=read_url,
+                        sink_file=str(target_raw.get("sinkFile") or ""),
+                        sink_line=int(target_raw.get("sinkLine") or 0),
+                    )
+                    notes["read_trace"] = evidence.get("trace_id") or ""
+                    notes["read_executed"] = evidence.get("executed") or {}
+                    statements = evidence.get("statements") or []
+                    if statements:
+                        read_sql = str(statements[0])
+                        notes["read_sql"] = read_sql
+                except Exception as exc:  # noqa: BLE001 - evidence is best effort
+                    notes["read_evidence_error"] = str(exc)
+            if not plan.get("constraints"):
+                writers: list[tuple[str, dict[str, Any]]] = []
+                seen_writers: set[str] = set()
+                for writer_id in flow.get("writer_slice_ids") or []:
+                    row = store.get_slice(str(writer_id))
+                    if row is not None:
+                        writers.append((str(writer_id), dict(row["slice"])))
+                        seen_writers.add(str(writer_id))
+                for row in store.list_slice_rows(run_id=run_id, limit=2000):
+                    if str(row.get("role") or "") != "write":
+                        continue
+                    if str(row.get("id")) in seen_writers:
+                        continue
+                    raw_candidate = row.get("slice")
+                    if isinstance(raw_candidate, dict):
+                        writers.append((str(row.get("id")), dict(raw_candidate)))
+                        seen_writers.add(str(row.get("id")))
+                if writers:
+                    from tia.inf.accounts import public_catalog
+
+                    planner = None
+                    try:
+                        from tia.ad.llm import LlmClient
+
+                        planner = LlmClient.from_env()
+                    except Exception:  # noqa: BLE001 - the planner is optional
+                        planner = None
+                    plan = await build_steps(
+                        _call,
+                        flow,
+                        writers,
+                        base_url,
+                        url_for,
+                        public_catalog(get_runtime().settings.accounts_path),
+                        read_raw=target_raw,
+                        read_sql=read_sql,
+                        planner=planner,
+                    )
             entry = _read_entry_for(reader, target_raw)
             pair_map = _constraint_candidates(flow, plan, store, url_for, base_url)
             hint = {

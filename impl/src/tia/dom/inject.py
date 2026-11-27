@@ -800,6 +800,39 @@ async def _run_inject(
     constraint_steps = notes.setdefault("constraint_steps", [])
     for constraint in (constraint_plan or {}).get("constraints") or []:
         constraint_id = str(constraint.get("constraint_id") or "")
+        if constraint.get("replay_url"):
+            from tia.dom.constraint_steps import replay as replay_step
+
+            replayed = await replay_step(
+                call,
+                case_id=result.case_id,
+                step=constraint,
+                payload_column=str(target.get("column") or ""),
+                tag=tag,
+            )
+            step_info: dict[str, Any] = {
+                "constraint_id": constraint_id,
+                "table": constraint.get("table"),
+                "column": constraint.get("column"),
+                "value": constraint.get("value"),
+                "predicate": constraint.get("predicate"),
+                "replay": replayed,
+            }
+            constraint_steps.append(step_info)
+            if not replayed.get("confirmed"):
+                stage(
+                    "I5.5",
+                    False,
+                    f"CONSTRAINT_REPLAY_FAILED {constraint.get('table')}.{constraint.get('column')}",
+                )
+                result.verdict = "CONSTRAINT_REPLAY_FAILED"
+                return await _finish(kernel, result)
+            stage(
+                "I5.5",
+                True,
+                f"{constraint.get('table')}.{constraint.get('column')} = {constraint.get('value')}",
+            )
+            continue
         c_table = str(constraint.get("table") or "")
         c_column = str(constraint.get("column") or "")
         c_value = str(constraint.get("value") or "")
@@ -1070,9 +1103,9 @@ async def _run_inject(
         notes["verify_on"] = "probe_page"
         notes["verify_attempts"] = [{"values": dict(delivery.plan.values) if delivery.plan else {}, "source": "probe_page",
                                      "found": bool(verify.get("found"))}]
-    elif read_channel != "sql_probe" and verify_url and verify_url != form.action and verify_entry:
-        entry_method = str(verify_entry.get("method") or "POST").upper()
-        entry_spec = [entry_field(item) for item in verify_entry.get("fields") or []]
+    elif read_channel != "sql_probe" and verify_url and verify_url != form.action:
+        entry_method = str((verify_entry or {}).get("method") or "GET").upper()
+        entry_spec = [entry_field(item) for item in (verify_entry or {}).get("fields") or []]
         read_forms: list[PageForm] = []
         read_html = ""
         try:

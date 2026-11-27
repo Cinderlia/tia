@@ -25,6 +25,10 @@ _SQL_KEYWORD = re.compile(r"\b(?:select|insert|update|delete|replace)\b", re.IGN
 _CALL = re.compile(
     r"\$(\w+)\s*->\s*(?:query|prepare|exec|execute)\s*\(\s*\$(\w+)\s*[,)]"
 )
+#: ``$link->query("UPDATE ...")`` — the statement is written inline at the call.
+_INLINE_CALL = re.compile(
+    r"\$(\w+)\s*->\s*(?:query|prepare|exec|execute)\s*\(", re.IGNORECASE
+)
 _ASSIGN = re.compile(r"^\s*\$(\w+)\s*=\s*(.*)$")
 _APPEND = re.compile(r"^\s*\$(\w+)\s*\.=\s*(.*)$")
 
@@ -58,7 +62,7 @@ def statement_origin(
                 argument = _call_argument(text)
                 break
     if argument is None:
-        return call_code, call_line
+        return _inline_statement(lines, call_line) or (call_code, call_line)
 
     window = [
         (number, text)
@@ -93,6 +97,71 @@ def statement_origin(
     if not _SQL_KEYWORD.search(statement):
         return call_code, call_line
     return statement, origin_line
+
+
+def _inline_statement(
+    lines: list[tuple[int, str]], call_line: int
+) -> tuple[str, int] | None:
+    """Return a statement written literally inside the query call at ``call_line``.
+
+    Some call sites pass a concatenated string straight to ``query()``.  Reading
+    only the call line would see no SQL; the statement spans the following lines
+    until the call's parentheses close.  PHP concatenation is collapsed to a
+    placeholder so the result still looks like a single SQL statement.
+    """
+
+    ordered = sorted(lines)
+    start = None
+    for index, (number, text) in enumerate(ordered):
+        if number == call_line and _INLINE_CALL.search(text):
+            start = index
+            break
+    if start is None:
+        return None
+    collected: list[str] = []
+    depth = 0
+    seen_open = False
+    for _number, text in ordered[start:]:
+        position = _INLINE_CALL.search(text)
+        body = text[position.end() :] if (position and not seen_open) else text
+        for ch in body:
+            if ch == "(":
+                depth += 1
+                seen_open = True
+            elif ch == ")":
+                depth -= 1
+        collected.append(body)
+        if seen_open and depth <= 0:
+            break
+    raw = " ".join(collected)
+    raw = re.sub(r"['\"]\s*\.\s*", "", raw)
+    raw = re.sub(r"\s*\.\s*['\"]", "", raw)
+    raw = raw.replace('"', " ")
+    raw = re.sub(r"\s+", " ", raw).strip()
+    while raw.endswith((")", ";")):
+        raw = raw[:-1].rstrip()
+    if not _SQL_KEYWORD.search(raw):
+        return None
+    return raw, call_line
+
+
+def sql_literals(text: str) -> str:
+    """Join the SQL string literals of a window, ignoring the PHP around them.
+
+    A statement is often spread over an assignment and later ``.=`` appends, with
+    request values spliced between the fragments.  Concatenating only the quoted
+    fragments keeps the SQL keywords and the literal predicates, which is what a
+    reachability check needs.
+    """
+
+    fragments: list[str] = []
+    for match in re.finditer(r'"([^"]*)"|\'([^\']*)\'', text):
+        fragment = match.group(1) if match.group(1) is not None else match.group(2)
+        if _SQL_KEYWORD.search(fragment) or re.search(
+            r"\b(?:and|or|where|order\s+by|limit)\b", fragment, re.IGNORECASE
+        ):
+            fragments.append(fragment.strip())
+    return " ".join(fragments)
 
 
 def request_carriers(
