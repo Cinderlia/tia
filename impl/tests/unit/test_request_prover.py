@@ -29,9 +29,26 @@ SLICE = {
 }
 
 
+WRITE_SOURCE = """<?php
+$entry = isset($_POST['entry']) ? $_POST['entry'] : '';
+$sql = "INSERT INTO blog (date, entry, owner) VALUES (now(),'".$entry."','".$owner."')";
+$result = $conn->query($sql);
+"""
+
+WRITE_SLICE = {
+    "kind": "SqlWriteLoose",
+    "sinkFile": "blog.php",
+    "sinkLine": 3,
+    "sinkCode": "INSERT INTO blog (date, entry, owner)",
+    "params": ["entry"],
+    "sqlProbe": {"extensionConfig": {"file": "blog.php", "line": "3"}},
+}
+
+
 class FakeSqliClient:
-    def __init__(self, *, hit: bool) -> None:
+    def __init__(self, *, hit: bool, source: str = SOURCE) -> None:
         self.hit = hit
+        self.source = source
         self.calls: list[str] = []
 
     async def call(self, tool: str, arguments: dict[str, Any] | None = None) -> Envelope:
@@ -48,13 +65,17 @@ class FakeSqliClient:
                 "sha256": "abc",
                 "lines": [
                     {"n": index + 1, "text": line, "in_comment": False, "in_string": False}
-                    for index, line in enumerate(SOURCE.splitlines())
+                    for index, line in enumerate(self.source.splitlines())
                 ],
             }
         if tool == "http_request":
             return {
                 "status": 200,
-                "body": '<form action="home.php" method="post"><input name="item"></form>',
+                "body": (
+                    '<form action="home.php" method="post">'
+                    '<input name="item"><input name="entry"><button name="blog" value="add">'
+                    "</form>"
+                ),
                 "content_type": "text/html",
                 "final_url": "http://target/home.php",
             }
@@ -99,3 +120,25 @@ async def test_no_probe_output_is_not_executed(runtime: None) -> None:
     result = await run_request_prover(SLICE, base_url="http://target/home.php", client=client)
     assert result.verdict == "NOT_EXECUTED"
     assert result.notes["attempts"][0]["marker_seen"] is False
+
+
+def test_sql_body_reduces_a_source_assignment_to_its_statement() -> None:
+    from tia.dom.request_prover import _sql_body
+
+    raw = '$sql = "INSERT INTO blog (date, entry) VALUES (now(), 1)";'
+    assert _sql_body(raw) == "INSERT INTO blog (date, entry) VALUES (now(), 1)"
+
+
+@pytest.mark.asyncio
+async def test_write_statement_registers_a_cleanup_target(runtime: None) -> None:
+    case: dict[str, Any] = {}
+    client = FakeSqliClient(hit=True, source=WRITE_SOURCE)
+
+    await run_request_prover(
+        WRITE_SLICE, base_url="http://target/blog.php", client=client, case=case
+    )
+
+    cleanup = case.get("cleanup") or {}
+    assert cleanup.get("table") == "blog"
+    assert "entry" in (cleanup.get("columns") or [])
+    assert cleanup.get("tag")

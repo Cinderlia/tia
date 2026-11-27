@@ -20,6 +20,7 @@ from urllib.parse import urlencode
 from tia.cap.blind import blind_check
 from tia.cap.domscan import parse
 from tia.cap.forms import FormField, PageForm, find_form, forms_from_document
+from tia.cap.sqlparse import parse_write
 from tia.cap.statement import request_carriers, statement_origin
 from tia.dom.trigger import StageRecord, TriggerResult, normalize_slice
 from tia.inf.reports import write_case_report
@@ -27,6 +28,7 @@ from tia.inf.runtime import get_runtime
 from tia.inf.settings import attempt_limit
 from tia.orch.kernel import Kernel, LocalToolClient, ToolCallError, ToolClient
 from tia.orch.learning import record_case
+from tia.schemas.envelope import ToolError
 from tia.sinks.base import Observation, trigger_verdict
 from tia.sinks.registry import sink_class_for
 
@@ -34,6 +36,19 @@ from tia.sinks.registry import sink_class_for
 REQUEST_ATTEMPTS = attempt_limit("request", 6)
 
 _POST_VAR_RE = re.compile(r"\$_(?:POST|GET|REQUEST)\[\s*['\"]([A-Za-z_]\w*)['\"]\s*\]")
+_ASSIGN_PREFIX = re.compile(r"^\s*\$[A-Za-z_]\w*\s*\.?=\s*")
+
+
+def _sql_body(text: str) -> str:
+    """Reduce a source assignment snippet to the SQL statement it builds.
+
+    ``statement_origin`` returns the source line(s) that build the statement
+    (``$sql = "INSERT ..."``); parsing wants the quoted statement itself.
+    """
+    body = _ASSIGN_PREFIX.sub("", text.strip()).rstrip().rstrip(";").rstrip()
+    if len(body) >= 2 and body[0] == body[-1] and body[0] in {'"', "'"}:
+        body = body[1:-1]
+    return body
 
 
 def _tag() -> str:
@@ -89,6 +104,7 @@ async def run_request_prover(
     client: ToolClient | None = None,
     slice_id: str | None = None,
     flow: dict[str, Any] | None = None,
+    case: dict[str, Any] | None = None,
 ) -> TriggerResult:
     rt = get_runtime()
     slice_doc = normalize_slice(raw_slice)
@@ -117,6 +133,9 @@ async def run_request_prover(
 
     def done(result: TriggerResult) -> TriggerResult:
         record_case(rt.store, {"sinkFile": sink_file}, result.verdict, result.notes)
+        if case_id:
+            with contextlib.suppress(Exception):
+                rt.store.merge_case_notes(case_id, result.notes)
         return result
 
     # P0 create the case ---------------------------------------------------------
@@ -239,6 +258,25 @@ async def run_request_prover(
     payloads = sink_class.seed(slice_doc, context, tag, payload_base)
     notes.update({"tag": tag, "context": context, "candidates": payloads})
     stages.append(StageRecord("P3", True, f"context={context} payloads={len(payloads)}"))
+
+    # A write statement creates a row even though this prover writes nothing
+    # itself: the request carrying the payload is what the application stores.
+    # Register the sweep target so the outer guard can remove those rows.
+    with contextlib.suppress(ToolError):
+        write_stmt = parse_write(_sql_body(origin_text))
+        targets = [{"table": write_stmt.table, "mode": "delete"}]
+        kernel.set_write_targets(targets)
+        await kernel.call(
+            "case_note", {"case_id": case_id, "key": "write_targets", "value": targets}
+        )
+        if case is not None:
+            case["cleanup"] = {
+                "kernel": kernel,
+                "case_id": case_id,
+                "table": write_stmt.table,
+                "columns": list(write_stmt.columns),
+                "tag": tag,
+            }
 
     # P4 send bounded shapes; the class decides whether the observation proves it -----
     outcome_level = "NO_DB_OBSERVATION"

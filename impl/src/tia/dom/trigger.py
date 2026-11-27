@@ -512,6 +512,7 @@ async def _run_trigger(
             client=client,
             slice_id=slice_id,
             flow=flow,
+            case=case,
         )
     sink = slice_doc["sink"]
     sink_file, sink_line = sink["file"], sink["line"]
