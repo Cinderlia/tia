@@ -35,6 +35,7 @@ from tia.cap.forms import (
     merge_forms,
 )
 from tia.dom.trigger import _POST_VAR_RE, StageRecord, TriggerResult, normalize_slice
+from tia.inf.accounts import public_catalog
 from tia.inf.reports import write_case_report
 from tia.inf.runtime import get_runtime
 from tia.inf.settings import attempt_limit
@@ -157,8 +158,12 @@ async def run_direct(
     notes["learning"] = hints
     constraints = f"max payload length {allowed} characters" if allowed else ""
 
-    async def _send(method: str, values: dict[str, str], files: dict[str, str]) -> dict[str, Any]:
+    async def _send(
+        method: str, values: dict[str, str], files: dict[str, str], account: str = ""
+    ) -> dict[str, Any]:
         request: dict[str, Any] = {"method": method, "url": form.action}
+        if account:
+            request["account_label"] = account
         if method == "POST":
             request["body"] = urlencode(values)
             request["headers"] = {"Content-Type": form.enctype}
@@ -208,6 +213,7 @@ async def run_direct(
         observation="\n".join(kernel.tool_errors[-3:]),
         max_rounds=_attempts(),
         send=_send,
+        accounts=public_catalog(get_runtime().settings.accounts_path),
         accept=_accept,
     )
     notes["delivery"] = {

@@ -37,6 +37,7 @@ from tia.cap.entry import (
 from tia.cap.forms import FormField, PageForm, find_form, forms_from_document
 from tia.cap.request_plan import plan_request
 from tia.dom.trigger import StageRecord
+from tia.inf.accounts import public_catalog
 from tia.inf.reports import write_case_report
 from tia.inf.runtime import get_runtime
 from tia.inf.settings import attempt_limit
@@ -614,7 +615,9 @@ async def _run_inject(
         (sink_file, number) for number in _insert_lines(window)
     }:
         arm_targets.append({"file": read_file, "line": read_line})
-    async def _send(method: str, values: dict[str, str], files: dict[str, str]) -> dict[str, Any]:
+    async def _send(
+        method: str, values: dict[str, str], files: dict[str, str], account: str = ""
+    ) -> dict[str, Any]:
         body = urlencode(values)
         if armed:
             page = await call(
@@ -627,6 +630,7 @@ async def _run_inject(
                     "headers": {"Content-Type": "application/x-www-form-urlencoded"},
                     "capture_html": True,
                     "files": files,
+                    "account_label": account,
                 },
             )
             http = page.get("http") or {}
@@ -647,6 +651,7 @@ async def _run_inject(
                 "body": body,
                 "headers": {"Content-Type": "application/x-www-form-urlencoded"},
                 "files": files,
+                "account_label": account,
             },
         )
         return {
@@ -699,6 +704,7 @@ async def _run_inject(
         max_rounds=WRITE_ATTEMPTS,
         send=_send,
         accept=_accept,
+        accounts=public_catalog(get_runtime().settings.accounts_path),
     )
     notes["write_attempts"] = [item.to_dict() for item in delivery.attempts]
     if delivery.plan is not None:

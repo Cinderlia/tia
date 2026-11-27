@@ -127,3 +127,55 @@ async def test_unknown_field_is_sent_with_a_warning() -> None:
     assert plan.values["desc"] == "p"
     assert plan.values["bogus"] == "z"
     assert any("bogus" in warning for warning in plan.warnings)
+
+
+async def test_planner_may_pick_a_configured_identity() -> None:
+    llm = FakeLlm(
+        {
+            "url": "http://app.test/file/",
+            "method": "POST",
+            "fields": {"desc": "tia"},
+            "payload_field": "desc",
+            "account": "admin",
+        }
+    )
+    accounts = [
+        {"label": "customer", "roles": ["customer"], "description": "can post"},
+        {"label": "admin", "roles": ["administrator"], "description": "can approve"},
+    ]
+    plan = await plan_request(
+        client=llm,  # type: ignore[arg-type]
+        goal="approve",
+        page_url="http://app.test/file/",
+        forms=_forms(),
+        source_text="",
+        payload="<script>alert(1)</script>ab12",
+        accounts=accounts,
+    )
+    assert plan is not None
+    assert plan.account == "admin"
+
+
+async def test_unknown_identity_is_dropped_with_a_warning() -> None:
+    llm = FakeLlm(
+        {
+            "url": "http://app.test/file/",
+            "method": "POST",
+            "fields": {"desc": "tia"},
+            "payload_field": "desc",
+            "account": "superuser",
+        }
+    )
+    accounts = [{"label": "customer", "roles": ["customer"], "description": "can post"}]
+    plan = await plan_request(
+        client=llm,  # type: ignore[arg-type]
+        goal="approve",
+        page_url="http://app.test/file/",
+        forms=_forms(),
+        source_text="",
+        payload="<script>alert(1)</script>ab12",
+        accounts=accounts,
+    )
+    assert plan is not None
+    assert plan.account == ""
+    assert any("superuser" in warning for warning in plan.warnings)

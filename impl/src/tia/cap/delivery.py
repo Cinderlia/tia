@@ -25,7 +25,10 @@ _PAGE_ERROR = re.compile(
     re.IGNORECASE,
 )
 
-Send = Callable[[str, dict[str, str], dict[str, str]], Awaitable[dict[str, Any]]]
+Send = Callable[
+    [str, dict[str, str], dict[str, str], str], Awaitable[dict[str, Any]]
+]
+_LOGIN_FORM = re.compile(r"<input[^>]+type=[\"']?password", re.IGNORECASE)
 Accept = Callable[["DeliveryAttempt", dict[str, Any]], Awaitable[bool]]
 
 
@@ -43,6 +46,7 @@ class DeliveryAttempt:
     html: str = ""
     probe_hit: bool = False
     plan_source: str = "local"
+    account: str = ""
     warnings: list[str] = field(default_factory=list)
     error: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
@@ -58,6 +62,7 @@ class DeliveryAttempt:
             "content_type": self.content_type,
             "probe_hit": self.probe_hit,
             "plan_source": self.plan_source,
+            "account": self.account,
             "warnings": self.warnings,
             "error": self.error,
             "extra": self.extra,
@@ -108,6 +113,24 @@ def diagnose(html: str, status: Any, probe_hit: bool, tag: str = "") -> str:
     return "; ".join(parts)
 
 
+def login_gate(status: Any, html: str, location: str) -> bool:
+    """True when the response is a login page instead of the requested action."""
+    if isinstance(status, int) and status in {401, 403}:
+        return True
+    if location and "login" in location.lower():
+        return True
+    return bool(_LOGIN_FORM.search(html or ""))
+
+
+def _user_hint(accounts: list[dict[str, Any]] | None) -> str:
+    rows = [
+        f"- {item.get('label')}: roles={item.get('roles') or []} "
+        f"description={item.get('description') or ''}"
+        for item in accounts or []
+    ]
+    return "\n".join(rows)
+
+
 async def deliver(
     *,
     client: LlmClient | None,
@@ -127,6 +150,7 @@ async def deliver(
     max_rounds: int = 2,
     send: Send,
     accept: Accept,
+    accounts: list[dict[str, Any]] | None = None,
 ) -> Delivery:
     """Plan and send a request, replanning with the failure as feedback."""
 
@@ -148,6 +172,7 @@ async def deliver(
             sink=sink,
             fallback_fields=fallback_fields,
             fallback_method=fallback_method,
+            accounts=accounts,
         )
         if plan is None:
             return delivery
@@ -166,10 +191,11 @@ async def deliver(
             files=files,
             payload=plan.payload or payload,
             plan_source=plan.source,
+            account=plan.account,
             warnings=list(plan.warnings),
         )
         try:
-            page = await send(plan.method, values, files)
+            page = await send(plan.method, values, files, plan.account)
         except Exception as exc:  # noqa: BLE001 - a failed send is just feedback
             attempt.error = f"{type(exc).__name__}: {exc}"
             delivery.attempts.append(attempt)
@@ -193,6 +219,20 @@ async def deliver(
         if accepted:
             return delivery
         observation = diagnose(attempt.html, attempt.status, attempt.probe_hit, tag)
+        gate = login_gate(
+            attempt.status,
+            attempt.html,
+            str((page.get("location") if isinstance(page, dict) else "") or ""),
+        )
+        if gate and accounts:
+            attempt.extra["login_gate"] = True
+            observation += (
+                "\n\nLOGIN GATE: the response is a login page or a redirect to one, "
+                "so the current user cannot finish this action. Available users:\n"
+                f"{_user_hint(accounts)}\n"
+                "Set \"account\" to one of these labels if a different identity may "
+                "have access; leave it empty to keep the current user."
+            )
         if snapshot:
             observation = f"{observation}\n\nECHO AROUND TAG (only the markup wrapping it):\n{snapshot}"
     last_plan = delivery.plan
@@ -207,7 +247,7 @@ async def deliver(
             plan_source="single-field",
         )
         try:
-            page = await send(attempt.method, values, attempt.files)
+            page = await send(attempt.method, values, attempt.files, last_plan.account)
         except Exception as exc:  # noqa: BLE001
             attempt.error = f"{type(exc).__name__}: {exc}"
             delivery.attempts.append(attempt)

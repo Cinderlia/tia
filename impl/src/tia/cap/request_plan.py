@@ -33,6 +33,7 @@ class PlannedRequest:
     warnings: list[str] = field(default_factory=list)
     payload: str = ""
     column: str = ""
+    account: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -47,6 +48,7 @@ class PlannedRequest:
             "warnings": self.warnings,
             "payload": self.payload,
             "column": self.column,
+            "account": self.account,
         }
 
 
@@ -74,6 +76,7 @@ def _prompt(
     html: str = "",
     tag: str = "",
     sink: str = "",
+    accounts: list[dict[str, Any]] | None = None,
 ) -> str:
     shape = []
     for index, item in enumerate(forms):
@@ -98,9 +101,27 @@ def _prompt(
         )
     import json
 
+    users = ""
+    if accounts:
+        rows = [
+            {
+                "label": item.get("label"),
+                "roles": item.get("roles") or [],
+                "description": item.get("description") or "",
+            }
+            for item in accounts
+        ]
+        users = (
+            "SWITCHABLE USERS (from the operator's account file; label + roles + "
+            "what the person said it can do). Leave \"account\" empty for the current "
+            "user, or name one when the page redirected to a login/denied page and "
+            "this identity cannot finish the action:\n"
+            f"{json.dumps(rows, ensure_ascii=False)[:2500]}\n"
+        )
     return (
         f"GOAL: {goal}\n"
         f"PAGE: {page_url}\n"
+        f"{users}"
         f"HINT: {hint}\n"
         f"STORAGE COLUMNS: {constraints[:1200]}\n"
         f"SLICE SINK (build the payload for THIS context, not for any SQL nearby): {sink[:1500]}\n"
@@ -114,7 +135,8 @@ def _prompt(
         "PAGE HTML (trimmed):\n"
         f"{html[:6000]}\n"
         "Return {\"url\", \"method\", \"fields\", \"payload_field\", "
-        "\"payload_field_file\", \"payload\", \"column\", \"reason\"}. "
+        "\"payload_field_file\", \"payload\", \"column\", \"account\", \"reason\"}. "
+        "\"account\" is a label from SWITCHABLE USERS or empty. "
         "\"payload\" must contain the TAG verbatim and be built for the sink context; "
         "\"column\" is the storage column the payload should end up in, if known."
     )
@@ -154,6 +176,7 @@ async def plan_request(
     sink: str = "",
     fallback_fields: dict[str, str] | None = None,
     fallback_method: str = "POST",
+    accounts: list[dict[str, Any]] | None = None,
 ) -> PlannedRequest | None:
     """Ask the model for a request plan; validate it; fall back to a local fill."""
     allowed = {entry.name for form in forms for entry in form.fields}
@@ -172,6 +195,7 @@ async def plan_request(
                 constraints=constraints,
                 html=html,
                 tag=tag,
+                accounts=accounts,
             ),
         )
         url = str(reply.get("url") or "")
@@ -260,6 +284,15 @@ async def plan_request(
         files: dict[str, str] = {}
         if file_field:
             files[file_field] = "tia-upload.png"
+        chosen_account = str(reply.get("account") or "").strip()
+        if chosen_account:
+            labels = {str(item.get("label") or "") for item in accounts or []}
+            if chosen_account not in labels:
+                warnings.append(
+                    f"account {chosen_account!r} is not one of {sorted(labels)}; "
+                    f"the current user is kept"
+                )
+                chosen_account = ""
         return PlannedRequest(
             url=url,
             method=method,
@@ -271,6 +304,7 @@ async def plan_request(
             warnings=warnings,
             payload=planned_payload,
             column=planned_column,
+            account=chosen_account,
         )
     if fallback_fields is None:
         return None

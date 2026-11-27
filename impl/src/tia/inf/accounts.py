@@ -154,3 +154,18 @@ def pick_account(
         return None
     candidates.sort(key=lambda account: (len(account.roles), account.label))
     return candidates[0]
+
+
+def public_catalog(path: Path | None) -> list[dict[str, Any]]:
+    """The identities an agent may switch to, safe to show to a model.
+
+    A missing or malformed account file yields an empty catalog instead of an
+    error: switching identity is an option, never a precondition.
+    """
+
+    if path is None:
+        return []
+    try:
+        return [account.public() for account in load_accounts(path)]
+    except AccountsConfigError:
+        return []
