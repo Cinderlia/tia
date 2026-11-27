@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from tia.cap.blind import BLIND_DELAY_S
 from tia.sinks.base import Observation, Outcome
 
 
@@ -25,7 +26,7 @@ class SqliSinkClass:
         return "sql_probe"
 
     def channels(self) -> frozenset[str]:
-        return frozenset({"sql_probe", "page", "timing"})
+        return frozenset({"sql_probe", "page", "timing", "blind"})
 
     def context(self, site: dict[str, Any], code: str) -> str:
         text = code or str(site.get("sink") or "")
@@ -73,7 +74,42 @@ class SqliSinkClass:
             out.append(("custom", f"{payload_base}{tag}"))
         return out
 
+    def blind_pairs(self, context: str, tag: str) -> list[tuple[str, str, str]]:
+        """(kind, true_payload, false_payload) candidates for blind acceptance.
+
+        Both payloads carry the tag in a trailing comment so the probe can tell
+        whether the engine executed them at all before any differential counts.
+        """
+        marker = f"tia{tag}"
+        if context == "numeric":
+            return [
+                ("boolean", f"1 AND 1=1 -- {marker}", f"1 AND 1=2 -- {marker}"),
+                ("time", f"1 AND SLEEP({BLIND_DELAY_S:g}) -- {marker}", f"1 AND SLEEP(0) -- {marker}"),
+            ]
+        return [
+            ("boolean", f"' AND 1=1 -- {marker}", f"' AND 1=2 -- {marker}"),
+            ("time", f"' AND SLEEP({BLIND_DELAY_S:g}) -- {marker}", f"' AND SLEEP(0) -- {marker}"),
+        ]
+
     def accept(self, observation: Observation, context: str) -> Outcome:
+        blind = observation.facts.get("blind")
+        if observation.channel == "blind" and isinstance(blind, dict):
+            evidence = [str(ref) for ref in observation.evidence_refs]
+            if bool(blind.get("confirmed")) and bool(blind.get("diagnosis")):
+                return Outcome(
+                    True,
+                    "SQLI_BLIND",
+                    "boolean/time differential after the probe diagnosis",
+                    75,
+                    evidence,
+                )
+            return Outcome(
+                False,
+                "NOT_CONFIRMED",
+                "no blind differential reached the engine",
+                15,
+                evidence,
+            )
         sql = observation.facts.get("sql_probe")
         evidence = [str(ref) for ref in observation.evidence_refs]
         if not isinstance(sql, dict):

@@ -17,6 +17,7 @@ import secrets
 from typing import Any
 from urllib.parse import urlencode
 
+from tia.cap.blind import blind_check
 from tia.cap.domscan import parse
 from tia.cap.forms import PageForm, find_form, forms_from_document
 from tia.dom.trigger import StageRecord, TriggerResult, normalize_slice
@@ -280,6 +281,66 @@ async def run_request_prover(
         with contextlib.suppress(ToolCallError):
             await kernel.call("probe_disarm", {"case_id": case_id})
 
+    # P4.5 blind acceptance: once the in-band diagnosis has run, ask the class for
+    # a true/false (or delayed) pair.  Blind evidence is the stricter verdict: it
+    # needs both the probe diagnosis and a behavioural differential, so it is only
+    # accepted after the diagnosis gate, never on its own.
+    blind: dict[str, Any] | None = None
+    if hasattr(sink_class, "blind_pairs"):
+        pairs = sink_class.blind_pairs(context, tag)
+        blind_result = await blind_check(
+            kernel,
+            case_id=case_id,
+            file=sink_file,
+            line=probe_line,
+            url=action,
+            method=method,
+            field=param,
+            base_values={},
+            pairs=pairs,
+            tag=tag,
+        )
+        blind = {
+            "kind": blind_result.kind,
+            "confirmed": blind_result.confirmed,
+            "diagnosis": blind_result.diagnosis,
+            "detail": blind_result.detail,
+        }
+        if blind_result.confirmed:
+            true_payload = str(blind_result.detail.get("true_payload") or "")
+            observation = Observation(
+                channel="blind",
+                request={"url": action, "method": method, "values": {param: true_payload}},
+                payload=true_payload,
+                marker_seen=True,
+                facts={"blind": blind},
+            )
+            outcome = sink_class.accept(observation, context)
+            last_outcome = outcome
+            outcome_level = outcome.level
+            if chosen is None:
+                chosen = {
+                    "shape": f"blind:{blind_result.kind}",
+                    "payload": true_payload,
+                    "reason": outcome.reason,
+                }
+            attempts.append(
+                {
+                    "shape": chosen["shape"],
+                    "payload": true_payload,
+                    "level": outcome.level,
+                    "blind": blind_result.detail,
+                }
+            )
+        stages.append(
+            StageRecord(
+                "P4.5",
+                blind_result.confirmed,
+                f"blind kind={blind_result.kind or '-'} diagnosis={blind_result.diagnosis}",
+            )
+        )
+    notes["blind"] = blind
+
     notes["attempts"] = attempts
     if chosen:
         notes["payload"] = chosen["payload"]
@@ -304,9 +365,13 @@ async def run_request_prover(
     notes["explanation"] = (
         "the payload reached an executed statement"
         if outcome_level == "SQLI_CONFIRMED"
+        else "the engine evaluated the injected predicate (blind differential)"
+        if outcome_level == "SQLI_BLIND"
         else "the payload did not reach an executed statement"
     )
-    stages.append(StageRecord("P5", outcome_level == "SQLI_CONFIRMED", notes["explanation"]))
+    stages.append(
+        StageRecord("P5", outcome_level in {"SQLI_CONFIRMED", "SQLI_BLIND"}, notes["explanation"])
+    )
 
     # P6 report (no database write, so no undo) --------------------------------------
     report = await kernel.report()
