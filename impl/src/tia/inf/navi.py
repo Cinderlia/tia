@@ -33,7 +33,40 @@ NAVI_CHAINS: tuple[str, ...] = (
     "sqlwrite-second-order",
 )
 
-#: XSS chains and the TIA slice family they feed.
+#: Chains whose slices are write sinks; the pairing agent consumes them.
+WRITE_CHAINS: frozenset[str] = frozenset(
+    {"sqlwrite-direct", "read-to-write", "sqlwrite-second-order"}
+)
+
+
+def chains_for_role(role: str) -> tuple[str, ...]:
+    """Chains that feed one role, derived from the chain names in the contract.
+
+    Deriving the role from the name (``*-second-order`` / ``*-direct`` / a write
+    sink) means a new chain is routed as soon as the contract adds it; it never
+    has to be registered in a second hand-kept table.
+    """
+
+    if role == "write":
+        return tuple(chain for chain in NAVI_CHAINS if chain in WRITE_CHAINS)
+    if role == "second":
+        return tuple(chain for chain in NAVI_CHAINS if chain.endswith("-second-order"))
+    if role == "direct":
+        return tuple(
+            chain
+            for chain in NAVI_CHAINS
+            if chain.endswith("-direct") and chain not in WRITE_CHAINS
+        )
+    raise NaviContractError(f"unknown family: {role}")
+
+
+#: Convenience groups for CLI callers; roles may overlap (a second-order write
+#: chain is both a main-side proof and a pairing source).
+CHAINS_OF_FAMILY: dict[str, tuple[str, ...]] = {
+    role: chains_for_role(role) for role in ("direct", "second", "write")
+}
+
+#: Legacy grouping used by :func:`load_navi` (SQL chains stay in their own key).
 FAMILY_OF_CHAIN: dict[str, str] = {
     "xss-direct": "direct",
     "xss-second-order": "second",
@@ -41,16 +74,6 @@ FAMILY_OF_CHAIN: dict[str, str] = {
 
 #: SQL chains, reserved until the SQL acceptance path lands.
 SQL_CHAINS: frozenset[str] = frozenset(NAVI_CHAINS) - frozenset(FAMILY_OF_CHAIN)
-
-#: Convenience groups for CLI callers.
-CHAINS_OF_FAMILY: dict[str, tuple[str, ...]] = {
-    "direct": ("xss-direct",),
-    "second": ("xss-second-order",),
-    # Write slices: the direct SQL-write chain plus the two second-order write
-    # sources. ``read-to-write`` is a first-class source (not a low-confidence
-    # fallback); ``sqlwrite-second-order`` is the last resort.
-    "write": ("sqlwrite-direct", "read-to-write", "sqlwrite-second-order"),
-}
 
 _GRAPH_NAME = "taint-analysis-graphs.json"
 _DEBUG_DIRS = ("joined", "result", "slices", "flows")
@@ -241,6 +264,7 @@ def family_slices(root: Path, family: str) -> list[dict[str, Any]]:
     selected = tuple(chain for chain in chains if chain in present)
     if not selected:
         raise NaviContractError(f"no {'/'.join(chains)} chain under {root}")
-    return load_navi(root, chains=selected, include_sql=True)[
-        "sql" if family == "write" else family
-    ]
+    slices: list[dict[str, Any]] = []
+    for chain in selected:
+        slices.extend(load_chain(root, chain))
+    return slices

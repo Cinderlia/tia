@@ -19,7 +19,8 @@ from urllib.parse import urlencode
 
 from tia.cap.blind import blind_check
 from tia.cap.domscan import parse
-from tia.cap.forms import PageForm, find_form, forms_from_document
+from tia.cap.forms import FormField, PageForm, find_form, forms_from_document
+from tia.cap.statement import request_carriers, statement_origin
 from tia.dom.trigger import StageRecord, TriggerResult, normalize_slice
 from tia.inf.reports import write_case_report
 from tia.inf.runtime import get_runtime
@@ -61,12 +62,19 @@ def _request_shapes(form: PageForm, param: str, payload: str) -> list[dict[str, 
     """
     shapes: list[dict[str, str]] = [{param: payload}]
     wide: dict[str, str] = {}
+    pressed: FormField | None = None
     for field in form.fields:
         kind = (field.type or "text").lower()
         if kind in {"submit", "button", "reset", "image", "file"}:
+            # A browser presses exactly one submit control; that control is part
+            # of the request (pages often branch on ``isset($_POST['action'])``).
+            if pressed is None and kind in {"submit", "button"}:
+                pressed = field
             continue
         wide[field.name] = "1" if kind in {"number", "range"} else "tia"
     wide[param] = payload
+    if pressed is not None:
+        wide[pressed.name] = pressed.value or "1"
     if wide != {param: payload}:
         shapes.append(wide)
     return shapes
@@ -139,6 +147,10 @@ async def run_request_prover(
         "source_read", {"file": sink_file, "around": {"line": sink_line, "n": 40}}
     )
     source_text = "\n".join(str(line["text"]) for line in source["lines"])
+    source_lines = [
+        (int(line.get("n") or line.get("line") or 0), str(line["text"]))
+        for line in source["lines"]
+    ]
     notes["source_sha256"] = source["sha256"]
     probe_line = _target_line(raw_slice, sink_line)
     if probe_line <= 0:
@@ -156,7 +168,18 @@ async def run_request_prover(
         )
     vars_in_source = sorted(set(_POST_VAR_RE.findall(source_text)))
     param = params[0] if params else (vars_in_source[0] if vars_in_source else "")
-    notes.update({"probe_line": probe_line, "params": params, "param": param})
+    origin_text, origin_line = statement_origin(
+        source_lines, probe_line, str(sink.get("code") or "")
+    )
+    notes.update(
+        {
+            "probe_line": probe_line,
+            "params": params,
+            "param": param,
+            "statement_origin": origin_line,
+            "statement_resolved": origin_line != probe_line,
+        }
+    )
     stages.append(
         StageRecord("P1", True, f"watch_line={probe_line} param={param or '(unknown)'}")
     )
@@ -187,19 +210,29 @@ async def run_request_prover(
         )
     if not param:
         param = form.fields[0].name if form.fields else ""
+    carriers = request_carriers(source_text, origin_text, [f.name for f in form.fields])
+    if carriers and param not in carriers:
+        # The slice's taint parameter is not necessarily the carrier of this
+        # statement (a second-order chain may name the login parameter).  Prefer
+        # the form field that the statement itself consumes.
+        param = carriers[0]
+        refound = find_form(forms, param)
+        if refound is not None:
+            form = refound
     method = (form.method or "POST").upper()
     action = form.action or base_url
     notes.update(
         {
             "form": {"action": action, "method": method, "fields": [f.name for f in form.fields]},
             "param": param,
+            "carriers": carriers,
         }
     )
     stages.append(StageRecord("P2", True, f"form={action} method={method} param={param}"))
 
     # P3 payload candidates come from the class ------------------------------------
     tag = _tag()
-    context = sink_class.context(slice_doc, str(sink.get("code") or ""))
+    context = sink_class.context(slice_doc, origin_text)
     payloads = sink_class.seed(slice_doc, context, tag, payload_base)
     notes.update({"tag": tag, "context": context, "candidates": payloads})
     stages.append(StageRecord("P3", True, f"context={context} payloads={len(payloads)}"))

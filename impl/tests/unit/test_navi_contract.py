@@ -151,3 +151,19 @@ def test_read_target_prefers_trigger_read_line() -> None:
     assert _read_target(raw, {"read_line": 61}) == {"file": "read.php", "line": 61}
     assert _read_target(raw, {}) == {"file": "read.php", "line": 55}
     assert _read_target(raw) == {"file": "read.php", "line": 55}
+
+
+def test_family_roles_are_derived_from_chain_names(tmp_path: Path) -> None:
+    """A second-order SQL write chain feeds both ``second`` and ``write``."""
+    _write_chain(tmp_path, "xss-direct", [_sink("page.php", 2, "echo $_GET['q']")])
+    _write_chain(tmp_path, "xss-second-order", [_sink("read.php", 5, "echo $row")])
+    _write_chain(tmp_path, "sqlwrite-second-order", [_sink("write.php", 9, "$db->query($sql)")])
+    _write_chain(tmp_path, "sqlwrite-direct", [_sink("direct.php", 3, "$db->query($sql)")])
+
+    second = family_slices(tmp_path, "second")
+    write = family_slices(tmp_path, "write")
+    direct = family_slices(tmp_path, "direct")
+
+    assert {item["sink"]["line"] for item in second} == {5, 9}
+    assert {item["sink"]["line"] for item in write} == {3, 9}
+    assert {item["sink"]["line"] for item in direct} == {2}
