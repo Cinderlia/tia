@@ -12,11 +12,13 @@ import os
 import re
 import secrets
 import string
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlencode
 
 from tia.ad.llm import LlmClient
+from tia.cap.cleanup import cleanup_tagged_rows
 from tia.cap.delivery import DeliveryAttempt, deliver
 from tia.cap.domscan import Document, echo_snapshot, parse
 from tia.cap.entry import (
@@ -37,6 +39,26 @@ from tia.sinks.base import Observation, inject_verdict
 from tia.sinks.registry import sink_class_for
 
 DEFAULT_PAYLOAD = "<script>alert(1)</script>"
+
+# The rows this run wrote through the application, so cleanup can always find
+# them: state is set before the first POST and cleared once residue is zero.
+_ACTIVE_CLEANUP: ContextVar[dict[str, Any] | None] = ContextVar(
+    "tia_inject_cleanup", default=None
+)
+
+
+async def _cleanup_tagged_rows(kernel: Kernel, state: dict[str, Any]) -> int:
+    """Delete every row carrying this run's tag; return how many rows remain."""
+    columns = list(state.get("columns") or [])
+    if not columns and state.get("column"):
+        columns = [str(state["column"])]
+    return await cleanup_tagged_rows(
+        kernel,
+        case_id=str(state.get("case_id") or ""),
+        table=str(state.get("table") or ""),
+        columns=columns,
+        tag=str(state.get("tag") or ""),
+    )
 
 #: Verification attempts on the read page: bounded exploration, not one shot.
 VERIFY_ATTEMPTS = attempt_limit("verify", 4)
@@ -152,7 +174,7 @@ def _best_pair_hint(pair_hints: list[dict[str, Any]] | None) -> dict[str, Any] |
     return None
 
 
-async def run_inject(
+async def _run_inject(
     raw_slice: dict[str, Any],
     base_url: str,
     payload_base: str = DEFAULT_PAYLOAD,
@@ -361,6 +383,16 @@ async def run_inject(
     target["column"] = chosen_column
     notes["entry"] = {"url": form.action, "method": form.method, "field": field_name, "fields": form.fields}
     notes["payload"] = payload
+    state: dict[str, Any] = {
+        "kernel": kernel,
+        "case_id": result.case_id,
+        "table": str(target.get("table") or ""),
+        "column": chosen_column,
+        "tag": tag,
+        "pending": False,
+    }
+    _ACTIVE_CLEANUP.set(state)
+    notes["_cleanup_needed"] = True
     stage("I3", True, f"payload {len(payload)} chars, column {chosen_column} width={widths.get(chosen_column)}")
     stage("I4", True, f"intersect: field={field_name}, column={chosen_column}, payload {len(payload)} chars")
 
@@ -537,6 +569,8 @@ async def run_inject(
     if armed:
         with contextlib.suppress(ToolCallError):
             await call("probe_disarm", {"case_id": result.case_id})
+    state["pending"] = True
+    state["column"] = str(target.get("column") or chosen_column)
     status = submitted.get("http", {}).get("status") if armed else submitted.get("status")
     stage("I5", True, f"POST {form.action} → {status} probe={armed}")
     if armed and (submitted.get("queries") or []):
@@ -1159,29 +1193,12 @@ async def run_inject(
     notes["explanation"] = outcome.reason
 
     # ---- I7 cleanup: delete self-generated data, keep change record for rollback ----
-    if cleanup and in_db:
-        try:
-            deleted = await call(
-                "db_write",
-                {
-                    "case_id": result.case_id,
-                    "sql": f"DELETE FROM `{table}` WHERE `{column}` LIKE '%{tag}%'",
-                    "expect_affected": 1,
-                },
-            )
-            change = (deleted.get("change") or {}).get("change_id")
-            again_rows = await call(
-                "db_read",
-                {
-                    "sql": f"SELECT COUNT(*) AS n FROM `{table}` WHERE `{column}` LIKE '%{tag}%'",
-                },
-            )
-            rows_again = again_rows.get("rows") or []
-            result.residue = int(rows_again[0].get("n") or 0) if rows_again else 0
-            notes["cleanup"] = {"change_id": change, "residue": result.residue}
-            stage("I7", result.residue == 0, f"cleanup change={change} residue={result.residue}")
-        except ToolCallError as exc:
-            stage("I7", False, f"cleanup failed: {exc.envelope.error.message if exc.envelope.error else exc}")
+    state["column"] = str(target.get("column") or column)
+    if cleanup and state.get("pending"):
+        result.residue = await _cleanup_tagged_rows(kernel, state)
+        state["pending"] = result.residue != 0
+        notes["cleanup"] = {"residue": result.residue, "tag": tag}
+        stage("I7", result.residue == 0, f"cleanup tag={tag} residue={result.residue}")
     else:
         stage("I7", True, "no data to clean")
 
@@ -1189,7 +1206,68 @@ async def run_inject(
     return await _finish(kernel, result)
 
 
+async def run_inject(
+    raw_slice: dict[str, Any],
+    base_url: str,
+    payload_base: str = DEFAULT_PAYLOAD,
+    budget: int = 40,
+    client: ToolClient | None = None,
+    cleanup: bool = True,
+    pair_hints: list[dict[str, Any]] | None = None,
+    verify_url: str | None = None,
+    verify_entry: dict[str, Any] | None = None,
+    verify_values: dict[str, str] | None = None,
+    payload_constraints: dict[str, Any] | None = None,
+    slice_id: str | None = None,
+    learning: dict[str, Any] | None = None,
+    read_target: dict[str, Any] | None = None,
+    constraint_plan: dict[str, Any] | None = None,
+    pair_candidates: dict[str, list[dict[str, Any]]] | None = None,
+    flow: dict[str, Any] | None = None,
+) -> InjectResult:
+    """Run the inject agent and always remove the rows it wrote through the app.
+
+    Every early return already cleans up; this wrapper is the guard for paths
+    that raise instead of returning (a killed request, a non-tool error).
+    """
+    token = _ACTIVE_CLEANUP.set(None)
+    try:
+        return await _run_inject(
+            raw_slice,
+            base_url,
+            payload_base=payload_base,
+            budget=budget,
+            client=client,
+            cleanup=cleanup,
+            pair_hints=pair_hints,
+            verify_url=verify_url,
+            verify_entry=verify_entry,
+            verify_values=verify_values,
+            payload_constraints=payload_constraints,
+            slice_id=slice_id,
+            learning=learning,
+            read_target=read_target,
+            constraint_plan=constraint_plan,
+            pair_candidates=pair_candidates,
+            flow=flow,
+        )
+    finally:
+        state = _ACTIVE_CLEANUP.get()
+        if cleanup and state and state.get("pending"):
+            with contextlib.suppress(Exception):
+                await _cleanup_tagged_rows(state["kernel"], state)
+        _ACTIVE_CLEANUP.reset(token)
+
+
 async def _finish(kernel: Kernel, result: InjectResult, cleanup: bool = True) -> InjectResult:
+    state = _ACTIVE_CLEANUP.get()
+    if cleanup and state and state.get("pending") and state.get("kernel") is kernel:
+        result.residue = await _cleanup_tagged_rows(kernel, state)
+        state["pending"] = result.residue != 0
+        result.notes["cleanup"] = {"residue": result.residue, "tag": state.get("tag")}
+        result.stages.append(
+            StageRecord("I7", result.residue == 0, f"cleanup tag={state.get('tag')} residue={result.residue}")
+        )
     if result.case_id:
         record_case(
             get_runtime().store,

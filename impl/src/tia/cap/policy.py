@@ -38,6 +38,7 @@ def check_write(
     case_id: str,
     statement: WriteStatement,
     rows: int,
+    allow_multi: bool = False,
 ) -> None:
     """All checks before DB writes; raises ``ToolError`` directly if failed."""
     require_case(store, case_id)
@@ -69,8 +70,8 @@ def check_write(
             )
 
     limit = profile.max_rows_per_write
-    if rows > limit:
+    if rows > limit and not allow_multi:
         raise _deny(
             f"Writing {rows} rows in one go, exceeding the limit of {limit}",
-            "Multi-row writes require allow_multi and registration in the case; the current implementation rejects all",
+            "Pass allow_multi when a cleanup is meant to remove every row carrying a tag",
         )

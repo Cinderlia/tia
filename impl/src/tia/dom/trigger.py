@@ -20,6 +20,7 @@ from urllib.parse import urlencode
 
 from tia.ad.llm import LlmClient
 from tia.cap.case import parse_sink
+from tia.cap.cleanup import cleanup_tagged_rows
 from tia.cap.entry import (
     EntryCandidate,
     derive_payload_constraints,
@@ -432,6 +433,68 @@ async def run_trigger(
     slice_id: str | None = None,
     flow: dict[str, Any] | None = None,
 ) -> TriggerResult:
+    """Run the trigger agent and always revert the rows it wrote directly.
+
+    P6 reverts on the normal path; this guard covers exceptions, timeouts and
+    budget exhaustion, which would otherwise leave a payload row in the target.
+    """
+    case: dict[str, Any] = {}
+    try:
+        return await _run_trigger(
+            raw_slice,
+            base_url=base_url,
+            payload_base=payload_base,
+            budget=budget,
+            client=client,
+            slice_id=slice_id,
+            flow=flow,
+            case=case,
+        )
+    finally:
+        case_id = str(case.get("case_id") or "")
+        if case_id:
+            await _revert_pending_writes(case_id)
+        await _sweep_tagged_rows(case.get("cleanup"))
+
+
+async def _revert_pending_writes(case_id: str) -> None:
+    """Undo direct writes left pending by an interrupted trigger run."""
+    from tia.cap.db import db_undo
+    from tia.schemas.envelope import ToolError
+
+    rt = get_runtime()
+    try:
+        if not rt.store.list_changes(case_id, pending_only=True):
+            return
+        await db_undo({"case_id": case_id})
+    except ToolError:
+        pass
+
+
+async def _sweep_tagged_rows(state: dict[str, Any] | None) -> None:
+    """Delete every row carrying this run's tag, whoever wrote it."""
+    if not state or state.get("kernel") is None:
+        return
+    await cleanup_tagged_rows(
+        state["kernel"],
+        case_id=str(state.get("case_id") or ""),
+        table=str(state.get("table") or ""),
+        columns=[str(column) for column in state.get("columns") or []],
+        tag=str(state.get("tag") or ""),
+    )
+
+
+async def _run_trigger(
+    raw_slice: dict[str, Any],
+    *,
+    base_url: str,
+    payload_base: str = "<script>alert(1)</script>",
+    budget: int = 40,
+    client: ToolClient | None = None,
+    slice_id: str | None = None,
+    flow: dict[str, Any] | None = None,
+    case: dict[str, Any] | None = None,
+) -> TriggerResult:
     rt = get_runtime()
     slice_doc = normalize_slice(raw_slice)
     sink_class = sink_class_for(str(slice_doc.get("kind") or ""))
@@ -476,6 +539,8 @@ async def run_trigger(
     opened = await kernel.call("case_open", {"slice": slice_doc, "agent": "trigger", "write_targets": []})
     case_id = str(opened["case_id"])
     kernel.case_id = case_id
+    if case is not None:
+        case["case_id"] = case_id
     kernel.slice_id = slice_id
     stages.append(StageRecord("P0", True, f"case_id={case_id}"))
 
@@ -588,6 +653,16 @@ async def run_trigger(
     column_length = {c["name"]: c.get("length") for c in table_meta["columns"]}
     column_type = {c["name"]: str(c.get("type") or "") for c in table_meta["columns"]}
     payload_column = value_columns[0] if value_columns else ""
+    # The application writes rows as well (the verification POST submits the
+    # form), so tag-based cleanup covers both our direct writes and the app's.
+    if case is not None:
+        case["cleanup"] = {
+            "kernel": kernel,
+            "case_id": case_id,
+            "table": table,
+            "columns": value_columns,
+            "tag": tag,
+        }
 
     # The model picks the storage column and shapes the payload for the sink
     # context; the local candidate list stays only as a fallback when no model

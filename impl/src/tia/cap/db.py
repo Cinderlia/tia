@@ -239,6 +239,7 @@ async def db_write(arguments: dict[str, Any]) -> ToolOutput:
         case_id=params.case_id,
         statement=statement,
         rows=len(before) if before else statement.value_rows,
+        allow_multi=params.allow_multi,
     )
 
     if params.dry_run:
