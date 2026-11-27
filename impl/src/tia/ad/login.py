@@ -97,6 +97,16 @@ def login(
             headers={"User-Agent": "tia-agent/0.1"},
         ) as client:
             page = client.get(account.login_url)
+            hops = 0
+            while page.is_redirect and hops < max_redirects:
+                location = page.headers.get("location", "")
+                if not location:
+                    break
+                target = urljoin(str(page.url), location)
+                hops += 1
+                page = client.get(target)
+                if target == account.login_url:
+                    break
             if page.status_code >= 400:
                 return LoginResult(
                     False, page.status_code, str(page.url), f"LOGIN_PAGE_STATUS_{page.status_code}"
