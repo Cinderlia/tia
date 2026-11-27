@@ -198,6 +198,11 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="Report directory for this run (default: <store dir>/reports)",
     )
+    pipeline.add_argument(
+        "--flow-queue",
+        action="store_true",
+        help="Schedule attack flows (target site + writers) instead of single slices",
+    )
     pipeline.add_argument("--json", action="store_true")
 
     llm = sub.add_parser("llm", help="List model profiles from config/local/llm.yaml")
@@ -545,6 +550,46 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         return str(args.base_url).rstrip("/") + "/" + parent.strip("/") + "/"
 
     url_for_fn = url_for if args.per_slice_url else None
+    if args.flow_queue:
+        from tia.dom.flow_main import run_flow_queue, seed_flow_queue
+        from tia.dom.pipeline import _reader
+
+        family = "direct" if args.mode == "direct" else "second"
+        read_slices = direct_slices if family == "direct" else trigger_slices
+        sites = [
+            {"raw": raw, "family": family, "role": "read"} for raw in read_slices
+        ] + [{"raw": raw, "family": "second", "role": "write"} for raw in write_slices]
+        reader = _reader()
+        seeded = seed_flow_queue(store, run_id, sites, family=family, reader=reader)
+        flow_result = asyncio.run(
+            run_flow_queue(
+                store,
+                args.base_url,
+                run_id,
+                limit=args.limit or 1000,
+                payload_base=args.payload,
+                budget=args.budget,
+                url_for=url_for_fn,
+                reader=reader,
+            )
+        )
+        for item in flow_result.outcomes:
+            print(f"[flow] [{item.slice_id}] {item.verdict}", file=sys.stderr)
+        summary = {
+            "ok": True,
+            "agent": "pipeline",
+            "mode": args.mode,
+            "queue": "flow",
+            "run_id": run_id,
+            "sites": seeded.sites,
+            "flows": seeded.flows,
+            "stop_reason": flow_result.stop_reason,
+            "outcomes": [item.model_dump() for item in flow_result.outcomes],
+        }
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        if not args.json:
+            print(flow_result.report)
+        return 0
     result = asyncio.run(
         run_pipeline(
             store,

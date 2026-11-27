@@ -27,6 +27,7 @@ class MainResult:
     outcomes: list[CaseOutcome] = field(default_factory=list)
     stop_reason: str = "DONE"
     report: str = ""
+    report_path: str = ""
 
 
 def slice_id(raw: dict[str, Any], index: int) -> str:

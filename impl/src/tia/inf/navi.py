@@ -46,8 +46,10 @@ SQL_CHAINS: frozenset[str] = frozenset(NAVI_CHAINS) - frozenset(FAMILY_OF_CHAIN)
 CHAINS_OF_FAMILY: dict[str, tuple[str, ...]] = {
     "direct": ("xss-direct",),
     "second": ("xss-second-order",),
-    # Write slices are SQL write sites; they only serve pairing for now.
-    "write": ("sqlwrite-direct",),
+    # Write slices: the direct SQL-write chain plus the two second-order write
+    # sources. ``read-to-write`` is a first-class source (not a low-confidence
+    # fallback); ``sqlwrite-second-order`` is the last resort.
+    "write": ("sqlwrite-direct", "read-to-write", "sqlwrite-second-order"),
 }
 
 _GRAPH_NAME = "taint-analysis-graphs.json"
@@ -235,6 +237,10 @@ def family_slices(root: Path, family: str) -> list[dict[str, Any]]:
     chains = CHAINS_OF_FAMILY.get(family)
     if chains is None:
         raise NaviContractError(f"unknown family: {family}")
-    return load_navi(root, chains=chains, include_sql=True)[
+    present = set(present_chains(root))
+    selected = tuple(chain for chain in chains if chain in present)
+    if not selected:
+        raise NaviContractError(f"no {'/'.join(chains)} chain under {root}")
+    return load_navi(root, chains=selected, include_sql=True)[
         "sql" if family == "write" else family
     ]

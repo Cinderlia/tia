@@ -211,6 +211,30 @@ CREATE TABLE IF NOT EXISTS learning (
     updated_at TEXT NOT NULL,
     UNIQUE(signature, attribute, value)
 );
+CREATE TABLE IF NOT EXISTS flow_job (
+    flow_id          TEXT PRIMARY KEY,
+    run_id           TEXT NOT NULL,
+    rank             INTEGER NOT NULL DEFAULT 0,
+    family           TEXT NOT NULL DEFAULT 'second',
+    sink_class       TEXT NOT NULL DEFAULT 'xss',
+    sink_kind        TEXT NOT NULL DEFAULT 'Xss',
+    target_slice_id  TEXT NOT NULL,
+    writer_slice_ids TEXT NOT NULL DEFAULT '[]',
+    table_name       TEXT NOT NULL DEFAULT '',
+    columns          TEXT NOT NULL DEFAULT '[]',
+    score            INTEGER NOT NULL DEFAULT 0,
+    reasons          TEXT NOT NULL DEFAULT '[]',
+    digest           TEXT NOT NULL DEFAULT '{}',
+    status           TEXT NOT NULL DEFAULT 'pending',
+    attempts         INTEGER NOT NULL DEFAULT 0,
+    verdict          TEXT NOT NULL DEFAULT '',
+    case_id          TEXT NOT NULL DEFAULT '',
+    probe            TEXT NOT NULL DEFAULT '{}',
+    notes            TEXT NOT NULL DEFAULT '{}',
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_flow_job_run ON flow_job (run_id, status, score);
 """
 
 
@@ -235,6 +259,8 @@ class Store:
                 ("order_mode", "ALTER TABLE slice ADD COLUMN order_mode TEXT NOT NULL DEFAULT 'second'"),
                 ("identity", "ALTER TABLE slice ADD COLUMN identity TEXT NOT NULL DEFAULT ''"),
                 ("duplicate_of", "ALTER TABLE slice ADD COLUMN duplicate_of TEXT"),
+                ("role", "ALTER TABLE slice ADD COLUMN role TEXT NOT NULL DEFAULT 'read'"),
+                ("chain", "ALTER TABLE slice ADD COLUMN chain TEXT NOT NULL DEFAULT ''"),
             ):
                 if name not in columns:
                     conn.execute(ddl)
@@ -1326,3 +1352,218 @@ class Store:
             key = f"{row['sink_file']}:{row['sink_line']}"
             history.setdefault(key, []).append(str(row["verdict"]))
         return history
+
+    # -- flow queue --------------------------------------------------------
+
+    def insert_site(
+        self,
+        run_id: str,
+        raw: dict[str, Any],
+        *,
+        family: str = "second",
+        chain: str = "",
+        role: str = "read",
+        identity: str = "",
+        score: int = 0,
+        reasons: list[str] | None = None,
+        digest: dict[str, Any] | None = None,
+    ) -> str | None:
+        """Insert one static site; de-duplicates on (file, line, role) inside a run.
+
+        A source line can be a read point in one chain and a write point in
+        another, so the role is part of the key — unlike :meth:`seed_slices`,
+        which serves the legacy single-family queue.
+        """
+        raw_sink = raw.get("sink")
+        sink: dict[str, Any] = raw_sink if isinstance(raw_sink, dict) else {}
+        sink_file = str(sink.get("file") or raw.get("sinkFile") or "")
+        sink_line = int(sink.get("line") or raw.get("sinkLine") or 0)
+        if not sink_file:
+            return None
+        slice_id = str(raw.get("slice_id") or f"site-{uuid.uuid4().hex[:10]}")
+        ts = now_iso()
+        with self._conn() as conn:
+            exists = conn.execute(
+                "SELECT id FROM slice WHERE run_id=? AND sink_file=? AND sink_line=? AND role=?"
+                " AND status IN ('pending','running','executed')",
+                (run_id, sink_file, sink_line, role),
+            ).fetchone()
+            if exists is not None:
+                return str(exists["id"])
+            conn.execute(
+                "INSERT INTO slice (id, run_id, kind, sink_file, sink_line, slice_json, order_mode,"
+                " identity, role, chain, score, reasons, digest, created_at, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    slice_id,
+                    run_id,
+                    str(raw.get("kind") or "unknown"),
+                    sink_file,
+                    sink_line,
+                    json.dumps(raw, ensure_ascii=False),
+                    family,
+                    identity,
+                    role,
+                    chain,
+                    score,
+                    json.dumps(reasons or [], ensure_ascii=False),
+                    json.dumps(digest or {}, ensure_ascii=False),
+                    ts,
+                    ts,
+                ),
+            )
+        return slice_id
+
+    def seed_flows(self, run_id: str, flows: list[dict[str, Any]]) -> int:
+        ts = now_iso()
+        with self._conn() as conn:
+            for index, flow in enumerate(flows):
+                flow_id_value = str(flow["flow_id"])
+                existing = conn.execute(
+                    "SELECT created_at FROM flow_job WHERE flow_id=?", (flow_id_value,)
+                ).fetchone()
+                created_at = str(existing["created_at"]) if existing is not None else ts
+                conn.execute(
+                    "INSERT OR REPLACE INTO flow_job (flow_id, run_id, rank, family, sink_class,"
+                    " sink_kind, target_slice_id, writer_slice_ids, table_name, columns, score,"
+                    " reasons, digest, created_at, updated_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        flow_id_value,
+                        run_id,
+                        int(flow.get("rank") or index),
+                        str(flow.get("family") or "second"),
+                        str(flow.get("sink_class") or "xss"),
+                        str(flow.get("sink_kind") or "Xss"),
+                        str(flow["target_slice_id"]),
+                        json.dumps(flow.get("writer_slice_ids") or [], ensure_ascii=False),
+                        str(flow.get("table") or ""),
+                        json.dumps(flow.get("columns") or [], ensure_ascii=False),
+                        int(flow.get("score") or 0),
+                        json.dumps(flow.get("reasons") or [], ensure_ascii=False),
+                        json.dumps(flow.get("digest") or {}, ensure_ascii=False),
+                        created_at,
+                        ts,
+                    ),
+                )
+        return len(flows)
+
+    def _flow_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        for key in ("writer_slice_ids", "columns", "reasons", "digest", "probe", "notes"):
+            raw = item.get(key)
+            try:
+                item[key] = json.loads(raw) if raw else ([] if key in {"writer_slice_ids", "columns", "reasons"} else {})
+            except json.JSONDecodeError:
+                item[key] = [] if key in {"writer_slice_ids", "columns", "reasons"} else {}
+        return item
+
+    def next_flow(self, run_id: str | None = None, ttl_minutes: int = 30) -> dict[str, Any] | None:
+        self.requeue_expired_flows(ttl_minutes)
+        sql = "SELECT flow_id FROM flow_job WHERE status='pending'"
+        args: list[Any] = []
+        if run_id:
+            sql += " AND run_id=?"
+            args.append(run_id)
+        sql += " ORDER BY score DESC, rank, created_at LIMIT 1"
+        with self._conn() as conn:
+            row = conn.execute(sql, tuple(args)).fetchone()
+            if row is None:
+                return None
+            flow_id_value = str(row["flow_id"])
+            conn.execute(
+                "UPDATE flow_job SET status='running', attempts=attempts+1, updated_at=? WHERE flow_id=?",
+                (now_iso(), flow_id_value),
+            )
+            fresh = conn.execute("SELECT * FROM flow_job WHERE flow_id=?", (flow_id_value,)).fetchone()
+        return self._flow_row(fresh)
+
+    def requeue_expired_flows(self, ttl_minutes: int = 30) -> int:
+        cutoff = datetime.now().astimezone().timestamp() - ttl_minutes * 60
+        with self._conn() as conn:
+            rows = conn.execute("SELECT flow_id, updated_at FROM flow_job WHERE status='running'").fetchall()
+            count = 0
+            for row in rows:
+                try:
+                    updated = datetime.fromisoformat(str(row["updated_at"]))
+                except ValueError:
+                    continue
+                if updated.timestamp() < cutoff:
+                    conn.execute(
+                        "UPDATE flow_job SET status='pending', updated_at=? WHERE flow_id=?",
+                        (now_iso(), row["flow_id"]),
+                    )
+                    count += 1
+        return count
+
+    def archive_flow(
+        self,
+        flow_id_value: str,
+        status: str,
+        verdict: str = "",
+        *,
+        case_id: str = "",
+        notes: dict[str, Any] | None = None,
+    ) -> bool:
+        with self._conn() as conn:
+            cursor = conn.execute(
+                "UPDATE flow_job SET status=?, verdict=?, case_id=?, notes=?, updated_at=? WHERE flow_id=?",
+                (
+                    status,
+                    verdict,
+                    case_id,
+                    json.dumps(notes or {}, ensure_ascii=False, default=str),
+                    now_iso(),
+                    flow_id_value,
+                ),
+            )
+            return cursor.rowcount > 0
+
+    def set_flow_probe(self, flow_id_value: str, probe: dict[str, Any]) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE flow_job SET probe=?, updated_at=? WHERE flow_id=?",
+                (json.dumps(probe, ensure_ascii=False, default=str), now_iso(), flow_id_value),
+            )
+
+    def get_flow(self, flow_id_value: str) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            row = conn.execute("SELECT * FROM flow_job WHERE flow_id=?", (flow_id_value,)).fetchone()
+        return self._flow_row(row) if row else None
+
+    def list_flow_jobs(
+        self, run_id: str | None = None, status: str | None = None, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM flow_job WHERE 1=1"
+        args: list[Any] = []
+        if run_id:
+            sql += " AND run_id=?"
+            args.append(run_id)
+        if status:
+            sql += " AND status=?"
+            args.append(status)
+        sql += " ORDER BY score DESC, rank, created_at LIMIT ?"
+        args.append(max(1, min(limit, 500)))
+        with self._conn() as conn:
+            rows = conn.execute(sql, tuple(args)).fetchall()
+        return [self._flow_row(row) for row in rows]
+
+    def count_pending_flows(self, run_id: str) -> int:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM flow_job WHERE status='pending' AND run_id=?", (run_id,)
+            ).fetchone()
+        return int(row["n"])
+
+    def peek_flows(self, run_id: str | None = None, limit: int = 5) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM flow_job WHERE status='pending'"
+        args: list[Any] = []
+        if run_id:
+            sql += " AND run_id=?"
+            args.append(run_id)
+        sql += " ORDER BY score DESC, rank, created_at LIMIT ?"
+        args.append(max(1, min(limit, 50)))
+        with self._conn() as conn:
+            rows = conn.execute(sql, tuple(args)).fetchall()
+        return [self._flow_row(row) for row in rows]
+

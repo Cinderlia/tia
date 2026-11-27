@@ -336,6 +336,36 @@ async def _fetch_verify(
     except ToolCallError:
         return None
 
+
+async def _node_windows(
+    kernel: Kernel, slice_doc: dict[str, Any], sink_file: str, limit: int = 6
+) -> list[dict[str, Any]]:
+    """Read short windows around taint nodes that live in other files.
+
+    A sink can be a shared template while the SQL that feeds it sits in the
+    calling module (the NAVI chain records both).  Inference needs that view.
+    """
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for node in slice_doc.get("nodes") or []:
+        if not isinstance(node, dict):
+            continue
+        file = str(node.get("file") or "")
+        line = int(node.get("line") or 0)
+        if not file or not line or file == sink_file or file in seen:
+            continue
+        seen.add(file)
+        try:
+            window = await kernel.call("source_read", {"file": file, "around": {"line": line, "n": 8}})
+        except ToolCallError:
+            continue
+        out.append(window)
+        if len(out) >= limit:
+            break
+    return out
+
+
+
 async def run_trigger(
     raw_slice: dict[str, Any],
     *,
@@ -344,6 +374,7 @@ async def run_trigger(
     budget: int = 40,
     client: ToolClient | None = None,
     slice_id: str | None = None,
+    flow: dict[str, Any] | None = None,
 ) -> TriggerResult:
     rt = get_runtime()
     slice_doc = normalize_slice(raw_slice)
@@ -357,6 +388,10 @@ async def run_trigger(
         "sink_file": sink_file,
         "sink_code": str(sink.get("code") or ""),
     }
+    if flow:
+        notes["flow_id"] = str(flow.get("flow_id") or "")
+        notes["flow_class"] = str(flow.get("sink_class") or "")
+        notes["flow_writers"] = list(flow.get("writer_slice_ids") or [])
     kernel = Kernel(
         profile="trigger", budget=budget, client=client or LocalToolClient(profile="trigger")
     )
@@ -376,17 +411,33 @@ async def run_trigger(
     source = await kernel.call("source_read", {"file": sink_file, "around": {"line": sink_line, "n": 40}})
     source_text = "\n".join(str(line["text"]) for line in source["lines"])
     notes["source_sha256"] = source["sha256"]
-    inferred = _infer_target(source_text, params)
+    node_windows = await _node_windows(kernel, slice_doc, sink_file)
+    inference_text = "\n".join(
+        [source_text]
+        + [
+            "\n".join(str(line["text"]) for line in window["lines"])
+            for window in node_windows
+        ]
+    )
+    inferred = _infer_target(inference_text, params)
     table = inferred["table"]
     columns = inferred["insert_columns"]
+    if not table and flow:
+        table = str(flow.get("table") or flow.get("table_name") or "")
+        columns = [str(column) for column in (flow.get("columns") or [])]
+        if table:
+            notes["inference_source"] = "flow"
     if not table:
         stages.append(StageRecord("P1", False, "Failed to infer target table from source code"))
         return done(TriggerResult(case_id=case_id, verdict="SQL_ERROR", residue=None,
                                   report=await kernel.report(), stages=stages, notes=notes,
                                   trace=kernel.trace))
     post_vars = sorted(set(_POST_VAR_RE.findall(source_text))) or params
-    entry_plan = infer_entry(source_text)
-    read_line = _read_line([line for line in source["lines"] if isinstance(line, dict)], table)
+    entry_plan = infer_entry(inference_text)
+    read_lines = [line for line in source["lines"] if isinstance(line, dict)]
+    for window in node_windows:
+        read_lines.extend(line for line in window["lines"] if isinstance(line, dict))
+    read_line = _read_line(read_lines, table)
     notes.update(
         {
             "table": table,
@@ -513,6 +564,7 @@ async def run_trigger(
             if value == payload and declared_length is not None and len(payload) > int(declared_length):
                 value = f"tia-{tag}"
             values.append(value)
+
         written_columns = [col for col, value in zip(value_columns, values, strict=True) if value == payload]
         if written_columns:
             payload_column = written_columns[0]

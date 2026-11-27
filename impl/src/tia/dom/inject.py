@@ -18,7 +18,7 @@ from urllib.parse import urlencode
 
 from tia.ad.llm import LlmClient
 from tia.cap.delivery import DeliveryAttempt, deliver
-from tia.cap.domscan import Document, parse
+from tia.cap.domscan import Document, echo_snapshot, parse
 from tia.cap.entry import (
     EntryPlan,
     entry_candidates,
@@ -169,6 +169,7 @@ async def run_inject(
     read_target: dict[str, Any] | None = None,
     constraint_plan: dict[str, Any] | None = None,
     pair_candidates: dict[str, list[dict[str, Any]]] | None = None,
+    flow: dict[str, Any] | None = None,
 ) -> InjectResult:
     kernel = Kernel(
         profile="inject", budget=budget, client=client or LocalToolClient(profile="inject")
@@ -177,6 +178,9 @@ async def run_inject(
     result = InjectResult(case_id="", verdict="ENV_ERROR")
     stages = result.stages
     notes = result.notes
+    if flow:
+        notes["flow_id"] = str(flow.get("flow_id") or "")
+        notes["flow_class"] = str(flow.get("sink_class") or "")
 
     def stage(name: str, ok: bool, note: str) -> None:
         stages.append(StageRecord(stage=name, ok=ok, note=note))
@@ -767,43 +771,37 @@ async def run_inject(
             client=LlmClient.from_env(),
             limit=VERIFY_ATTEMPTS,
         )
-        attempt_values = [candidate.values for candidate in entry_candidates_list] or [entry_fields]
+        # Local-first: the trigger already proved which read parameters reach the
+        # sink. Seed those values, then try single-field and full-form variants
+        # before asking the model for anything.
+        local_values: list[dict[str, str]] = []
+        if verify_values:
+            seed_by_name = {spec.name: spec for spec in entry_spec}
+            seeded: dict[str, str] = {}
+            for name, value in verify_values.items():
+                spec = seed_by_name.get(str(name))
+                if spec is not None and spec.usage == "contains":
+                    seeded[str(name)] = tag
+                elif value not in (None, ""):
+                    seeded[str(name)] = str(value)
+            if seeded:
+                local_values.append(seeded)
+        for spec in entry_spec:
+            single = {spec.name: tag}
+            if single not in local_values:
+                local_values.append(single)
+        combined = {spec.name: tag for spec in entry_spec}
+        if combined not in local_values:
+            local_values.append(combined)
+        for candidate_entry in entry_candidates_list:
+            candidate_values = dict(candidate_entry.values)
+            if candidate_values and candidate_values not in local_values:
+                local_values.append(candidate_values)
+        attempt_values = local_values or [entry_fields]
         notes["verify_attempt_candidates"] = [
             {"method": candidate.method, "confidence": candidate.confidence, "values": candidate.values}
             for candidate in entry_candidates_list
         ]
-        read_plan = await plan_request(
-            client=LlmClient.from_env(),
-            goal=(
-                "open this page so the row that carries the tag is selected and rendered; "
-                "some pages reject mutually exclusive parameters"
-            ),
-            page_url=verify_url,
-            forms=read_forms
-            or [
-                PageForm(
-                    action=verify_url,
-                    method=entry_method.lower(),
-                    fields=[FormField(name=item.name, type="numeric" if item.numeric else "text")
-                            for item in entry_spec],
-                )
-            ],
-            html=read_html,
-            source_text=str(notes.get("read_sink_code") or text),
-            payload=tag,
-            tag=tag,
-            sink=str(notes.get("read_sink_code") or ""),
-            constraints=", ".join(f"{name}: {kind}" for name, kind in column_limits.items()),
-            hint="choose the parameters that make this page query the row that contains the tag",
-            fallback_fields=attempt_values[0] if attempt_values else {},
-            fallback_method=entry_method,
-        )
-        if read_plan is not None and read_plan.values:
-            notes["read_request_plan"] = read_plan.to_dict()
-            ordered = [read_plan.values] + [
-                item for item in attempt_values if dict(item) != dict(read_plan.values)
-            ]
-            attempt_values = ordered[: VERIFY_ATTEMPTS + 1]
         verify = None
         attempts: list[dict[str, Any]] = []
         read_armed = False
@@ -818,25 +816,7 @@ async def run_inject(
                     },
                 )
                 read_armed = True
-        queue: list[dict[str, str]] = []
-        if verify_values:
-            # The trigger proved which read parameters reach the sink, but its tag
-            # belongs to the trigger case. Reuse only the "exact" values; rewrite
-            # every "contains" field with this case's tag.
-            by_name = {spec.name: spec for spec in entry_spec}
-            seeded: dict[str, str] = {}
-            for name, value in verify_values.items():
-                spec = by_name.get(str(name))
-                if spec is not None and spec.usage == "contains":
-                    seeded[str(name)] = tag
-                elif value not in (None, ""):
-                    seeded[str(name)] = str(value)
-            if seeded:
-                queue.append(seeded)
-        for seed in attempt_values:
-            seed_values = dict(seed)
-            if seed_values not in queue:
-                queue.append(seed_values)
+        queue: list[dict[str, str]] = [dict(seed) for seed in attempt_values]
         used_plans = 0
         observation = ""
         index = 0
@@ -943,6 +923,12 @@ async def run_inject(
             )
             if verify is None or (this_verify.get("found") and not bool(verify.get("found"))):
                 verify = this_verify
+            if tag and tag in attempt_html:
+                snapshot = echo_snapshot(attempt_html, tag)
+                if snapshot:
+                    notes.setdefault("read_snapshots", []).append(
+                        {"values": dict(values), "snapshot": snapshot}
+                    )
             if this_verify.get("found"):
                 break
             lowered = attempt_html.lower()
@@ -957,7 +943,7 @@ async def run_inject(
             observation = f"HTTP {status}; the case tag is absent from the response"
             if snippet:
                 observation += f"; page text: {snippet}"
-            if used_plans < 1:
+            if used_plans < 1 and index >= len(queue):
                 used_plans += 1
                 again = await plan_request(
                     client=LlmClient.from_env(),
