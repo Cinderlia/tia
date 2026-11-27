@@ -479,13 +479,76 @@ def is_html_content_type(content_type: str) -> bool:
     return lowered in {"text/html", "application/xhtml+xml", ""}
 
 
-def echo_snapshot(html: str, tag: str, *, before: int = 120, after: int = 120, max_len: int = 4000) -> str:
-    """Return only the markup that directly wraps the echoed tag.
+_NEUTRAL_TAGS: frozenset[str] = frozenset(
+    {
+        "html",
+        "body",
+        "head",
+        "div",
+        "span",
+        "p",
+        "a",
+        "b",
+        "i",
+        "u",
+        "em",
+        "strong",
+        "small",
+        "font",
+        "br",
+        "hr",
+        "ul",
+        "ol",
+        "li",
+        "dl",
+        "dt",
+        "dd",
+        "table",
+        "thead",
+        "tbody",
+        "tfoot",
+        "tr",
+        "td",
+        "th",
+        "section",
+        "article",
+        "header",
+        "footer",
+        "main",
+        "nav",
+        "aside",
+        "figure",
+        "figcaption",
+        "blockquote",
+        "label",
+        "form",
+        "fieldset",
+        "legend",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "img",
+        "input",
+        "button",
+        "select",
+        "option",
+    }
+)
 
-    A whole response page is mostly noise and truncating it can cut exactly the
-    quote or comment that decides whether the payload is inert. This keeps the
-    tag occurrence plus its enclosing chain (start tags, quote, comment or
-    script string) and drops sibling content.
+
+def echo_snapshot(
+    html: str, tag: str, *, before: int = 120, after: int = 120, max_len: int = 2000
+) -> str:
+    """Return the markup around the echo that can change whether the tag executes.
+
+    Blacklist, not whitelist: dropping a harmless layout wrapper can never make
+    an inert payload look executable, while keeping one too many is merely
+    noise, so unknown tags stay. Layout-only tags are removed; wrappers that
+    change parsing (script, style, textarea, title, template, noscript, iframe,
+    object, embed, svg, math) and attribute/comment contexts are kept.
     """
     position = html.find(tag)
     if position < 0:
@@ -498,35 +561,33 @@ def echo_snapshot(html: str, tag: str, *, before: int = 120, after: int = 120, m
     if segment.kind == "comment":
         return f"<!-- ... {inner} ... -->"[:max_len]
     node = segment.node
-    if segment.kind == "attr" and node is not None:
+    if node is None:
+        return inner[:max_len]
+    if segment.kind == "attr":
         name = segment.attr_name or ""
         quote = _QUOTE_TEXT.get(segment.quote or "", "")
         value = html[segment.start : segment.end]
-        opening = "".join(
-            f" {other}={_QUOTE_TEXT.get(q, '')}{node.attrs[other]}{_QUOTE_TEXT.get(q, '')}"
-            for other, q in node.attr_quotes.items()
-            if other != name
-        )
-        text = f"<{node.tag}{opening} {name}={quote}{value}{quote}>"
+        text = f"<{node.tag} {name}={quote}{value}{quote}>"
         if not html[segment.start : segment.end + 1].endswith(quote):
             text += "  [attribute value is not closed after the payload]"
         return text[:max_len]
-    if node is None:
-        return inner[:max_len]
-    closing = f"</{node.tag}>"
-    node_end = node.end - len(closing) if html[node.end - len(closing) : node.end].lower() == closing else node.end
-    inner_start = max(node.start_tag_end, position - before)
-    inner_end = min(node_end, position + len(tag) + after)
-    inner = html[inner_start:inner_end]
     chain: list[Node] = []
     current: Node | None = node
     while current is not None:
-        if current.tag not in {"html", "body"}:
+        if current.tag.lower() not in _NEUTRAL_TAGS:
             chain.append(current)
         current = current.parent
-    opened = "".join(f"<{item.tag}>" for item in reversed(chain))
-    closed = "".join(f"</{item.tag}>" for item in chain)
-    text = opened + inner + closed
-    if node.tag in {"script", "style", "textarea", "title"}:
-        text += f"\n[payload sits inside <{node.tag}>; the closing sequence decides execution]"
+    closing = f"</{node.tag}>"
+    node_end = (
+        node.end - len(closing)
+        if html[node.end - len(closing) : node.end].lower() == closing
+        else node.end
+    )
+    inner_start = max(node.start_tag_end, position - before)
+    inner_end = min(node_end, position + len(tag) + after)
+    text = "".join(f"<{item.tag}>" for item in reversed(chain))
+    text += html[inner_start:inner_end]
+    text += "".join(f"</{item.tag}>" for item in chain)
+    if chain:
+        text += "\n[payload sits inside these wrappers; the closing sequence decides execution]"
     return text[:max_len]
