@@ -435,8 +435,10 @@ async def run_trigger(
     rt = get_runtime()
     slice_doc = normalize_slice(raw_slice)
     sink_class = sink_class_for(str(slice_doc.get("kind") or ""))
-    has_writers = bool(list((flow or {}).get("writer_slice_ids") or []))
-    if not sink_class.writes_database() and not has_writers:
+    # The sink class decides how it is proved: a class that never persists a
+    # payload is proved through the request itself, regardless of what writers a
+    # flow happens to carry.  Writers only matter to classes that store a value.
+    if not sink_class.writes_database():
         from tia.dom.request_prover import run_request_prover
 
         return await run_request_prover(

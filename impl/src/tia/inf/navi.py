@@ -33,43 +33,65 @@ NAVI_CHAINS: tuple[str, ...] = (
     "sqlwrite-second-order",
 )
 
-#: Chains whose slices are write sinks; the pairing agent consumes them.
-WRITE_CHAINS: frozenset[str] = frozenset(
-    {"sqlwrite-direct", "read-to-write", "sqlwrite-second-order"}
-)
+@dataclass(frozen=True, slots=True)
+class ChainSpec:
+    """One chain of the contract: its sink kind and the roles that consume it.
+
+    The table is a transcription of ``docs/NAVI-CHAIN-CONTRACT.md``, not a rule:
+    the chain name is authoritative and it already carries the semantics (once /
+    second-order, read / write).  A name that is missing here is a contract
+    change and must be added explicitly, never guessed from the name.
+    """
+
+    name: str
+    kind: str
+    roles: tuple[str, ...]
+    family: str
+
+
+#: Contract chains.  ``roles`` may overlap: a second-order write chain is both
+#: a main-side proof source and a pairing source.
+CHAIN_SPECS: dict[str, ChainSpec] = {
+    "xss-direct": ChainSpec("xss-direct", "Xss", ("direct",), "direct"),
+    "xss-second-order": ChainSpec("xss-second-order", "Xss", ("second",), "second"),
+    "sqlwrite-direct": ChainSpec("sqlwrite-direct", "SqlInjection", ("write",), "sql"),
+    "read-to-write": ChainSpec("read-to-write", "SqlWriteLoose", ("write",), "sql"),
+    "sqlread-direct": ChainSpec("sqlread-direct", "SqlRead", ("direct",), "sql"),
+    "sqlwrite-second-order": ChainSpec(
+        "sqlwrite-second-order", "SqlWriteLoose", ("second", "write"), "sql"
+    ),
+}
+
+
+def chain_spec(chain: str) -> ChainSpec:
+    """The declared spec of ``chain``; an unknown chain is a contract error."""
+
+    spec = CHAIN_SPECS.get(chain)
+    if spec is None:
+        raise NaviContractError(f"chain not in the contract: {chain}")
+    return spec
 
 
 def chains_for_role(role: str) -> tuple[str, ...]:
-    """Chains that feed one role, derived from the chain names in the contract.
+    """Chains that feed one role, in contract order (roles may overlap)."""
 
-    Deriving the role from the name (``*-second-order`` / ``*-direct`` / a write
-    sink) means a new chain is routed as soon as the contract adds it; it never
-    has to be registered in a second hand-kept table.
-    """
-
-    if role == "write":
-        return tuple(chain for chain in NAVI_CHAINS if chain in WRITE_CHAINS)
-    if role == "second":
-        return tuple(chain for chain in NAVI_CHAINS if chain.endswith("-second-order"))
-    if role == "direct":
-        return tuple(
-            chain
-            for chain in NAVI_CHAINS
-            if chain.endswith("-direct") and chain not in WRITE_CHAINS
-        )
-    raise NaviContractError(f"unknown family: {role}")
+    if role not in {"direct", "second", "write"}:
+        raise NaviContractError(f"unknown family: {role}")
+    return tuple(
+        chain
+        for chain, spec in CHAIN_SPECS.items()
+        if role in spec.roles
+    )
 
 
-#: Convenience groups for CLI callers; roles may overlap (a second-order write
-#: chain is both a main-side proof and a pairing source).
+#: Convenience groups for CLI callers.
 CHAINS_OF_FAMILY: dict[str, tuple[str, ...]] = {
     role: chains_for_role(role) for role in ("direct", "second", "write")
 }
 
 #: Legacy grouping used by :func:`load_navi` (SQL chains stay in their own key).
 FAMILY_OF_CHAIN: dict[str, str] = {
-    "xss-direct": "direct",
-    "xss-second-order": "second",
+    chain: spec.family for chain, spec in CHAIN_SPECS.items() if spec.family != "sql"
 }
 
 #: SQL chains, reserved until the SQL acceptance path lands.
@@ -173,6 +195,7 @@ def load_chain(root: Path, chain: str) -> list[dict[str, Any]]:
     if not isinstance(sinks, list):
         raise NaviContractError(f"{path} has no sinks list")
 
+    spec = chain_spec(chain)
     family = FAMILY_OF_CHAIN.get(chain, "sql")
     out: list[dict[str, Any]] = []
     for raw in sinks:
@@ -205,7 +228,7 @@ def load_chain(root: Path, chain: str) -> list[dict[str, Any]]:
             file=file,
             line=line,
             code=code,
-            kind=str(raw.get("kind") or ("Xss" if family != "sql" else "SqlWriteLoose")),
+            kind=str(raw.get("kind") or spec.kind),
             params=params,
             nodes=nodes,
             edges=edges,

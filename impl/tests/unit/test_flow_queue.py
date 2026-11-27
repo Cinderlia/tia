@@ -174,3 +174,117 @@ def test_xss_class_accepts_executable_observation() -> None:
         "best": {"executable": False, "match_kind": "encoded", "context_kind": "html_text"},
     }
     assert not plugin.accept(Observation("page", facts={"verify": encoded}), "html_text").confirmed
+
+
+SQLI_SLICE = {
+    "kind": "SqlInjection",
+    "sinkFile": "home.php",
+    "sinkLine": 3,
+    "sinkCode": '$sql = "select * from caffaine where itemid = ".$item;',
+    "params": ["item"],
+    "sqlProbe": {"extensionConfig": {"file": "home.php", "line": "3"}},
+}
+
+SQLI_SOURCE = """<?php
+$item = isset($_POST['item']) ? $_POST['item'] : '';
+$sql = "select * from caffaine where itemid = ".$item;
+$result = $conn->query($sql);
+"""
+
+
+class ProvingSqliClient:
+    """Trigger-side tools: the probe sees the payload inside the executed SQL."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def call(self, tool: str, arguments: dict[str, Any] | None = None) -> Envelope:
+        self.calls.append(tool)
+        args = arguments or {}
+        data: dict[str, Any] = {}
+        if tool == "case_open":
+            data = {"case_id": "case-sqli-flow", "read_point": {"file": "home.php", "line": 3}}
+        elif tool == "source_read":
+            data = {
+                "file": "home.php",
+                "total_lines": len(SQLI_SOURCE.splitlines()),
+                "sha256": "x",
+                "lines": [
+                    {"n": index + 1, "text": line, "in_comment": False, "in_string": False}
+                    for index, line in enumerate(SQLI_SOURCE.splitlines())
+                ],
+            }
+        elif tool == "http_request":
+            data = {
+                "status": 200,
+                "body": '<form action="home.php" method="post"><input name="item"></form>',
+                "content_type": "text/html",
+                "final_url": "http://app/home.php",
+            }
+        elif tool == "probe_arm":
+            data = {"probe_id": "p1", "target": {"file": "home.php", "line": 3}}
+        elif tool == "probe_run":
+            body = str(args.get("body") or "")
+            payload = (body.split("=", 1)[1] if "=" in body else "").split("&", 1)[0]
+            data = {"hit": True, "queries": [{"sql": f"select * from caffaine where itemid = {payload}"}]}
+        elif tool in {"case_note", "case_report", "case_verdict", "probe_disarm"}:
+            data = {"ok": True}
+        return Envelope.success(tool=tool, profile="trigger", data=data, cost_ms=1)
+
+
+class ExplodingInjectClient:
+    """The replay step must never run for a class that does not persist a payload."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def call(self, tool: str, arguments: dict[str, Any] | None = None) -> Envelope:
+        self.calls.append(tool)
+        raise AssertionError(f"inject client must not be called for a request-only sink ({tool})")
+
+
+@pytest.mark.asyncio
+async def test_request_only_flow_ends_at_the_prover(tmp_path, _runtime) -> None:
+    store = Store(tmp_path / "tia.db")
+    read_id = store.insert_site(
+        "run-sql",
+        SQLI_SLICE,
+        family="second",
+        chain="sqlwrite-second-order",
+        role=READ,
+        identity="home.php:3:read",
+        score=80,
+        reasons=[],
+        digest={},
+    )
+    write_id = store.insert_site(
+        "run-sql",
+        WRITE_SLICE,
+        family="second",
+        chain="sqlwrite-direct",
+        role=WRITE,
+        identity="actions/write.php:27:write",
+        score=50,
+        reasons=[],
+        digest={},
+    )
+    assert read_id and write_id
+    flow = build_flows(
+        [
+            _site(SQLI_SLICE, READ, "caffaine", ("itemid",), score=80),
+            _site(WRITE_SLICE, WRITE, "caffaine", ("itemid",), score=50),
+        ]
+    )[0]
+    flow = flow.__class__(**{**flow.__dict__, "target_slice_id": read_id, "writer_slice_ids": [write_id]})
+    store.seed_flows("run-sql", [flow.to_row()])
+
+    prover = ProvingSqliClient()
+    inject = ExplodingInjectClient()
+    result = await run_flow_queue(
+        store, "http://app/home.php", "run-sql", trigger_client=prover, inject_client=inject
+    )
+
+    assert result.stop_reason == "DONE"
+    assert [outcome.verdict for outcome in result.outcomes] == ["EXECUTED"]
+    assert inject.calls == []
+    assert store.list_flow_jobs("run-sql")[0]["status"] == "reported"

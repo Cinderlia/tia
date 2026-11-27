@@ -17,19 +17,20 @@ import hashlib
 from dataclasses import dataclass, field
 from typing import Any
 
+from tia.inf.navi import CHAIN_SPECS
 from tia.sinks.registry import sink_class_for
 
 READ = "read"
 WRITE = "write"
 STATE = "state"
 
-#: Chain → site role; chain names are authoritative, slice features never are.
-_WRITE_CHAINS = {"sqlwrite-direct", "read-to-write", "sqlwrite-second-order"}
+#: Chain → site role; the chain name is authoritative, slice features never are.
 _STATE_CHAINS = {"statewrite"}
 
 
 def site_role(chain: str, family: str) -> str:
-    if chain in _WRITE_CHAINS:
+    spec = CHAIN_SPECS.get(chain)
+    if spec is not None and "write" in spec.roles:
         return WRITE
     if chain in _STATE_CHAINS:
         return STATE

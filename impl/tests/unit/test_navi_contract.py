@@ -167,3 +167,30 @@ def test_family_roles_are_derived_from_chain_names(tmp_path: Path) -> None:
     assert {item["sink"]["line"] for item in second} == {5, 9}
     assert {item["sink"]["line"] for item in write} == {3, 9}
     assert {item["sink"]["line"] for item in direct} == {2}
+
+
+def test_chain_specs_match_the_contract_table() -> None:
+    """The declared table is the contract; every chain has one explicit row."""
+    from tia.inf.navi import CHAIN_SPECS, NAVI_CHAINS, chains_for_role
+
+    assert set(CHAIN_SPECS) == set(NAVI_CHAINS)
+    assert [spec.kind for spec in CHAIN_SPECS.values()] == [
+        "Xss",
+        "Xss",
+        "SqlInjection",
+        "SqlWriteLoose",
+        "SqlRead",
+        "SqlWriteLoose",
+    ]
+    assert chains_for_role("second") == ("xss-second-order", "sqlwrite-second-order")
+    assert chains_for_role("write") == (
+        "sqlwrite-direct",
+        "read-to-write",
+        "sqlwrite-second-order",
+    )
+    assert chains_for_role("direct") == ("xss-direct", "sqlread-direct")
+
+
+def test_unknown_chain_is_a_contract_error(tmp_path: Path) -> None:
+    with pytest.raises(NaviContractError):
+        load_chain(tmp_path, "xss-third-order")

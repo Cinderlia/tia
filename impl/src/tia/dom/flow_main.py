@@ -30,6 +30,7 @@ from tia.orch.learning import hints_for
 from tia.orch.pairing import Reader, resolve_entry
 from tia.orch.slicing import score_slice
 from tia.schemas.objects import CaseOutcome
+from tia.sinks.registry import sink_class_for
 
 
 @dataclass
@@ -272,16 +273,19 @@ async def run_flow_queue(
         residue = trigger.residue or 0
         refs = list(probe.evidence_refs)
         success = trigger.verdict == "EXECUTED" and residue == 0
-        # No writer step in this flow: the prover is the whole proof, nothing to replay.
-        if not list(flow.get("writer_slice_ids") or []):
+        flow_class = sink_class_for(str(flow.get("sink_class") or ""))
+        # A class that never persists a payload needs no replay step: the prover
+        # is the whole proof, so the flow ends here regardless of writers.
+        if not flow_class.writes_database():
+            proof_notes = {"flow_class": flow_class.name}
             store.archive_flow(
                 str(flow["flow_id"]),
                 "reported" if success else "failed",
                 verdict,
                 case_id=case_id,
-                notes={"flow_class": "sqli"},
+                notes=proof_notes,
             )
-            reports.add(case_id, "sqli", verdict, str(flow["flow_id"]))
+            reports.add(case_id, flow_class.name, verdict, str(flow["flow_id"]))
             result.outcomes.append(
                 CaseOutcome(
                     slice_id=str(flow["flow_id"]),
@@ -289,7 +293,7 @@ async def run_flow_queue(
                     verdict=verdict,
                     evidence_refs=refs,
                     residue=residue,
-                    notes={"flow_class": "sqli"},
+                    notes=proof_notes,
                     duration_ms=int((time.monotonic() - started) * 1000),
                 )
             )
