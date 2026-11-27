@@ -207,6 +207,11 @@ def _parser() -> argparse.ArgumentParser:
 
     llm = sub.add_parser("llm", help="List model profiles from config/local/llm.yaml")
     llm.add_argument("--json", action="store_true")
+    llm.add_argument(
+        "--probe",
+        action="store_true",
+        help="Send one tiny request per thinking style and report which is accepted",
+    )
     return parser
 
 
@@ -719,6 +724,14 @@ def main(argv: list[str] | None = None) -> int:
 def _run_llm(args: argparse.Namespace) -> int:
     from tia.ad.llm import LlmClient
     from tia.inf.settings import active_llm_profile, config_dir, load_llm_profiles
+
+    if args.probe:
+        client = LlmClient.from_env()
+        if client is None:
+            print(json.dumps({"ok": False, "error": "no model endpoint configured"}))
+            return 1
+        print(json.dumps(asyncio.run(client.probe_thinking()), indent=2))
+        return 0
 
     profiles = load_llm_profiles()
     payload = {

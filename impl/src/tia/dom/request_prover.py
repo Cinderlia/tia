@@ -193,9 +193,12 @@ async def run_request_prover(
     form = find_form(forms, param) if param else (forms[0] if forms else None)
     if status >= 400 or form is None:
         stages.append(StageRecord("P2", False, f"status={status} forms={len(forms)}"))
+        rt.store.set_case_verdict(case_id, "READ_EMPTY", ceiling="EXECUTABLE")
         report = await kernel.report()
-        await kernel.call("case_report", {"case_id": case_id, "format": "markdown"})
-        rt.store.set_case_verdict(case_id, "READ_EMPTY", ceiling="EXECUTABLE", report=report)
+        if not report.strip():
+            await kernel.call("case_report", {"case_id": case_id, "format": "markdown"})
+            report = await kernel.report()
+        rt.store.set_case_report(case_id, report)
         write_case_report(rt.store, case_id)
         return done(
             TriggerResult(
@@ -407,11 +410,13 @@ async def run_request_prover(
     )
 
     # P6 report (no database write, so no undo) --------------------------------------
+    # Persist the verdict before rendering it, or the report header says undetermined.
+    rt.store.set_case_verdict(case_id, verdict, ceiling="EXECUTABLE")
     report = await kernel.report()
     if not report.strip():
         await kernel.call("case_report", {"case_id": case_id, "format": "markdown"})
         report = await kernel.report()
-    rt.store.set_case_verdict(case_id, verdict, ceiling="EXECUTABLE", report=report)
+    rt.store.set_case_report(case_id, report)
     write_case_report(rt.store, case_id)
     stages.append(StageRecord("P6", True, "report written"))
     return done(

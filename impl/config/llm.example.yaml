@@ -14,6 +14,9 @@ profiles:
     timeout: 120
     max_tokens: 4096
     enable_thinking: false
+    # Thinking style: the client tries reasoning_effort + enable_thinking,
+    # then reasoning_effort alone, then the plain payload.
+    reasoning_effort: low
 
   deepseek:
     base_url: https://api.deepseek.com/v1

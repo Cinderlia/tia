@@ -70,6 +70,7 @@ class LlmProfile:
     timeout: float = 60.0
     max_tokens: int = 4096
     enable_thinking: bool = False
+    reasoning_effort: str = ""
 
     def resolved_key(self) -> str:
         import os
@@ -87,6 +88,8 @@ class LlmProfile:
             "model": self.model,
             "key": "set" if self.resolved_key() else "missing",
             "key_env": self.key_env,
+            "enable_thinking": self.enable_thinking,
+            "reasoning_effort": self.reasoning_effort,
         }
 
 
@@ -105,6 +108,7 @@ def load_llm_profiles() -> dict[str, LlmProfile]:
             timeout=float(item.get("timeout") or 60.0),
             max_tokens=int(item.get("max_tokens") or 4096),
             enable_thinking=bool(item.get("enable_thinking") or False),
+            reasoning_effort=str(item.get("reasoning_effort") or ""),
         )
     return profiles
 
