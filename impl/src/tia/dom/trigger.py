@@ -27,16 +27,17 @@ from tia.cap.entry import (
     infer_entry,
 )
 from tia.cap.forms import FormField, PageForm
-from tia.cap.payloads import infer_sink_context, render, shapes_for
 from tia.cap.request_plan import plan_request
 from tia.inf.reports import write_case_report
 from tia.inf.runtime import get_runtime
 from tia.inf.settings import attempt_limit
 from tia.inf.store import now_iso
-from tia.orch.judge import judge_trigger
 from tia.orch.kernel import Kernel, LocalToolClient, StepRecord, ToolCallError, ToolClient
 from tia.orch.learning import record_case
 from tia.schemas.plan import ConstraintPlan, ConstraintWrite, PayloadPlan, Step
+from tia.schemas.verdict import TriggerVerdict
+from tia.sinks.base import Observation, trigger_verdict
+from tia.sinks.registry import sink_class_for
 
 #: Exploration budget: enough attempts for complex entry pages, still bounded.
 ENTRY_ATTEMPTS = attempt_limit("entry", 8)
@@ -183,22 +184,21 @@ def _column_value(column: str, *, payload: str, tag: str, column_type: str = "")
 
 
 def _payload_candidates(
-    payload_base: str, tag: str, context_kind: str, limit: int
+    payload_base: str,
+    tag: str,
+    context_kind: str,
+    limit: int,
+    *,
+    sink_class: Any = None,
+    site: dict[str, Any] | None = None,
 ) -> list[tuple[str, str]]:
-    """Ordered payload candidates: caller override first, then context shapes."""
-    out: list[tuple[str, str]] = []
-    seen: set[str] = set()
-    custom = f"{payload_base}{tag}" if payload_base else ""
-    if custom:
-        out.append(("custom", custom))
-        seen.add(custom)
-    for shape in shapes_for(context_kind):
-        payload = render(shape, tag)
-        if payload in seen:
-            continue
-        out.append((shape, payload))
-        seen.add(payload)
-    return out[:limit]
+    """Ordered payload candidates, seeded by the sink class for this kind."""
+    if sink_class is None:
+        sink_class = sink_class_for(str((site or {}).get("kind") or "Xss"))
+    candidates: list[tuple[str, str]] = sink_class.seed(
+        site or {}, context_kind, tag, payload_base=payload_base
+    )
+    return candidates[:limit]
 
 
 def _entry_variants(candidates: list[EntryCandidate], limit: int) -> list[EntryCandidate]:
@@ -497,9 +497,17 @@ async def run_trigger(
 
     # P4 Craft payload candidates from the sink context and write them --------
     tag = _tag()
-    context_hint = infer_sink_context(str(sink.get("code") or ""))
-    payloads = _payload_candidates(payload_base, tag, context_hint, PAYLOAD_ATTEMPTS)
-    notes.update({"tag": tag, "context_hint": context_hint})
+    sink_class = sink_class_for(str(slice_doc.get("kind") or "Xss"))
+    context_hint = sink_class.context(sink, str(sink.get("code") or ""))
+    payloads = _payload_candidates(
+        payload_base,
+        tag,
+        context_hint,
+        PAYLOAD_ATTEMPTS,
+        sink_class=sink_class,
+        site=slice_doc,
+    )
+    notes.update({"tag": tag, "context_hint": context_hint, "sink_class": sink_class.name})
     pk_columns = list(table_meta.get("primary_key") or [])
     value_columns = columns or [
         c["name"] for c in table_meta["columns"] if c["name"] not in pk_columns
@@ -931,9 +939,20 @@ async def run_trigger(
     )
 
     wrote_any = any(bool(item.get("written")) for item in payload_attempts)
-    verdict, explanation = judge_trigger(
-        verify=verify, written=change is not None or wrote_any, db_error=db_error
-    )
+    if db_error:
+        verdict, explanation = TriggerVerdict.SQL_ERROR, f"Write phase failed: {db_error}"
+    else:
+        outcome = sink_class.accept(
+            Observation(
+                channel="page",
+                payload=payload_base,
+                marker_seen=bool(verify and verify.get("found")),
+                facts={"verify": verify, "written": change is not None or wrote_any},
+            ),
+            context=context_hint,
+        )
+        verdict = TriggerVerdict(trigger_verdict(outcome))
+        explanation = outcome.reason
     if constraints:
         notes["explanation"] = (
             f"{explanation}; {len(constraints)} database condition(s) were required and "

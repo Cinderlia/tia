@@ -151,7 +151,8 @@ def preferred_payload_shape(hints: dict[str, Any] | None, context_kind: str | No
     """First learned, context-compatible shape, if any."""
     if not hints:
         return None
-    from tia.cap.payloads import shapes_for
+    from tia.sinks.registry import sink_class_for
 
-    candidates = [name for name in hints.get("preferred_shapes") or [] if name in shapes_for(context_kind)]
+    known = sink_class_for("Xss").shapes(context_kind or "html_text")
+    candidates = [name for name in hints.get("preferred_shapes") or [] if name in known]
     return candidates[0] if candidates else None

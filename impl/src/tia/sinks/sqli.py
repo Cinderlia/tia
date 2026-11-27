@@ -31,13 +31,36 @@ class SqliSinkClass:
             return "like_string"
         return "string_literal"
 
-    def seed(self, site: dict[str, Any], context: str, tag: str) -> list[str]:
-        marker = f"tia{tag}"
+    def shapes(self, context: str) -> list[str]:
         if context == "numeric":
-            return [f"1 OR 1=1 -- {marker}"]
+            return ["numeric_or"]
         if context == "order_by":
-            return [f"(SELECT 1) -- {marker}"]
-        return [f"' AND 1=1 -- {marker}", f"' OR '1'='1' -- {marker}"]
+            return ["order_by_subquery"]
+        return ["quote_and", "quote_or"]
+
+    def render(self, shape: str, tag: str) -> str:
+        marker = f"tia{tag}"
+        if shape == "numeric_or":
+            return f"1 OR 1=1 -- {marker}"
+        if shape == "order_by_subquery":
+            return f"(SELECT 1) -- {marker}"
+        if shape == "quote_or":
+            return f"' OR '1'='1' -- {marker}"
+        return f"' AND 1=1 -- {marker}"
+
+    def seed(
+        self,
+        site: dict[str, Any],
+        context: str,
+        tag: str,
+        payload_base: str = "",
+    ) -> list[tuple[str, str]]:
+        out: list[tuple[str, str]] = []
+        if payload_base:
+            out.append(("custom", f"{payload_base}{tag}"))
+        for shape in self.shapes(context):
+            out.append((shape, self.render(shape, tag)))
+        return out
 
     def accept(self, observation: Observation, context: str) -> Outcome:
         sql = observation.facts.get("sql_probe")

@@ -26,15 +26,15 @@ from tia.cap.entry import (
     resolve_values_with_guess,
 )
 from tia.cap.forms import FormField, PageForm, find_form, forms_from_document
-from tia.cap.payloads import render as render_shape
 from tia.cap.request_plan import plan_request
 from tia.dom.trigger import StageRecord
 from tia.inf.reports import write_case_report
 from tia.inf.runtime import get_runtime
 from tia.inf.settings import attempt_limit
-from tia.orch.judge import judge_inject
 from tia.orch.kernel import Kernel, LocalToolClient, ToolCallError, ToolClient
 from tia.orch.learning import preferred_payload_shape, record_case
+from tia.sinks.base import Observation, inject_verdict
+from tia.sinks.registry import sink_class_for
 
 DEFAULT_PAYLOAD = "<script>alert(1)</script>"
 
@@ -325,9 +325,10 @@ async def run_inject(
                     f"{column.get('type') or 'text'}({column.get('length') or '?'})"
                 )
     constraints = dict(payload_constraints or {})
+    sink_class = sink_class_for(str(raw_slice.get("kind") or "Xss"))
     learned_shape = preferred_payload_shape(learning, constraints.get("context_kind"))
     if learned_shape:
-        payload = render_shape(learned_shape, tag)
+        payload = sink_class.render(learned_shape, tag)
         notes["payload_shape"] = learned_shape
         stage("I3", True, f"learned payload shape {learned_shape} for this site")
     else:
@@ -1031,8 +1032,21 @@ async def run_inject(
         except ToolCallError:
             notes["execution"] = None
 
-    verdict, explanation = judge_inject(in_db, found, executable, notes.get("execution"))
-    notes["explanation"] = explanation
+    outcome = sink_class.accept(
+        Observation(
+            channel="inject",
+            marker_seen=found,
+            facts={
+                "tag_in_db": in_db,
+                "tag_in_page": found,
+                "executable": executable,
+                "execution": notes.get("execution"),
+            },
+        ),
+        context=str(constraints.get("context_kind") or ""),
+    )
+    verdict = inject_verdict(outcome)
+    notes["explanation"] = outcome.reason
 
     # ---- I7 cleanup: delete self-generated data, keep change record for rollback ----
     if cleanup and in_db:

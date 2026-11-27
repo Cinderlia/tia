@@ -38,9 +38,10 @@ from tia.dom.trigger import _POST_VAR_RE, StageRecord, TriggerResult, normalize_
 from tia.inf.reports import write_case_report
 from tia.inf.runtime import get_runtime
 from tia.inf.settings import attempt_limit
-from tia.orch.judge import judge_direct
 from tia.orch.kernel import Kernel, LocalToolClient, ToolCallError, ToolClient
 from tia.orch.learning import hints_for, record_case
+from tia.sinks.base import Observation, trigger_verdict
+from tia.sinks.registry import sink_class_for
 
 
 def _attempts() -> int:
@@ -231,7 +232,14 @@ async def run_direct(
     notes["attempts"] = attempts
     stages.append(StageRecord("D4", True, f"attempts={len(attempts)}"))
 
-    verdict, explanation = judge_direct(attempts)
+    sink_class = sink_class_for(str(raw.get("kind") or "Xss"))
+    outcome = sink_class.accept(
+        Observation(channel="attempts", marker_seen=any(a.get("found") for a in attempts),
+                    facts={"attempts": attempts}),
+        context="",
+    )
+    verdict = trigger_verdict(outcome)
+    explanation = outcome.reason
     notes["explanation"] = explanation
     stages.append(StageRecord("D5", verdict == "EXECUTED", explanation))
     best = next((item for item in attempts if item.get("executable")), None) or next(

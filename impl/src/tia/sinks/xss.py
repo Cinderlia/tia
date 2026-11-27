@@ -33,49 +33,118 @@ class XssSinkClass:
         hint = infer_sink_context(text)
         return _CONTEXT_ALIASES.get(hint, hint)
 
-    def seed(self, site: dict[str, Any], context: str, tag: str) -> list[str]:
-        payloads: list[str] = []
+    def shapes(self, context: str) -> list[str]:
+        return shapes_for(context)
+
+    def render(self, shape: str, tag: str) -> str:
+        return render(shape, tag)
+
+    def seed(
+        self,
+        site: dict[str, Any],
+        context: str,
+        tag: str,
+        payload_base: str = "",
+    ) -> list[tuple[str, str]]:
+        """Ordered ``(shape, payload)`` candidates for this sink context."""
+        out: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        custom = f"{payload_base}{tag}" if payload_base else ""
+        if custom:
+            out.append(("custom", custom))
+            seen.add(custom)
         for shape in shapes_for(context):
-            rendered = render(shape, tag)
-            if rendered and rendered not in payloads:
-                payloads.append(rendered)
-        if not payloads:
-            payloads.append(f"<script>alert(1)</script>{tag}")
-        return payloads
+            payload = render(shape, tag)
+            if payload and payload not in seen:
+                out.append((shape, payload))
+                seen.add(payload)
+        if not out:
+            out.append(("script_tag", f"<script>alert(1)</script>{tag}"))
+        return out
 
     def accept(self, observation: Observation, context: str) -> Outcome:
-        """Map a ``verify_tag`` observation (plus optional browser execution)."""
+        """Turn one observation into a class verdict.
 
+        Three channels share the verdict vocabulary:
+        ``page`` (trigger verify facts), ``attempts`` (direct deliveries) and
+        ``inject`` (the three-state write/read/execute matrix).
+        """
+        if observation.channel == "attempts":
+            return self._accept_attempts(observation)
+        if observation.channel == "inject":
+            return self._accept_inject(observation)
+        return self._accept_verify(observation)
+
+    @staticmethod
+    def _execution_state(execution: Any) -> bool | None:
+        if not isinstance(execution, dict) or execution.get("error"):
+            return None
+        executed = execution.get("executed")
+        return bool(executed) if isinstance(executed, bool) else None
+
+    def _accept_verify(self, observation: Observation) -> Outcome:
         verify = observation.facts.get("verify")
+        evidence = [str(item) for item in (verify.get("evidence_refs") or [])] if isinstance(verify, dict) else []
+        if observation.facts.get("written") is False:
+            return Outcome(False, "NOT_EXECUTED", "Payload not written to target table; flow did not reach the read point", 20, evidence)
         if not isinstance(verify, dict):
-            return Outcome(confirmed=False, level="NO_OBSERVATION", reason="no verify result")
-        evidence = [str(item) for item in (verify.get("evidence_refs") or [])]
+            return Outcome(False, "NOT_EXECUTED", "No verify_tag result", 20)
+        if not verify.get("found"):
+            return Outcome(False, "READ_NOT_REFLECTED", "Tag written but not found in page; read path did not reflect it", 30, evidence)
         raw_best = verify.get("best")
         best: dict[str, Any] = raw_best if isinstance(raw_best, dict) else {}
-        executable = bool(best.get("executable"))
         reason = str(best.get("executable_reason") or "")
-        found = bool(verify.get("found"))
-        execution = observation.facts.get("execution")
-        executed: bool | None = None
-        if isinstance(execution, dict) and not execution.get("error"):
-            executed = bool(execution.get("executed"))
-        if executable and executed is False:
-            return Outcome(False, "INERT", "did not execute in the browser", 20, evidence)
+        state = self._execution_state(verify.get("execution"))
+        if best.get("executable"):
+            if state is False:
+                return Outcome(False, "REFLECTED_INERT", "Static hit, but the payload did not execute when the page was loaded in Chrome", 40, evidence)
+            suffix = " (browser-confirmed)" if state else ""
+            return Outcome(True, "EXECUTABLE", f"Hit {best.get('context_kind')}, executable ({reason}){suffix}", 90 if state else 70, evidence)
+        if reason == "ENCODED_ONLY":
+            return Outcome(False, "ENCODED", "Hit is encoded and cannot be restored to an executable marker", 40, evidence)
+        if reason in {"CSP_BLOCKED", "SANDBOXED"}:
+            return Outcome(False, "BLOCKED_CSP", f"Context reachable but blocked: {reason}", 50, evidence)
+        if reason in {"NO_CARRIER", "NEEDS_RUNTIME", "INERT_PAYLOAD", "NEEDS_EXECUTABLE_PAYLOAD"}:
+            return Outcome(False, "REFLECTED_INERT", f"Hit but context not executable: {reason}", 40, evidence)
+        return Outcome(False, "REFLECTED_INERT", f"Hit but not judged executable: {reason}", 40, evidence)
+
+    def _accept_attempts(self, observation: Observation) -> Outcome:
+        attempts = observation.facts.get("attempts")
+        if not isinstance(attempts, list) or not attempts:
+            return Outcome(False, "NOT_EXECUTED", "No delivery attempt was made", 10)
+        executable = [item for item in attempts if isinstance(item, dict) and item.get("executable")]
         if executable:
-            confirmed = executed is not False
-            return Outcome(
-                confirmed=confirmed,
-                level="EXECUTABLE" if confirmed else "UNCONFIRMED",
-                reason=reason or "executable context",
-                confidence=90 if executed else 70,
-                evidence_refs=evidence,
-                notes={"context_kind": best.get("context_kind")},
-            )
-        if not found:
-            return Outcome(False, "NOT_REFLECTED", "payload did not appear", 30, evidence)
-        if str(best.get("match_kind") or "") == "encoded":
-            return Outcome(False, "ENCODED", "payload was encoded", 40, evidence)
-        return Outcome(False, "INERT", reason or "no executable context", 30, evidence)
+            best = executable[0]
+            state = self._execution_state(best.get("execution"))
+            if state is False:
+                return Outcome(False, "REFLECTED_INERT", "Static hit, but the payload did not execute when the page was loaded in Chrome", 40)
+            suffix = " (browser-confirmed)" if state else ""
+            return Outcome(True, "EXECUTABLE", f"Hit {best.get('context_kind')}, executable ({best.get('reason')}){suffix}", 90 if state else 70)
+        reflected = [item for item in attempts if isinstance(item, dict) and item.get("found")]
+        if not reflected:
+            return Outcome(False, "READ_NOT_REFLECTED", "Payload never appeared in the response", 30)
+        reasons = {str(item.get("reason")) for item in reflected}
+        if "ENCODED_ONLY" in reasons:
+            return Outcome(False, "ENCODED", "Hit is encoded and cannot be restored", 40)
+        blocked = sorted(reasons & {"CSP_BLOCKED", "SANDBOXED"})
+        if blocked:
+            return Outcome(False, "BLOCKED_CSP", f"Context reachable but blocked: {blocked[0]}", 50)
+        return Outcome(False, "REFLECTED_INERT", "Payload reflected but no shape was executable", 40)
+
+    def _accept_inject(self, observation: Observation) -> Outcome:
+        facts = observation.facts
+        tag_in_db = bool(facts.get("tag_in_db"))
+        tag_in_page = bool(facts.get("tag_in_page"))
+        executable = bool(facts.get("executable"))
+        if not tag_in_db and not tag_in_page:
+            return Outcome(False, "WRITE_NOT_REACHED", "Tag not in DB or page: write path not reached", 20)
+        if tag_in_db and not tag_in_page:
+            return Outcome(False, "WRITTEN_NOT_VISIBLE", "Write succeeded but not readable on page: read selector or session issue", 40)
+        if tag_in_db and tag_in_page and not executable:
+            return Outcome(False, "NOT_EXECUTABLE", "Written and reflected, but context not executable", 50)
+        if self._execution_state(facts.get("execution")) is False:
+            return Outcome(False, "NOT_EXECUTABLE", "Static hit, but the payload did not execute in Chrome", 50)
+        return Outcome(True, "EXECUTABLE", "In DB, in page, and context executable", 90)
 
     def diagnose(self, observation: Observation, outcome: Outcome) -> list[str]:
         hints: list[str] = []
