@@ -28,6 +28,9 @@ class XssSinkClass:
     def writes_database(self) -> bool:
         return True
 
+    def observation_channel(self) -> str:
+        return "page"
+
     def channels(self) -> frozenset[str]:
         return frozenset({"page", "browser"})
 

@@ -21,6 +21,9 @@ class SqliSinkClass:
     def writes_database(self) -> bool:
         return False
 
+    def observation_channel(self) -> str:
+        return "sql_probe"
+
     def channels(self) -> frozenset[str]:
         return frozenset({"sql_probe", "page", "timing"})
 

@@ -17,7 +17,15 @@ _BY_KIND: dict[str, SinkClass] = {
 }
 
 
+_BY_NAME: dict[str, SinkClass] = {plugin.name: plugin for plugin in _BY_KIND.values()}
+
+
 def sink_class_for(kind: str) -> SinkClass:
-    """Look up the plugin; unknown kinds default to the XSS rules (the sink text
-    still has to render somewhere), never to a silent pass."""
-    return _BY_KIND.get(str(kind), _XSS)
+    """Look up the plugin by slice kind or by class name.
+
+    Flows carry the class name (``sqli``) while slices carry the NAVI kind
+    (``SqlInjection``); both resolve here. Unknown kinds default to the XSS
+    rules (the sink text still has to render somewhere), never to a silent pass.
+    """
+    key = str(kind)
+    return _BY_KIND.get(key) or _BY_NAME.get(key) or _XSS

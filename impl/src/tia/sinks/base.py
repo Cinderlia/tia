@@ -52,6 +52,10 @@ class SinkClass(Protocol):
         """True when reaching the sink requires a value stored in the database."""
         ...
 
+    def observation_channel(self) -> str:
+        """The channel that decides whether the sink was reached."""
+        ...
+
     def context(self, site: dict[str, Any], code: str) -> str: ...
 
     def shapes(self, context: str) -> list[str]: ...
@@ -90,6 +94,9 @@ _INJECT_LEVELS = {
     "WRITTEN_NOT_VISIBLE": "WRITTEN_NOT_VISIBLE",
     "NOT_EXECUTABLE": "NOT_EXECUTABLE",
     "EXECUTABLE": "EXECUTABLE",
+    "SQLI_CONFIRMED": "EXECUTABLE",
+    "NOT_CONFIRMED": "NOT_EXECUTABLE",
+    "NO_DB_OBSERVATION": "NOT_EXECUTABLE",
 }
 
 

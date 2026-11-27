@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs
 
 import pytest
 
@@ -298,3 +299,52 @@ async def test_inject_reports_unsatisfied_constraint(runtime: Any) -> None:
 
     assert result.verdict == "CONSTRAINT_UNSATISFIED"
     assert result.notes["constraint_steps"][0]["constraint_id"] == "dc-1"
+
+
+class SqlReadClient(FakeInjectClient):
+    """The read page is a SQL sink: only the probe may judge it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.read_probes = 0
+        self.verify_calls: list[dict[str, Any]] = []
+
+    def _data(self, tool: str, args: dict[str, Any]) -> dict[str, Any]:
+        if tool == "verify_tag":
+            self.verify_calls.append(args)
+            return {"found": False, "occurrence_count": 0, "best": {"executable": False}}
+        if tool == "probe_run" and "list.php" in str(args.get("url") or ""):
+            values = {
+                key: item[0] for key, item in parse_qs(str(args.get("body") or "")).items()
+            }
+            needle = "".join(values.values())
+            self.read_probes += 1
+            return {
+                "hit": True,
+                "queries": [
+                    {
+                        "sql": f"SELECT * FROM comments WHERE comment LIKE '%{needle}%'",
+                        "rows": [{"comment": needle}],
+                    }
+                ],
+                "http": {"status": 200},
+            }
+        return super()._data(tool, args)
+
+
+async def test_inject_sql_read_channel_uses_probe(runtime: Any) -> None:
+    client = SqlReadClient()
+    result = await run_inject(
+        {**_slice(), "kind": "SqlInjection"},
+        base_url="http://127.0.0.1/xvwa/",
+        client=client,
+        read_target={"file": "list.php", "line": 12},
+        verify_url="http://127.0.0.1/xvwa/list.php",
+        verify_entry={"method": "POST", "fields": [{"name": "item", "type": "text"}]},
+        verify_values={"item": "abcd"},
+        flow={"sink_class": "sqli", "flow_id": "flow-sql"},
+    )
+    assert result.verdict == "EXECUTABLE"
+    assert result.notes["verify_on"] == "sql_probe"
+    assert client.read_probes >= 1
+    assert not [call for call in client.verify_calls if "list.php" in str(call.get("url") or "")]

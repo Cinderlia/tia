@@ -366,6 +366,62 @@ async def _node_windows(
 
 
 
+
+
+async def _sql_probe_verify(
+    kernel: Kernel,
+    case_id: str,
+    file: str,
+    line: int,
+    url: str,
+    method: str,
+    values: dict[str, str],
+    tag: str,
+    sink_class: Any,
+    context: str,
+) -> dict[str, Any]:
+    """Read a stored value back and let the SQL probe judge the read page."""
+    with contextlib.suppress(ToolCallError):
+        await kernel.call(
+            "probe_arm",
+            {"case_id": case_id, "file": file, "line": line, "output": f"trigger-read-{tag}.json"},
+        )
+    arguments: dict[str, Any] = {"case_id": case_id, "url": url, "method": method.upper()}
+    if method.upper() == "POST":
+        arguments["body"] = urlencode(values)
+        arguments["headers"] = {"Content-Type": "application/x-www-form-urlencoded"}
+    else:
+        arguments["params"] = values
+    try:
+        run = await kernel.call("probe_run", arguments)
+    finally:
+        with contextlib.suppress(ToolCallError):
+            await kernel.call("probe_disarm", {"case_id": case_id})
+    queries = run.get("queries") or []
+    statements = [str(item.get("sql") or "") for item in queries if isinstance(item, dict)]
+    marker = any(tag in statement for statement in statements)
+    facts = {
+        "executed": bool(queries),
+        "error": str(run.get("error") or ""),
+        "statements": statements[:3],
+    }
+    outcome = sink_class.accept(
+        Observation(
+            channel="sql_probe",
+            request={"url": url, "method": method, "values": values},
+            payload=tag,
+            marker_seen=marker,
+            facts={"sql_probe": facts},
+        ),
+        context,
+    )
+    return {
+        "found": marker,
+        "best": {"executable": outcome.confirmed, "context_kind": "sql_probe"},
+        "sql_probe": facts,
+        "sql_probe_level": outcome.level,
+    }
+
 async def run_trigger(
     raw_slice: dict[str, Any],
     *,
@@ -379,7 +435,8 @@ async def run_trigger(
     rt = get_runtime()
     slice_doc = normalize_slice(raw_slice)
     sink_class = sink_class_for(str(slice_doc.get("kind") or ""))
-    if not sink_class.writes_database():
+    has_writers = bool(list((flow or {}).get("writer_slice_ids") or []))
+    if not sink_class.writes_database() and not has_writers:
         from tia.dom.request_prover import run_request_prover
 
         return await run_request_prover(
@@ -512,6 +569,7 @@ async def run_trigger(
     tag = _tag()
     sink_class = sink_class_for(str(slice_doc.get("kind") or "Xss"))
     context_hint = sink_class.context(sink, str(sink.get("code") or ""))
+    channel = sink_class.observation_channel()
     payloads = _payload_candidates(
         payload_base,
         tag,
@@ -687,30 +745,51 @@ async def run_trigger(
                 "found": False,
             }
             try:
-                if candidate.method == "GET":
-                    fetched = await kernel.call(
-                        "http_request",
-                        {"method": "GET", "url": base_url, "params": candidate.values},
+                if channel == "sql_probe":
+                    if read_line is None:
+                        attempt["error"] = "no read line to watch"
+                        verify_attempts.append(attempt)
+                        continue
+                    attempt_verify = await _sql_probe_verify(
+                        kernel,
+                        case_id,
+                        sink_file,
+                        read_line,
+                        base_url,
+                        candidate.method,
+                        dict(candidate.values),
+                        tag,
+                        sink_class,
+                        context_hint,
                     )
+                    attempt["status"] = 200
                 else:
-                    fetched = await kernel.call(
-                        "http_request",
-                        {
-                            "method": "POST",
-                            "url": base_url,
-                            "body": urlencode(candidate.values),
-                            "headers": {"Content-Type": "application/x-www-form-urlencoded"},
-                        },
-                    )
-                attempt["status"] = fetched.get("status")
-                body = str(fetched.get("body") or "")
-                verify_args: dict[str, Any] = {"tag": tag, "payload": payload}
-                if body:
-                    verify_args["html"] = body
-                    verify_args["content_type"] = str(fetched.get("content_type") or "text/html")
-                else:
-                    verify_args["url"] = base_url
-                attempt_verify = await kernel.call("verify_tag", verify_args)
+                    if candidate.method == "GET":
+                        fetched = await kernel.call(
+                            "http_request",
+                            {"method": "GET", "url": base_url, "params": candidate.values},
+                        )
+                    else:
+                        fetched = await kernel.call(
+                            "http_request",
+                            {
+                                "method": "POST",
+                                "url": base_url,
+                                "body": urlencode(candidate.values),
+                                "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+                            },
+                        )
+                    attempt["status"] = fetched.get("status")
+                    body = str(fetched.get("body") or "")
+                    verify_args: dict[str, Any] = {"tag": tag, "payload": payload}
+                    if body:
+                        verify_args["html"] = body
+                        verify_args["content_type"] = str(
+                            fetched.get("content_type") or "text/html"
+                        )
+                    else:
+                        verify_args["url"] = base_url
+                    attempt_verify = await kernel.call("verify_tag", verify_args)
             except ToolCallError as exc:
                 attempt["error"] = f"{exc.code.value}: {exc.message}"
                 verify_attempts.append(attempt)
@@ -906,13 +985,14 @@ async def run_trigger(
             "node_path": best.get("node_path"),
         }
         final_payload = str((chosen or {}).get("payload") or "")
-        notes["payload_constraints"] = derive_payload_constraints(
-            verify,
-            column=payload_column,
-            column_length=column_length.get(payload_column),
-            payload=final_payload,
-        )
-        if bool(best.get("executable")) and chosen is not None:
+        if channel != "sql_probe":
+            notes["payload_constraints"] = derive_payload_constraints(
+                verify,
+                column=payload_column,
+                column_length=column_length.get(payload_column),
+                payload=final_payload,
+            )
+        if channel != "sql_probe" and bool(best.get("executable")) and chosen is not None:
             try:
                 confirmed = await kernel.call(
                     "verify_tag",
@@ -932,7 +1012,7 @@ async def run_trigger(
                 verify["execution"] = confirmed.get("execution")
             except ToolCallError:
                 notes["execution"] = None
-    elif db_error is None:
+    elif channel != "sql_probe" and db_error is None:
         try:
             verify = await kernel.call(
                 "verify_tag", {"tag": tag, "payload": payloads[0][1], "url": base_url}
@@ -955,15 +1035,26 @@ async def run_trigger(
     if db_error:
         verdict, explanation = TriggerVerdict.SQL_ERROR, f"Write phase failed: {db_error}"
     else:
-        outcome = sink_class.accept(
-            Observation(
-                channel="page",
-                payload=payload_base,
-                marker_seen=bool(verify and verify.get("found")),
-                facts={"verify": verify, "written": change is not None or wrote_any},
-            ),
-            context=context_hint,
-        )
+        if channel == "sql_probe":
+            outcome = sink_class.accept(
+                Observation(
+                    channel="sql_probe",
+                    payload=final_payload if verify is not None else payload_base,
+                    marker_seen=bool(verify and verify.get("found")),
+                    facts={"sql_probe": (verify or {}).get("sql_probe") or {}},
+                ),
+                context_hint,
+            )
+        else:
+            outcome = sink_class.accept(
+                Observation(
+                    channel="page",
+                    payload=payload_base,
+                    marker_seen=bool(verify and verify.get("found")),
+                    facts={"verify": verify, "written": change is not None or wrote_any},
+                ),
+                context_hint,
+            )
         verdict = TriggerVerdict(trigger_verdict(outcome))
         explanation = outcome.reason
     if constraints:

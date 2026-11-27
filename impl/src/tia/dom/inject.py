@@ -700,14 +700,121 @@ async def run_inject(
     notes["tag_in_db"] = in_db
     stage("I6", in_db, f"tag_in_db={in_db}")
 
+    # The read-side sink class decides the acceptance channel.  A SQL injection
+    # read page proves itself through the database probe, not through markup.
+    flow_class = str((flow or {}).get("sink_class") or "")
+    read_class = sink_class_for(flow_class or str(raw_slice.get("kind") or "Xss"))
+    read_channel = read_class.observation_channel()
+    sql_outcome = None
+    verify: dict[str, Any] | None = None
+    if read_channel == "sql_probe" and verify_url:
+        sql_entry = verify_entry or {}
+        sql_method = str(sql_entry.get("method") or "POST").upper()
+        sql_fields = [
+            str(item.get("name"))
+            for item in sql_entry.get("fields") or []
+            if isinstance(item, dict) and item.get("name")
+        ]
+        seeds: list[dict[str, str]] = []
+        if verify_values:
+            seed: dict[str, str] = {}
+            for name, value in verify_values.items():
+                token = str(value or "")
+                seed[str(name)] = tag if (len(token) == 4 and token.isalnum()) else token
+            if seed:
+                seeds.append(seed)
+        for name in sql_fields:
+            single = {name: tag}
+            if single not in seeds:
+                seeds.append(single)
+        if sql_fields:
+            combined = {name: tag for name in sql_fields}
+            if combined not in seeds:
+                seeds.append(combined)
+        sql_attempts: list[dict[str, Any]] = []
+        read_armed = False
+        if read_file and read_line:
+            with contextlib.suppress(ToolCallError):
+                await call(
+                    "probe_arm",
+                    {
+                        "case_id": result.case_id,
+                        "targets": [{"file": read_file, "line": read_line}],
+                        "output": f"inject-sqlread-{tag}.json",
+                    },
+                )
+                read_armed = True
+        try:
+            for values in seeds[:VERIFY_ATTEMPTS]:
+                arguments: dict[str, Any] = {
+                    "case_id": result.case_id,
+                    "url": verify_url,
+                    "method": sql_method,
+                }
+                if sql_method == "POST":
+                    arguments["body"] = urlencode(values)
+                    arguments["headers"] = {"Content-Type": "application/x-www-form-urlencoded"}
+                else:
+                    arguments["params"] = values
+                try:
+                    run = await call("probe_run", arguments)
+                except ToolCallError as exc:
+                    sql_attempts.append({"values": values, "error": exc.code.value})
+                    continue
+                queries = run.get("queries") or []
+                statements = [
+                    str(item.get("sql") or "") for item in queries if isinstance(item, dict)
+                ]
+                marker_seen = any(tag in statement for statement in statements)
+                sql_observation = Observation(
+                    channel="sql_probe",
+                    request={"url": verify_url, "method": sql_method, "values": values},
+                    payload=tag,
+                    marker_seen=marker_seen,
+                    facts={
+                        "sql_probe": {
+                            "executed": bool(queries),
+                            "error": str(run.get("error") or ""),
+                            "statements": statements[:3],
+                        }
+                    },
+                )
+                outcome = read_class.accept(sql_observation, "sql_probe")
+                sql_outcome = outcome
+                sql_attempts.append(
+                    {
+                        "values": values,
+                        "marker_seen": marker_seen,
+                        "executed": bool(queries),
+                        "level": outcome.level,
+                        "statements": statements[:2],
+                    }
+                )
+                if outcome.confirmed:
+                    break
+        finally:
+            if read_armed:
+                with contextlib.suppress(ToolCallError):
+                    await call("probe_disarm", {"case_id": result.case_id})
+        notes["verify_attempts"] = sql_attempts
+        notes["verify_on"] = "sql_probe"
+        if sql_outcome is not None:
+            notes["sql_probe_verdict"] = sql_outcome.level
+        sql_confirmed = bool(sql_outcome is not None and sql_outcome.confirmed)
+        verify = {
+            "found": sql_confirmed,
+            "best": {"executable": sql_confirmed, "context_kind": "sql_probe"},
+            "channel": "sql_probe",
+        }
+        stage("I6", sql_confirmed, f"sql_probe attempts={len(sql_attempts)}")
+
     # Second-order XSS: the write entry and the read page differ. Fetch the read
     # page with its own entry parameters before classifying the tag context.
     verify_content_type = "text/html"
-    verify: dict[str, Any] | None = None
     submitted_http = submitted.get("http") or {}
     same_page_html = str(submitted_http.get("html") or "")
     same_page_is_sink = not verify_url or verify_url == form.action
-    if same_page_is_sink and same_page_html and tag in same_page_html:
+    if read_channel != "sql_probe" and same_page_is_sink and same_page_html and tag in same_page_html:
         # The write page already rendered the tag: one arm, one request covered both
         # the write target and the read target.
         verify = await call(
@@ -722,7 +829,7 @@ async def run_inject(
         notes["verify_on"] = "probe_page"
         notes["verify_attempts"] = [{"values": dict(delivery.plan.values) if delivery.plan else {}, "source": "probe_page",
                                      "found": bool(verify.get("found"))}]
-    elif verify_url and verify_url != form.action and verify_entry:
+    elif read_channel != "sql_probe" and verify_url and verify_url != form.action and verify_entry:
         entry_method = str(verify_entry.get("method") or "POST").upper()
         entry_spec = [entry_field(item) for item in verify_entry.get("fields") or []]
         read_forms: list[PageForm] = []
@@ -990,7 +1097,7 @@ async def run_inject(
         if verify is None:
             verify = await call("verify_tag", {"tag": tag, "payload": payload, "url": verify_url or form.action})
         notes["verify_on"] = "read_page"
-    else:
+    elif read_channel != "sql_probe":
         try:
             verify = await call("verify_tag", {"tag": tag, "payload": payload, "url": form.action})
             notes["verify_on"] = "url"
@@ -1003,7 +1110,7 @@ async def run_inject(
     notes.update({"tag_in_page": found, "executable": executable, "context_kind": best.get("context_kind")})
     stage("I6", found, f"tag_in_page={found} executable={executable} kind={best.get('context_kind')}")
 
-    if executable and verify is not None:
+    if executable and verify is not None and read_channel != "sql_probe":
         try:
             if notes.get("verify_on") == "probe_page":
                 page_values = dict(delivery.plan.values) if delivery.plan else {}
@@ -1032,19 +1139,22 @@ async def run_inject(
         except ToolCallError:
             notes["execution"] = None
 
-    outcome = sink_class.accept(
-        Observation(
-            channel="inject",
-            marker_seen=found,
-            facts={
-                "tag_in_db": in_db,
-                "tag_in_page": found,
-                "executable": executable,
-                "execution": notes.get("execution"),
-            },
-        ),
-        context=str(constraints.get("context_kind") or ""),
-    )
+    if sql_outcome is not None:
+        outcome = sql_outcome
+    else:
+        outcome = sink_class.accept(
+            Observation(
+                channel="inject",
+                marker_seen=found,
+                facts={
+                    "tag_in_db": in_db,
+                    "tag_in_page": found,
+                    "executable": executable,
+                    "execution": notes.get("execution"),
+                },
+            ),
+            context=str(constraints.get("context_kind") or ""),
+        )
     verdict = inject_verdict(outcome)
     notes["explanation"] = outcome.reason
 
