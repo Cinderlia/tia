@@ -29,6 +29,16 @@ def configure(settings: Settings) -> Runtime:
     return _runtime
 
 
+def peek_settings() -> Settings | None:
+    """Settings if an entry point configured the runtime, else None.
+
+    Report code uses this to name the target directory without triggering the
+    lazy ``get_runtime`` configuration (which loads config files and sessions).
+    """
+
+    return _runtime.settings if _runtime is not None else None
+
+
 def get_runtime() -> Runtime:
     global _runtime
     if _runtime is None:

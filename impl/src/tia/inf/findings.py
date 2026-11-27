@@ -92,8 +92,12 @@ def _storage(notes: dict[str, Any]) -> str:
 
 def _sql(notes: dict[str, Any]) -> str:
     probe = notes.get("probe")
-    if isinstance(probe, dict) and probe.get("sql"):
-        return str(probe["sql"])
+    if isinstance(probe, dict):
+        statements = [str(item) for item in probe.get("statements") or [] if item]
+        if len(statements) > 1:
+            return ";\n".join(statements)
+        if probe.get("sql"):
+            return str(probe["sql"])
     insert = notes.get("insert_sql")
     if insert:
         return str(insert)
@@ -102,10 +106,58 @@ def _sql(notes: dict[str, Any]) -> str:
 
 def _read_request(notes: dict[str, Any]) -> str:
     target = notes.get("read_target")
-    url = str(notes.get("read_url") or notes.get("base_url") or "")
+    url = str(notes.get("read_url") or "")
+    if not url:
+        execution = notes.get("execution")
+        if isinstance(execution, dict):
+            url = str(execution.get("final_url") or "")
+    url = url or str(notes.get("base_url") or "")
     if isinstance(target, dict) and target.get("file"):
         return f"GET {url} (reads `{target['file']}:{target.get('line') or '?'}`)"
     return f"GET {url}" if url else "(not recorded)"
+
+
+def _constraints(notes: dict[str, Any]) -> list[dict[str, Any]]:
+    """Branch conditions that must hold for the read path to return the row."""
+
+    steps = notes.get("constraint_steps")
+    if isinstance(steps, list):
+        found = [item for item in steps if isinstance(item, dict)]
+        if found:
+            return found
+    legacy = notes.get("constraints")
+    if isinstance(legacy, list):
+        return [item for item in legacy if isinstance(item, dict)]
+    return []
+
+
+def _replay_url(item: dict[str, Any]) -> str:
+    replay = item.get("replay")
+    if isinstance(replay, dict):
+        return str(replay.get("url") or (replay.get("urls") or [""])[0] or "")
+    return str(item.get("replay_url") or "")
+
+
+def _replay_params(item: dict[str, Any]) -> dict[str, Any]:
+    replay = item.get("replay")
+    if not isinstance(replay, dict):
+        return {}
+    attempts = replay.get("attempts")
+    if isinstance(attempts, list):
+        for attempt in reversed(attempts):
+            if isinstance(attempt, dict) and attempt.get("params"):
+                return dict(attempt["params"])
+    return {}
+
+
+def _params_hint(params: dict[str, Any]) -> str:
+    shown: list[str] = []
+    for name, value in params.items():
+        if name.lower() == "formid":
+            shown.append("`formid=(your session token)`")
+        else:
+            shown.append(f"`{name}={value}`")
+    return ", ".join(shown)
 
 
 def _payload(notes: dict[str, Any]) -> str:
@@ -140,40 +192,82 @@ def _entry_pairs(entry: dict[str, Any], field: str, payload: str) -> list[tuple[
 
 
 def _constraint_section(notes: dict[str, Any], kind: str) -> list[str]:
-    """Replay prerequisites trigger discovered as database-only branch conditions."""
-    if kind != "second_order":
+    """Extra SQL requirements (branch conditions) and how the run satisfied them."""
+    if kind not in {"second_order", "second_order_db_only"}:
         return []
-    constraints = [item for item in notes.get("constraints") or [] if isinstance(item, dict)]
+    constraints = _constraints(notes)
     if not constraints:
         return []
-    lines = ["", "## Prerequisites (database constraints)", ""]
+    lines = [
+        "",
+        "## Additional SQL requirements",
+        "",
+        "The payload alone is not enough: the read path only returns the row when these "
+        "database conditions hold. They are part of the reachability, not of the payload.",
+        "",
+    ]
     for index, item in enumerate(constraints, 1):
         table = item.get("table") or "?"
         column = item.get("column") or "?"
         value = item.get("value")
-        predicate = item.get("predicate") or "the application branch reads this condition"
-        lines.append(
-            f"{index}. `{table}`.`{column}` must equal `{value}` — {predicate}"
-        )
-    lines += ["", "## Reproduction order", ""]
-    step = 1
-    entry = notes.get("entry") if isinstance(notes.get("entry"), dict) else {}
-    field = (entry or {}).get("field") or "the payload field"
-    url = (entry or {}).get("url") or "the injection page"
-    lines.append(f"{step}. Open `{url}` and submit the payload in `{field}`.")
-    for item in constraints:
-        step += 1
-        table = item.get("table") or "?"
-        column = item.get("column") or "?"
-        value = item.get("value")
-        replay = item.get("replay") or "app_request"
-        lines.append(
-            f"{step}. Rewrite `{table}`.`{column}` to `{value}` through the application "
-            f"(replay: {replay})."
-        )
-    step += 1
-    lines.append(f"{step}. Open the read page; the payload is rendered there.")
+        predicate = str(item.get("predicate") or "").strip().splitlines()[0][:160]
+        line = f"{index}. `{table}`.`{column}` must equal `{value}`"
+        if predicate:
+            line += f" — `{predicate}`"
+        lines.append(line)
+
+    satisfied = [
+        item
+        for item in constraints
+        if isinstance(item.get("replay"), dict) and item["replay"].get("confirmed")
+    ]
+    if satisfied:
+        lines += [
+            "",
+            "### How this run satisfied them (through the application, not direct SQL)",
+            "",
+        ]
+        for item in satisfied:
+            table = item.get("table") or "?"
+            column = item.get("column") or "?"
+            url = _replay_url(item)
+            params = _params_hint(_replay_params(item))
+            account = str(item.get("account") or item.get("replay_account") or "")
+            replay = item["replay"] if isinstance(item.get("replay"), dict) else {}
+            queries = 0
+            for attempt in replay.get("attempts") or []:
+                if isinstance(attempt, dict):
+                    queries += int(attempt.get("queries") or 0)
+            bits = [f"`{table}`.`{column}` = `{item.get('value')}`"]
+            if url:
+                bits.append(f"request `GET {url}`" + (f" with {params}" if params else ""))
+            if account:
+                bits.append(f"account `{account}`")
+            if queries:
+                bits.append(f"probe matched {queries} executed statement(s)")
+            if replay.get("observed") is not None:
+                bits.append(f"database confirmed the column equals `{item.get('value')}`")
+            lines.append("- " + "; ".join(bits) + ".")
+    else:
+        lines += [
+            "",
+            "During this run the condition was not replayed through the application; "
+            "see the case report for the exact SQL.",
+        ]
     return lines
+
+
+def _browser_params(params: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for name, value in params.items():
+        low = str(name).lower()
+        if low == "formid":
+            parts.append("formid=<session token>")
+        elif low in {"tid", "id"}:
+            parts.append(f"{name}=<id of the row you created>")
+        else:
+            parts.append(f"{name}={value}")
+    return "&".join(parts)
 
 
 def _verify_section(notes: dict[str, Any], kind: str) -> list[str]:
@@ -197,6 +291,13 @@ def _verify_section(notes: dict[str, Any], kind: str) -> list[str]:
         return lines + ["- No URL recorded for this finding."]
     step = 1
     pairs = _entry_pairs(entry, field, payload) if payload else []
+    raw_fields = entry.get("fields")
+    recorded: dict[str, Any] = dict(raw_fields) if isinstance(raw_fields, dict) else {}
+    plan = notes.get("request_plan")
+    if isinstance(plan, dict):
+        for name, value in (plan.get("model") or {}).items():
+            if recorded.get(name) in (None, ""):
+                recorded[name] = value
     if method == "get" and pairs:
         query = "&".join(f"{quote(name)}={quote(value, safe='')}" for name, value in pairs)
         target = f"{url}{'&' if '?' in url else '?'}{query}"
@@ -214,11 +315,31 @@ def _verify_section(notes: dict[str, Any], kind: str) -> list[str]:
             "| --- | --- |",
         ]
         step += 2
-        for name, value in pairs or [(field, payload)]:
-            shown = "(empty)" if value == "" else f"`{value}`"
+        for name, _value in pairs or [(field, payload)]:
+            if name == field:
+                shown = f"`{payload}`" if payload else "(empty)"
+            elif name.lower() == "formid":
+                shown = "(the token your session received on this page)"
+            elif name in recorded and recorded[name] not in ("", None):
+                shown = f"`{recorded[name]}`"
+            else:
+                shown = "(empty)"
             lines.append(f"| `{name}` | {shown} |")
         lines.append("")
     if kind == "second_order":
+        for item in _constraints(notes):
+            replay_url = _replay_url(item)
+            if not replay_url:
+                continue
+            params = _browser_params(_replay_params(item))
+            target = f"{replay_url}{'&' if '?' in replay_url else '?'}{params}" if params else replay_url
+            account = str(item.get("account") or "")
+            who = f"As `{account}`, " if account else ""
+            lines.append(
+                f"{step}. {who}open the approval/action request that satisfies "
+                f"`{item.get('table')}`.`{item.get('column')}` = `{item.get('value')}`: {target}"
+            )
+            step += 1
         lines.append(f"{step}. Open the read page: {_read_request(notes)}")
         step += 1
     lines.append(f"{step}. The value is rendered at the sink above.")

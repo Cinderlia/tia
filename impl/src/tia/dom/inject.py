@@ -787,6 +787,11 @@ async def _run_inject(
             "targets": submitted.get("targets"),
             "by_target": submitted.get("by_target"),
             "sql": query.get("sql"),
+            "statements": [
+                str(item.get("sql") or "")
+                for item in (submitted.get("queries") or [])
+                if item.get("sql")
+            ],
             "bindings": query.get("bindings"),
             "affected_rows": query.get("affected_rows"),
             "last_insert_id": query.get("last_insert_id"),
@@ -816,6 +821,7 @@ async def _run_inject(
                 "column": constraint.get("column"),
                 "value": constraint.get("value"),
                 "predicate": constraint.get("predicate"),
+                "account": constraint.get("account"),
                 "replay": replayed,
             }
             constraint_steps.append(step_info)

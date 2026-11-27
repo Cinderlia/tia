@@ -11,21 +11,46 @@ import os
 from pathlib import Path
 from typing import Any
 
+from tia.inf.runtime import peek_settings
+
 REPORTS_ENV = "TIA_REPORTS"
-
-
-def reports_root(store: Any) -> Path:
-    """Where report files live (``TIA_REPORTS`` or ``<store dir>/reports``)."""
-
-    override = os.environ.get(REPORTS_ENV, "").strip()
-    if override:
-        return Path(override)
-    return Path(store.path).parent / "reports"
+TARGET_ENV = "TIA_REPORTS_TARGET"
 
 
 def _safe(name: str) -> str:
     cleaned = "".join(ch if ch.isalnum() or ch in "-_." else "-" for ch in name)
     return cleaned.strip("-") or "case"
+
+
+def target_name() -> str:
+    """Directory that keeps one target's reports apart from every other target.
+
+    ``TIA_REPORTS_TARGET`` wins, then the basename of the configured app root
+    (``/app/PhoenixCart`` → ``PhoenixCart``), then ``default`` for plain unit
+    tests that never start a runtime.
+    """
+
+    override = os.environ.get(TARGET_ENV, "").strip()
+    if override:
+        return _safe(override)
+    app_root = os.environ.get("TIA_APP_ROOT", "").strip()
+    if not app_root:
+        settings = peek_settings()
+        app_root = str(settings.app_root or "") if settings is not None else ""
+    return _safe(Path(app_root).name) if app_root else "default"
+
+
+def reports_root(store: Any) -> Path:
+    """Where report files live: ``<base>/reports/<target>``.
+
+    The base is ``TIA_REPORTS`` or ``<store dir>/reports``. Every target gets
+    its own subdirectory, so a campaign that touches several applications
+    never mixes their findings.
+    """
+
+    override = os.environ.get(REPORTS_ENV, "").strip()
+    base = Path(override) if override else Path(store.path).parent / "reports"
+    return base / target_name()
 
 
 def write_case_report(store: Any, case_id: str, *, subdir: str = "cases") -> Path | None:
