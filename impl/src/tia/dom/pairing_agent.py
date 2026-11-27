@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 from tia.orch.identity import identity_of
@@ -118,6 +118,100 @@ def _has_sink(raw: dict[str, Any]) -> bool:
     return bool(
         str(raw.get("sinkFile") or (sink.get("file") if isinstance(sink, dict) else "") or "").strip()
     )
+
+
+
+def _pair_candidates(
+    store: Any,
+    request: dict[str, Any],
+    *,
+    entries: list[SliceEntry] | None = None,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    """Rank seeded write slices that can rewrite the requested column."""
+    table = str(request.get("table_name") or "").strip().lower()
+    column = str(request.get("column_name") or "").strip().lower()
+    write_entries = entries or []
+    if not write_entries:
+        write_entries = []
+        for row in store.list_slice_rows(run_id=str(request.get("run_id") or ""), limit=2000):
+            raw = row.get("slice")
+            if isinstance(raw, dict):
+                entry = resolve_entry(raw, 0, reader=None)
+                write_entries.append(replace(entry, slice_id=str(row["id"])))
+    candidates: list[dict[str, Any]] = []
+    for entry in write_entries:
+        if entry.slice_id == str(request.get("read_slice_id") or ""):
+            continue
+        tables = {op.table.strip().lower() for op in entry.ops if op.table}
+        if table and table not in tables:
+            continue
+        columns = [
+            op
+            for op in entry.ops
+            if op.op in {"insert", "update"}
+            and (not table or op.table.strip().lower() == table)
+        ]
+        score = 60
+        if column and any(column in [name.strip().lower() for name in op.columns] for op in columns):
+            score += 20
+        reasons = [f"write slice reaches {entry.file}:{entry.line}"]
+        if column:
+            reasons.append(f"column {column}")
+        candidates.append(
+            {
+                "write_slice_id": entry.slice_id,
+                "score": score,
+                "table": table,
+                "columns": [name for op in columns for name in op.columns],
+                "reasons": reasons,
+            }
+        )
+    candidates.sort(key=lambda item: (-int(item["score"]), str(item["write_slice_id"])))
+    return candidates[:limit]
+
+
+async def respond(
+    store: Any, run_id: str, *, limit: int = 20, reader: Reader | None = None
+) -> dict[str, Any]:
+    """Answer pending pair requests with ranked write slices (inject asks, pairing answers)."""
+    requests = store.list_pair_requests(run_id=run_id, status="pending", limit=limit)
+    if not requests:
+        return {"answered": 0, "no_path": 0, "requests": []}
+    writes: list[SliceEntry] = []
+    for row in store.list_slice_rows(run_id=run_id, limit=2000):
+        raw = row.get("slice")
+        if isinstance(raw, dict):
+            writes.append(replace(resolve_entry(raw, 0, reader=reader), slice_id=str(row["id"])))
+    results: list[dict[str, Any]] = []
+    answered = 0
+    no_path = 0
+    for request in requests:
+        candidates = _pair_candidates(store, request, entries=writes)
+        request_id = str(request["request_id"])
+        if candidates:
+            store.respond_pair_request(
+                request_id,
+                candidates=candidates,
+                reason=f"{len(candidates)} write slice(s) can reach "
+                f"{request.get('table_name')}.{request.get('column_name')}",
+            )
+            answered += 1
+            status = "answered"
+        else:
+            store.respond_pair_request(
+                request_id,
+                candidates=[],
+                reason=(
+                    f"no write slice reaches {request.get('table_name')}."
+                    f"{request.get('column_name')}"
+                ),
+                status="no_path",
+            )
+            no_path += 1
+            status = "no_path"
+        results.append({"request_id": request_id, "status": status, "candidates": candidates})
+    return {"answered": answered, "no_path": no_path, "requests": results}
 
 
 def build_pairing_queue(

@@ -25,7 +25,7 @@ from tia.cap.entry import (
     entry_field,
     resolve_values_with_guess,
 )
-from tia.cap.forms import FormField, PageForm, forms_from_document
+from tia.cap.forms import FormField, PageForm, find_form, forms_from_document
 from tia.cap.payloads import render as render_shape
 from tia.cap.request_plan import plan_request
 from tia.dom.trigger import StageRecord
@@ -167,6 +167,8 @@ async def run_inject(
     slice_id: str | None = None,
     learning: dict[str, Any] | None = None,
     read_target: dict[str, Any] | None = None,
+    constraint_plan: dict[str, Any] | None = None,
+    pair_candidates: dict[str, list[dict[str, Any]]] | None = None,
 ) -> InjectResult:
     kernel = Kernel(
         profile="inject", budget=budget, client=client or LocalToolClient(profile="inject")
@@ -547,6 +549,137 @@ async def run_inject(
     if int(status or 0) >= 400:
         result.verdict = "WRITE_NOT_REACHED"
         return await _finish(kernel, result)
+
+    # ---- I5.5 database constraints: replay the branch conditions trigger found ----
+    constraint_steps = notes.setdefault("constraint_steps", [])
+    for constraint in (constraint_plan or {}).get("constraints") or []:
+        constraint_id = str(constraint.get("constraint_id") or "")
+        c_table = str(constraint.get("table") or "")
+        c_column = str(constraint.get("column") or "")
+        c_value = str(constraint.get("value") or "")
+        pair_opts = (pair_candidates or {}).get(constraint_id) or []
+        chosen = pair_opts[0] if pair_opts else None
+        step: dict[str, Any] = {
+            "constraint_id": constraint_id,
+            "table": c_table,
+            "column": c_column,
+            "value": c_value,
+            "predicate": constraint.get("predicate"),
+        }
+        if chosen is None:
+            step["error"] = "no injection slice can rewrite this condition"
+            constraint_steps.append(step)
+            stage("I5.5", False, f"CONSTRAINT_UNSATISFIED {c_table}.{c_column}")
+            result.verdict = "CONSTRAINT_UNSATISFIED"
+            return await _finish(kernel, result)
+        other = get_runtime().store.get_slice(str(chosen.get("write_slice_id") or ""))
+        if other is None:
+            step["error"] = "the paired write slice disappeared"
+            constraint_steps.append(step)
+            stage("I5.5", False, "CONSTRAINT_REPLAY_FAILED missing slice")
+            result.verdict = "CONSTRAINT_REPLAY_FAILED"
+            return await _finish(kernel, result)
+        other_raw = dict(other["slice"])
+        c_file = str(other_raw.get("sinkFile") or "")
+        c_line = int(other_raw.get("sinkLine") or 0)
+        step["write_slice_id"] = str(chosen.get("write_slice_id"))
+        step["page_url"] = str(chosen.get("page_url") or base_url)
+        try:
+            window = await call(
+                "source_read", {"file": c_file, "around": {"line": c_line, "n": 40}}
+            )
+            c_text = "\n".join(item["text"] for item in window.get("lines") or [])
+        except ToolCallError as exc:
+            step["error"] = f"source_read failed: {exc}"
+            constraint_steps.append(step)
+            stage("I5.5", False, f"CONSTRAINT_REPLAY_FAILED {c_table}.{c_column}")
+            result.verdict = "CONSTRAINT_REPLAY_FAILED"
+            return await _finish(kernel, result)
+        col_params = _column_params(c_text)
+        step["parameter"] = col_params.get(c_column) or c_column
+        try:
+            page = await call("http_request", {"method": "GET", "url": str(step["page_url"])})
+            c_forms = forms_from_document(
+                parse(str(page.get("body") or "")), str(step["page_url"])
+            )
+        except ToolCallError as exc:
+            c_forms = []
+            step["page_error"] = str(exc)
+        c_form = find_form(c_forms, str(step["parameter"]), method="post")
+        if c_form is None and c_forms:
+            c_form = c_forms[0]
+        if c_form is None:
+            step["error"] = "no form on the paired write page"
+            constraint_steps.append(step)
+            stage("I5.5", False, f"CONSTRAINT_REPLAY_FAILED {c_table}.{c_column}")
+            result.verdict = "CONSTRAINT_REPLAY_FAILED"
+            return await _finish(kernel, result)
+        values = {
+            item.name: str(item.value or "tia")
+            for item in c_form.fields
+            if item.type not in {"submit", "button", "checkbox", "radio"}
+        }
+        values[str(step["parameter"])] = c_value
+        step["values"] = dict(values)
+        armed_now = False
+        try:
+            await call(
+                "probe_arm",
+                {
+                    "case_id": result.case_id,
+                    "targets": [{"file": c_file, "line": c_line}],
+                    "output": f"constraint-{tag}-{constraint_id}.json",
+                },
+            )
+            armed_now = True
+        except ToolCallError:
+            armed_now = False
+        try:
+            replay = await call(
+                "probe_run" if armed_now else "http_request",
+                {
+                    "case_id": result.case_id,
+                    "url": c_form.action,
+                    "method": "POST",
+                    "body": urlencode(values),
+                    "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+                    "capture_html": True,
+                },
+            )
+        except ToolCallError as exc:
+            replay = {}
+            step["error"] = f"replay failed: {exc}"
+        finally:
+            if armed_now:
+                with contextlib.suppress(ToolCallError):
+                    await call("probe_disarm", {"case_id": result.case_id})
+        queries = replay.get("queries") or []
+        step["affected"] = sum(int(q.get("affected_rows") or 0) for q in queries)
+        step["probe_hit"] = step["affected"] > 0
+        payload_column = str(target.get("column") or "")
+        value_ok = False
+        if payload_column:
+            with contextlib.suppress(ToolCallError):
+                check = await call(
+                    "db_read",
+                    {
+                        "sql": (
+                            f"SELECT `{c_column}` AS v FROM `{c_table}` "
+                            f"WHERE `{payload_column}` LIKE '%{tag}%' LIMIT 1"
+                        )
+                    },
+                )
+                rows_check = check.get("rows") or []
+                if rows_check:
+                    step["observed"] = rows_check[0].get("v")
+                    value_ok = str(rows_check[0].get("v")) == c_value
+        step["confirmed"] = value_ok
+        constraint_steps.append(step)
+        if not (step.get("probe_hit") or value_ok):
+            stage("I5.5", False, f"CONSTRAINT_REPLAY_FAILED {c_table}.{c_column}")
+            result.verdict = "CONSTRAINT_REPLAY_FAILED"
+            return await _finish(kernel, result)
+        stage("I5.5", True, f"{c_table}.{c_column} = {c_value}")
 
     # ---- I6 tri-state acceptance: in DB / on page / executable ----
     table = target["table"]

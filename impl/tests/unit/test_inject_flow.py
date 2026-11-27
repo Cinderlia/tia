@@ -197,3 +197,104 @@ async def test_main_runs_trigger_then_inject(runtime: Any) -> None:
     assert outcome.verdict == "EXECUTABLE"
     assert outcome.evidence_refs
     assert "# TIA Scheduling Report" in result.report
+
+
+class ConstraintClient(FakeInjectClient):
+    """The payload insert works; the read page only shows it after status=publish."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.constraint_applied = False
+
+    def _data(self, tool: str, args: dict[str, Any]) -> dict[str, Any]:
+        if tool == "source_read" and str(args.get("file") or "").endswith("posts.php"):
+            text = 'update posts set status=:status where id=:id'
+            return {
+                "file": "posts.php",
+                "total_lines": 60,
+                "sha256": "abc",
+                "lines": [{"n": 40, "text": text, "in_comment": False, "in_string": False}],
+            }
+        if tool == "db_read":
+            sql = str(args.get("sql") or "")
+            if "`status`" in sql:
+                value = "publish" if self.constraint_applied else "pending"
+                return {"rows": [{"v": value}], "columns": ["v"]}
+            return {"rows": [{"n": 1}], "columns": ["n"]}
+        if tool == "probe_run":
+            body = str(args.get("body") or "")
+            if "status=publish" in body:
+                self.constraint_applied = True
+                return {
+                    "hit": True,
+                    "mode": "write",
+                    "queries": [{"sql": "update posts set status='publish'", "affected_rows": 1}],
+                    "http": {"status": 200, "html": self.page, "content_type": "text/html"},
+                }
+        if tool == "probe_arm":
+            return {"probe_id": "probe-case-inject", "armed_at": "2026-11-25T00:00:00+00:00"}
+        return super()._data(tool, args)
+
+
+def _constraint_plan() -> dict[str, Any]:
+    return {
+        "constraints": [
+            {
+                "constraint_id": "dc-1",
+                "table": "posts",
+                "column": "status",
+                "value": "publish",
+                "op": "set",
+                "predicate": "page shows the post only when status is publish",
+            }
+        ],
+        "steps": [{"kind": "payload", "ref": "payload"}, {"kind": "constraint", "ref": "dc-1"}],
+    }
+
+
+async def test_inject_replays_database_constraint(runtime: Any) -> None:
+    from tia.inf.runtime import get_runtime
+
+    store = get_runtime().store
+    ids = store.seed_slices(
+        "pair-run",
+        [
+            {
+                "kind": "Xss",
+                "sinkFile": "posts.php",
+                "sinkLine": 40,
+                "sinkCode": "update posts set status=:status where id=:id",
+                "params": ["status"],
+            }
+        ],
+        order_mode="second",
+    )
+    client = ConstraintClient()
+    result = await run_inject(
+        _slice(),
+        base_url="http://127.0.0.1/xvwa/",
+        client=client,
+        constraint_plan=_constraint_plan(),
+        pair_candidates={
+            "dc-1": [{"write_slice_id": ids[0], "page_url": "http://127.0.0.1/xvwa/posts.php", "score": 80}]
+        },
+    )
+
+    assert result.verdict == "EXECUTABLE"
+    steps = result.notes["constraint_steps"]
+    assert len(steps) == 1
+    assert steps[0]["constraint_id"] == "dc-1"
+    assert steps[0]["confirmed"] is True
+
+
+async def test_inject_reports_unsatisfied_constraint(runtime: Any) -> None:
+    result = await run_inject(
+        _slice(),
+        base_url="http://127.0.0.1/xvwa/",
+        client=ConstraintClient(),
+        constraint_plan=_constraint_plan(),
+        pair_candidates={"dc-1": []},
+    )
+
+    assert result.verdict == "CONSTRAINT_UNSATISFIED"
+    assert result.notes["constraint_steps"][0]["constraint_id"] == "dc-1"

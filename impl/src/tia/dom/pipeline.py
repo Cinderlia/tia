@@ -22,7 +22,7 @@ from tia.cap.entry import infer_read_entry
 from tia.dom.direct import run_direct
 from tia.dom.inject import run_inject
 from tia.dom.main import seed_queue
-from tia.dom.pairing_agent import PairingConfig, build_pairing_queue
+from tia.dom.pairing_agent import PairingConfig, build_pairing_queue, respond
 from tia.dom.trigger import normalize_slice, run_trigger
 from tia.inf.findings import finding_db_only, finding_first_order, finding_second_order
 from tia.inf.reports import RunReports
@@ -279,6 +279,7 @@ async def run_pipeline(
                 url_for=url_for,
                 reader=reader,
                 payload_constraints=(trigger.notes or {}).get("payload_constraints"),
+                constraint_plan=(trigger.notes or {}).get("constraint_plan"),
                 read_values=(trigger.notes or {}).get("read_entry_values"),
             )
         except ToolCallError as exc:
@@ -380,6 +381,50 @@ async def _run_direct_round(
     )
 
 
+
+async def _prepare_constraints(
+    store: Any,
+    run_id: str,
+    read_slice_id: str,
+    plan: dict[str, Any] | None,
+    url_for: Callable[[dict[str, Any]], str] | None,
+    base_url: str,
+) -> dict[str, list[dict[str, Any]]]:
+    """Ask the pairing agent for a write slice per database-branch condition."""
+    constraints = list((plan or {}).get("constraints") or [])
+    if not constraints:
+        return {}
+    requests: list[str] = []
+    for constraint in constraints:
+        request = store.add_pair_request(
+            run_id=run_id,
+            read_slice_id=read_slice_id,
+            kind="constraint",
+            table=str(constraint.get("table") or ""),
+            column=str(constraint.get("column") or ""),
+            op=str(constraint.get("op") or "set"),
+            value=str(constraint.get("value") or ""),
+            direction="payload_then_write",
+        )
+        requests.append(str(request))
+    await respond(store, run_id)
+    mapping: dict[str, list[dict[str, Any]]] = {}
+    for constraint, request_id in zip(constraints, requests, strict=False):
+        row = store.get_pair_request(request_id) or {}
+        options: list[dict[str, Any]] = []
+        for candidate in row.get("candidates") or []:
+            slice_id = str(candidate.get("write_slice_id") or "")
+            option = dict(candidate)
+            option["page_url"] = base_url
+            if url_for is not None:
+                write_row = store.get_slice(slice_id)
+                if write_row is not None:
+                    option["page_url"] = url_for(dict(write_row["slice"]))
+            options.append(option)
+        mapping[str(constraint.get("constraint_id") or "")] = options
+    return mapping
+
+
 async def walk_injection_queue(
     store: Any,
     pair_run_id: str,
@@ -392,6 +437,7 @@ async def walk_injection_queue(
     reader: Callable[[str, int, int], list[tuple[int, str]]] | None = None,
     payload_constraints: dict[str, Any] | None = None,
     read_values: dict[str, str] | None = None,
+    constraint_plan: dict[str, Any] | None = None,
 ) -> PipelineResult:
     """Inject every candidate in queue order; the read side is already proven."""
     result = PipelineResult()
@@ -409,6 +455,14 @@ async def walk_injection_queue(
         read_raw = dict(read_row["slice"]) if read_row is not None else {}
         read_url = url_for(read_raw) if (url_for is not None and read_raw) else base_url
         entry = _read_entry(reader, read_raw) if read_raw else None
+        pair_map = await _prepare_constraints(
+            store,
+            pair_run_id,
+            str(item["read_slice_id"]),
+            constraint_plan,
+            url_for,
+            read_url,
+        )
         hint = {
             "pair_id": item["pair_id"],
             "table": item["table"],
@@ -444,6 +498,8 @@ async def walk_injection_queue(
             slice_id=str(item["write_slice_id"]),
             learning=hints_for(store, read_raw or write_raw),
             read_target=_read_target(read_raw),
+            constraint_plan=constraint_plan,
+            pair_candidates=pair_map,
         )
         if (
             len(hints) > 1
@@ -466,6 +522,8 @@ async def walk_injection_queue(
                     slice_id=str(hints[1]["alternate_write_slice_id"]),
                     learning=hints_for(store, read_raw or write_raw),
                     read_target=_read_target(read_raw),
+                    constraint_plan=constraint_plan,
+                    pair_candidates=pair_map,
                 )
                 inject.notes["alternate_attempt"] = {
                     "slice_id": hints[1]["alternate_write_slice_id"],

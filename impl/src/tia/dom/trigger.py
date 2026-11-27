@@ -36,11 +36,15 @@ from tia.inf.store import now_iso
 from tia.orch.judge import judge_trigger
 from tia.orch.kernel import Kernel, LocalToolClient, StepRecord, ToolCallError, ToolClient
 from tia.orch.learning import record_case
+from tia.schemas.plan import ConstraintPlan, ConstraintWrite, PayloadPlan, Step
 
 #: Exploration budget: enough attempts for complex entry pages, still bounded.
 ENTRY_ATTEMPTS = attempt_limit("entry", 8)
 #: How many payload shapes one slice may try before the slice is judged.
 PAYLOAD_ATTEMPTS = attempt_limit("payload", 3)
+#: Bounded discovery of database-only branch conditions.
+CONSTRAINT_ROUNDS = attempt_limit("constraint_rounds", 3)
+CONSTRAINT_WRITES = attempt_limit("constraint_writes", 3)
 
 _INSERT_RE = re.compile(r"insert\s+into\s+`?(\w+)`?\s*\(([^)]*)\)", re.IGNORECASE)
 _SELECT_TABLE_RE = re.compile(r"\bfrom\s+`?(\w+)`?", re.IGNORECASE)
@@ -221,6 +225,116 @@ def _entry_variants(candidates: list[EntryCandidate], limit: int) -> list[EntryC
             out.append(variant)
     return out[:limit]
 
+
+
+_LITERAL_EQ_RE = re.compile(
+    r"(?:where|and|or)\s+`?(\w+)`?\s*=\s*'([^']{1,40})'", re.IGNORECASE
+)
+_ROW_CMP_RE = re.compile(
+    r"\$?\w+\[\s*['\"](\w+)['\"]\s*\]\s*(?:===?|!==?)\s*['\"]([^'\"]{1,40})['\"]"
+)
+_NULL_CMP_RE = re.compile(r"\$?\w+\[\s*['\"](\w+)['\"]\s*\]\s*is\s+null", re.IGNORECASE)
+
+
+def _constraint_candidates(
+    source_text: str, table_meta: dict[str, Any], payload_column: str
+) -> list[dict[str, Any]]:
+    """Static hints for branch conditions that a database write could satisfy.
+
+    Only values that literally appear next to a real column are proposed; the
+    caller proves each one by writing it and re-reading the page, so a wrong
+    guess costs one bounded attempt instead of corrupting the plan.
+    """
+    columns = {
+        str(col.get("name")): str(col.get("type") or "")
+        for col in table_meta.get("columns") or []
+    }
+    found: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(column: str, value: str, predicate: str, why: str) -> None:
+        if column not in columns or column == payload_column:
+            return
+        key = (column, value)
+        if key in seen:
+            return
+        seen.add(key)
+        found.append(
+            {
+                "column": column,
+                "value": value,
+                "predicate": predicate.strip(),
+                "why": why,
+            }
+        )
+
+    for match in _LITERAL_EQ_RE.finditer(source_text):
+        add(
+            match.group(1),
+            match.group(2),
+            match.group(0),
+            "the SQL filter compares this column to a literal",
+        )
+    for match in _ROW_CMP_RE.finditer(source_text):
+        add(
+            match.group(1),
+            match.group(2),
+            match.group(0),
+            "the branch compares this row field to a literal",
+        )
+    for match in _NULL_CMP_RE.finditer(source_text):
+        add(
+            match.group(1),
+            "",
+            match.group(0),
+            "the branch requires a NULL value",
+        )
+    # Boolean-ish columns mentioned in a condition usually gate visibility.
+    for name, col_type in columns.items():
+        if name == payload_column:
+            continue
+        if name not in source_text:
+            continue
+        if re.search(r"\b(tinyint|bool|boolean|bit)\b", col_type, re.IGNORECASE):
+            add(name, "1", name, "a boolean column guards the branch")
+    return found[: max(1, CONSTRAINT_WRITES)]
+
+
+async def _fetch_verify(
+    kernel: Kernel,
+    base_url: str,
+    method: str,
+    values: dict[str, str],
+    tag: str,
+    payload: str,
+) -> dict[str, Any] | None:
+    """Fetch the trigger page the same way the entry was solved, then verify."""
+    try:
+        if method.upper() == "GET":
+            fetched = await kernel.call(
+                "http_request", {"method": "GET", "url": base_url, "params": values}
+            )
+        else:
+            fetched = await kernel.call(
+                "http_request",
+                {
+                    "method": "POST",
+                    "url": base_url,
+                    "body": urlencode(values),
+                    "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+                },
+            )
+        args: dict[str, Any] = {"tag": tag, "payload": payload}
+        body = str(fetched.get("body") or "")
+        if body:
+            args["html"] = body
+            args["content_type"] = str(fetched.get("content_type") or "text/html")
+        else:
+            args["url"] = base_url
+        result = await kernel.call("verify_tag", args)
+        return result if isinstance(result, dict) else None
+    except ToolCallError:
+        return None
 
 async def run_trigger(
     raw_slice: dict[str, Any],
@@ -550,14 +664,146 @@ async def run_trigger(
         )
         if attempt_verify is not None and bool((attempt_verify.get("best") or {}).get("executable")):
             break
-        # Not executable yet: drop this row and try the next shape.
+        # Not executable yet.  If the page did not show the value at all, keep
+        # the row: a database-only branch condition may be hiding it, and the
+        # constraint discovery below needs a row to rewrite.  If the page did
+        # show it (context/encoding problem), drop the row and try the next
+        # payload shape.
         if change_id:
+            if attempt_verify is not None and not bool(attempt_verify.get("found")):
+                break
             with contextlib.suppress(ToolCallError):
                 await kernel.call("db_undo", {"change_id": change_id})
             change = None
 
     if chosen is None and verify is not None:
         chosen = {"shape": "unknown", "payload": payloads[0][1], "values": {}, "method": "GET"}
+    # P3/P5 attribution: database-only branch conditions ----------------------
+    # The payload is in place but the page still does not render it. Instead of
+    # giving up, look for literal branch conditions in the source, satisfy each
+    # one with a direct write, and re-read the page. Direct writes are discovery
+    # only: they are recorded as ConstraintWrite steps and P6 rolls them back.
+    constraints: list[dict[str, Any]] = []
+    constraint_attempts: list[dict[str, Any]] = []
+    best_now = (verify or {}).get("best") or {}
+    if (
+        change is not None
+        and payload_column
+        and not bool(best_now.get("executable"))
+        and entry_request is not None
+    ):
+        trigger_method, trigger_values = entry_request
+        for round_index in range(max(1, CONSTRAINT_ROUNDS)):
+            progressed = False
+            for hint in _constraint_candidates(source_text, table_meta, payload_column):
+                if any(item["column"] == hint["column"] for item in constraints):
+                    continue
+                column = hint["column"]
+                value_sql = (
+                    "NULL" if hint["value"] == "" else _sql_literal(str(hint["value"]))
+                )
+                sql = (
+                    f"UPDATE `{table}` SET `{column}`={value_sql} "
+                    f"WHERE `{payload_column}` LIKE '%{tag}%'"
+                )
+                discovery_id: str | None = None
+                try:
+                    written_condition = await kernel.call("db_write", {"sql": sql})
+                    change_condition = (
+                        written_condition.get("change") if isinstance(written_condition, dict) else None
+                    )
+                    discovery_id = str((change_condition or {}).get("change_id") or "") or None
+                except ToolCallError as exc:
+                    constraint_attempts.append(
+                        {
+                            "round": round_index,
+                            "column": column,
+                            "value": hint["value"],
+                            "written": False,
+                            "error": f"{exc.code.value}: {exc.message}",
+                        }
+                    )
+                    continue
+                refreshed = await _fetch_verify(
+                    kernel, base_url, trigger_method, trigger_values, tag, str((chosen or {}).get("payload") or "")
+                )
+                new_best = (refreshed or {}).get("best") or {}
+                progressed_now = bool(new_best.get("executable"))
+                constraint_attempts.append(
+                    {
+                        "round": round_index,
+                        "column": column,
+                        "value": hint["value"],
+                        "predicate": hint["predicate"],
+                        "written": True,
+                        "found": bool((refreshed or {}).get("found")),
+                        "executable": progressed_now,
+                    }
+                )
+                if progressed_now:
+                    constraint = ConstraintWrite(
+                        constraint_id=f"dc-{len(constraints) + 1}",
+                        at=f"{sink.get('file')}:{sink.get('line')}",
+                        predicate=hint["predicate"],
+                        why=hint["why"],
+                        table=table,
+                        column=column,
+                        value=hint["value"],
+                        sql=sql,
+                        depends_on=["payload"] if constraints == [] else [],
+                        replay="app_request",
+                        confidence=70,
+                        evidence_refs=[],
+                    )
+                    constraints.append(constraint.model_dump())
+                    verify = refreshed
+                    progressed = True
+                    break
+                if discovery_id:
+                    with contextlib.suppress(ToolCallError):
+                        await kernel.call("db_undo", {"change_id": discovery_id})
+            if progressed or not constraints:
+                continue
+            if bool(((verify or {}).get("best") or {}).get("executable")):
+                break
+
+    if constraints:
+        notes["constraints"] = constraints
+    notes["constraint_attempts"] = constraint_attempts
+    best_now = (verify or {}).get("best") or {}
+    if constraints or (change is not None and str((chosen or {}).get("payload") or "")):
+        payload_plan = PayloadPlan(
+            table=table,
+            column=payload_column,
+            payload=str((chosen or {}).get("payload") or ""),
+            tag=tag,
+            context_kind=str(best_now.get("context_kind") or context_hint),
+            out_filter="none" if bool(best_now.get("executable")) else "unknown",
+            length_budget=(
+                int(column_length[payload_column])
+                if column_length.get(payload_column) is not None
+                else None
+            ),
+            sink=f"{sink.get('file')}:{sink.get('line')}\n{sink.get('code')}",
+            evidence_refs=[],
+        )
+        steps = [Step(kind="payload", ref="payload")]
+        steps += [
+            Step(kind="constraint", ref=str(item["constraint_id"]), phase="after_payload")
+            for item in constraints
+        ]
+        trigger_method, trigger_values = entry_request or ("GET", {})
+        notes["constraint_plan"] = ConstraintPlan(
+            steps=steps,
+            payload=payload_plan,
+            constraints=[ConstraintWrite.model_validate(item) for item in constraints],
+            final_trigger={
+                "url": base_url,
+                "method": trigger_method.upper(),
+                "fields": trigger_values,
+            },
+        ).model_dump()
+
     notes["payload_attempts"] = payload_attempts
     notes["payload_candidates"] = [payload for _, payload in payloads]
     if chosen is not None:
@@ -636,7 +882,13 @@ async def run_trigger(
     verdict, explanation = judge_trigger(
         verify=verify, written=change is not None or wrote_any, db_error=db_error
     )
-    notes["explanation"] = explanation
+    if constraints:
+        notes["explanation"] = (
+            f"{explanation}; {len(constraints)} database condition(s) were required and "
+            "recorded as replay steps"
+        )
+    else:
+        notes["explanation"] = explanation
 
     # P6 Rollback + report ------------------------------------------------------
     residue: int | None = None

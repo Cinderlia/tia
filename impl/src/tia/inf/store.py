@@ -15,7 +15,7 @@ import json
 import sqlite3
 import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -184,6 +184,23 @@ CREATE TABLE IF NOT EXISTS trace (
     observed_at  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_trace_case ON trace(case_id, observed_at);
+CREATE TABLE IF NOT EXISTS pair_request (
+    request_id    TEXT PRIMARY KEY,
+    run_id        TEXT NOT NULL,
+    read_slice_id TEXT NOT NULL,
+    kind          TEXT NOT NULL DEFAULT 'constraint',
+    table_name    TEXT NOT NULL DEFAULT '',
+    column_name   TEXT NOT NULL DEFAULT '',
+    op            TEXT NOT NULL DEFAULT 'set',
+    value         TEXT NOT NULL DEFAULT '',
+    direction     TEXT NOT NULL DEFAULT '',
+    status        TEXT NOT NULL DEFAULT 'pending',
+    candidates    TEXT NOT NULL DEFAULT '[]',
+    reason        TEXT NOT NULL DEFAULT '',
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pair_request_run ON pair_request(run_id, status);
 CREATE TABLE IF NOT EXISTS learning (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     signature  TEXT NOT NULL,
@@ -627,6 +644,84 @@ class Store:
             }
             for row in rows
         ]
+
+    # -- pairing requests ------------------------------------------------
+
+    def add_pair_request(
+        self,
+        *,
+        run_id: str,
+        read_slice_id: str,
+        kind: str = "constraint",
+        table: str = "",
+        column: str = "",
+        op: str = "set",
+        value: Any = "",
+        direction: str = "",
+    ) -> str:
+        """Ask the pairing agent for write slices; answered asynchronously."""
+        request_id = f"pr-{uuid.uuid4().hex[:12]}"
+        ts = now_iso()
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO pair_request (request_id, run_id, read_slice_id, kind, table_name,"
+                " column_name, op, value, direction, status, created_at, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,'pending',?,?)",
+                (request_id, run_id, read_slice_id, kind, table, column, op,
+                 json.dumps(value, ensure_ascii=False), direction, ts, ts),
+            )
+        return request_id
+
+    def get_pair_request(self, request_id: str) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM pair_request WHERE request_id=?", (request_id,)
+            ).fetchone()
+        return self._pair_request_row(row) if row else None
+
+    def list_pair_requests(
+        self, *, run_id: str = "", status: str = "", limit: int = 50
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        args: list[Any] = []
+        if run_id:
+            clauses.append("run_id=?")
+            args.append(run_id)
+        if status:
+            clauses.append("status=?")
+            args.append(status)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM pair_request{where} ORDER BY created_at, request_id LIMIT ?",
+                (*args, max(1, min(limit, 500))),
+            ).fetchall()
+        return [self._pair_request_row(row) for row in rows]
+
+    def respond_pair_request(
+        self,
+        request_id: str,
+        *,
+        candidates: list[dict[str, Any]],
+        reason: str = "",
+        status: str = "answered",
+    ) -> bool:
+        with self._conn() as conn:
+            changed = conn.execute(
+                "UPDATE pair_request SET status=?, candidates=?, reason=?, updated_at=?"
+                " WHERE request_id=? AND status='pending'",
+                (status, json.dumps(candidates, ensure_ascii=False), reason,
+                 now_iso(), request_id),
+            ).rowcount
+        return bool(changed)
+
+    @staticmethod
+    def _pair_request_row(row: sqlite3.Row) -> dict[str, Any]:
+        payload = dict(row)
+        with suppress(json.JSONDecodeError):
+            payload["value"] = json.loads(payload.get("value") or '""')
+        payload["candidates"] = json.loads(payload.get("candidates") or "[]")
+        return payload
 
     def bump_learning(self, signature: str, attribute: str, value: str, success: bool) -> None:
         """Accumulate one observation for a site signature; shared by both families."""
