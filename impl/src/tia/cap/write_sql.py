@@ -11,7 +11,10 @@ renders the placeholder, and checks the statement against the structural rules
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
+
+import httpx
 
 from tia.cap.sqlparse import WriteStatement, parse_write
 from tia.schemas.envelope import ErrorCode, ToolError
@@ -24,19 +27,21 @@ MAX_SQL_CHARS = 4_000
 
 WRITE_PROMPT = """\
 You write one SQL statement that stores a marker payload so the page renders it at
-the sink below. Reply with JSON only: {"sql": "...", "reason": "..."}.
+the sink below. Reply with JSON only: {"sql": "...", "column": "...", "reason": "..."}.
 
 Rules:
 - Reply with the column that receives the payload in "column": the column the sink
   prints. It must be one of the table columns below.
-- Put {{PAYLOAD}} exactly once, at the position where the payload value belongs.
+- Put {{PAYLOAD}} exactly once, unquoted, at the position where the payload value
+  belongs; the harness substitutes a complete SQL literal (quotes included).
   Never write the payload yourself: it changes between attempts.
 - {{ROW_ID}} may be used at most once for a primary key; it is replaced by one of
   the RETURNED ROWS below. Prefer an UPDATE of a row the executed read returned,
   so the read path will show the change; use INSERT when no row is usable.
 - UPDATE must have a WHERE clause. One statement only. No DDL, comments,
   semicolons inside the statement, or multiple statements.
-- Write the payload into the column the sink expression prints.
+- The sink expression uses $rows[N]; N is a 0-based index into READ COLUMN
+  ORDER below. Write the payload into the column at that index.
 """
 
 
@@ -92,6 +97,29 @@ def compile(
     return sql, statement
 
 
+_SELECT_LIST = re.compile(r"select\s+(?P<cols>.+?)\s+from\s", re.IGNORECASE | re.DOTALL)
+
+
+def column_order(observed: list[dict[str, Any]], rows: list[dict[str, Any]]) -> list[str]:
+    """The 0-based column order a sink's ``$rows[N]`` indexes into."""
+    for item in observed:
+        match = _SELECT_LIST.search(str(item.get("sql") or ""))
+        if match is None:
+            continue
+        cols: list[str] = []
+        for part in match.group("cols").split(","):
+            name = part.strip().strip("`").split(".")[-1].strip("`")
+            if not name or "*" in name:
+                cols = []
+                break
+            cols.append(name)
+        if cols:
+            return cols
+    if rows:
+        return [str(key) for key in rows[0]]
+    return []
+
+
 def _rows_view(rows: list[dict[str, Any]], *, limit: int = MAX_ROWS) -> list[dict[str, Any]]:
     view: list[dict[str, Any]] = []
     for row in rows[:limit]:
@@ -130,11 +158,54 @@ def _prompt(
             "EXECUTED READ: none captured. Explore the schema and write an INSERT "
             "that satisfies every NOT NULL column and foreign key."
         )
+    order = column_order(observed, rows)
+    if order:
+        lines.append(
+            "READ COLUMN ORDER (0-based, from the executed SELECT list; "
+            "$rows[N] indexes this list):"
+        )
+        lines.extend(f"  {index}: {name}" for index, name in enumerate(order))
     if rows:
         lines.append(f"RETURNED ROWS (for {{{{ROW_ID}}}}): {json.dumps(_rows_view(rows), ensure_ascii=False, default=str)[:2000]}")
     if error:
         lines.append(f"THE PREVIOUS ATTEMPT FAILED: {error[:800]}")
     return "\n".join(lines)
+
+
+async def _raw_json(model: Any, system: str, user: str) -> tuple[dict[str, Any], str]:
+    """One direct request used when the shared client returns an empty reply."""
+    headers = {"Content-Type": "application/json"}
+    key = getattr(model, "api_key", "")
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    body = {
+        "model": getattr(model, "model", ""),
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": 0.2,
+        "max_tokens": getattr(model, "max_tokens", 1024),
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(
+                f"{getattr(model, 'base_url', '')}/chat/completions",
+                json=body,
+                headers=headers,
+            )
+    except httpx.HTTPError as exc:
+        return {}, f"{type(exc).__name__}: {exc}"
+    if response.status_code != 200:
+        return {}, f"status {response.status_code}: {response.text[:200]}"
+    try:
+        text = str(response.json()["choices"][0]["message"]["content"] or "")
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        return {}, f"bad body: {type(exc).__name__}"
+    from tia.ad.llm import _parse_object
+
+    return _parse_object(text), f"raw: {text[:200]}"
 
 
 async def plan_write_sql(
@@ -163,12 +234,18 @@ async def plan_write_sql(
         tag=tag,
         error=error,
     )
+
     reply = await model.complete_json(WRITE_PROMPT + "\n" + prompt, {})
+    detail = ""
+    if not (isinstance(reply, dict) and reply.get("sql")):
+        # The endpoint occasionally returns an empty body under load; one direct
+        # retry with the same prompt is cheaper than a failed write.
+        reply, detail = await _raw_json(model, WRITE_PROMPT, prompt)
     template = ""
     if isinstance(reply, dict):
         template = str(reply.get("sql") or "").strip()
     if not template:
-        raise _bad("the model returned no SQL")
+        raise _bad(f"the model returned no SQL: {str(reply)[:300]} {detail[:300]}")
     if len(template) > MAX_SQL_CHARS:
         raise _bad("the SQL template is too long")
     column = str(reply.get("column") or "").strip() if isinstance(reply, dict) else ""

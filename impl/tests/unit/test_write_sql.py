@@ -116,3 +116,44 @@ async def test_plan_write_sql_requires_a_known_column() -> None:
             payload="x",
             tag="ab12",
         )
+
+
+def test_column_order_follows_the_executed_select_list() -> None:
+    observed = [{"sql": "select t.user, `comment`, date from comments t"}]
+    assert write_sql.column_order(observed, []) == ["user", "comment", "date"]
+
+
+def test_column_order_falls_back_to_the_row_keys() -> None:
+    observed = [{"sql": "select * from comments"}]
+    rows = [{"user": "a", "comment": "b", "date": "c"}]
+    assert write_sql.column_order(observed, rows) == ["user", "comment", "date"]
+
+
+async def test_plan_write_sql_numbers_the_read_columns() -> None:
+    model = FakeModel(
+        {
+            "sql": "UPDATE `comments` SET `date` = {{PAYLOAD}} WHERE `id` = 44",
+            "column": "date",
+        }
+    )
+    await write_sql.plan_write_sql(
+        model,
+        sink='<span class="pull-right">".$rows[2]."</span>',
+        table="comments",
+        columns=["id", "user", "comment", "date"],
+        schema="",
+        observed=[
+            {
+                "sql": "select user,comment,date from comments",
+                "line": 5,
+                "rows": [{"user": "a", "comment": "b", "date": "c"}],
+            }
+        ],
+        rows=[{"user": "a", "comment": "b", "date": "c"}],
+        payload="<script>alert(1)</script>ab12",
+        tag="ab12",
+    )
+    prompt = model.prompts[0]
+    assert "0: user" in prompt
+    assert "1: comment" in prompt
+    assert "2: date" in prompt
