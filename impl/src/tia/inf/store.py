@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
@@ -258,6 +259,12 @@ CREATE TABLE IF NOT EXISTS flow_job (
     updated_at       TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_flow_job_run ON flow_job (run_id, status, score);
+CREATE TABLE IF NOT EXISTS table_lock (
+    table_name  TEXT PRIMARY KEY,
+    owner       TEXT NOT NULL,
+    acquired_at REAL NOT NULL,
+    expires_at  REAL NOT NULL
+);
 """
 
 
@@ -320,6 +327,54 @@ class Store:
                 " write_identity TEXT NOT NULL, verdict TEXT NOT NULL,"
                 " case_id TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL)"
             )
+
+    # -- table leases ------------------------------------------------------
+    def acquire_table_lock(
+        self, table: str, *, owner: str, ttl_sec: float = 600.0
+    ) -> bool:
+        """Take the table for one agent; the lease expires if that agent dies."""
+        now = time.time()
+        with self._conn() as conn:
+            cur = conn.execute(
+                "UPDATE table_lock SET owner=?, acquired_at=?, expires_at=?"
+                " WHERE table_name=? AND (owner=? OR expires_at < ?)",
+                (owner, now, now + ttl_sec, table, owner, now),
+            )
+            if cur.rowcount == 1:
+                return True
+            try:
+                conn.execute(
+                    "INSERT INTO table_lock (table_name, owner, acquired_at, expires_at)"
+                    " VALUES (?, ?, ?, ?)",
+                    (table, owner, now, now + ttl_sec),
+                )
+            except sqlite3.IntegrityError:
+                return False
+            return True
+
+    def refresh_table_lock(self, table: str, *, owner: str, ttl_sec: float = 600.0) -> bool:
+        now = time.time()
+        with self._conn() as conn:
+            cur = conn.execute(
+                "UPDATE table_lock SET expires_at=? WHERE table_name=? AND owner=?",
+                (now + ttl_sec, table, owner),
+            )
+            return cur.rowcount == 1
+
+    def release_table_lock(self, table: str, *, owner: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "DELETE FROM table_lock WHERE table_name=? AND owner=?", (table, owner)
+            )
+
+    def release_table_locks(self, *, owner: str) -> None:
+        with self._conn() as conn:
+            conn.execute("DELETE FROM table_lock WHERE owner=?", (owner,))
+
+    def list_table_locks(self) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute("SELECT * FROM table_lock ORDER BY table_name").fetchall()
+            return [dict(row) for row in rows]
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:

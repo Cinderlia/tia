@@ -28,6 +28,7 @@ from tia.cap.entry import (
     infer_entry,
 )
 from tia.cap.forms import FormField, PageForm
+from tia.cap.locks import TableLocks
 from tia.cap.request_plan import plan_request
 from tia.cap.schema import fetch_brief, render_brief
 from tia.cap.write_sql import compile as compile_write
@@ -533,6 +534,9 @@ async def run_trigger(
         if case_id:
             await _revert_pending_writes(case_id)
         await _sweep_tagged_rows(case.get("cleanup"))
+        locks = case.get("locks")
+        if locks is not None:
+            locks.release()
 
 
 async def _revert_pending_writes(case_id: str) -> None:
@@ -555,20 +559,21 @@ async def _sweep_tagged_rows(state: dict[str, Any] | None) -> None:
         return
     kernel = state["kernel"]
     case_id = str(state.get("case_id") or "")
-    tag = str(state.get("tag") or "")
+    tags = [str(item) for item in (state.get("tags") or [state.get("tag") or ""]) if item]
     snapshots = dict(state.get("snapshots") or {})
-    if str(state.get("table") or "") in snapshots:
-        await cleanup_new_rows(
-            kernel, case_id=case_id, snapshots=snapshots, tag=tag
-        )
+    table = str(state.get("table") or "")
+    if table in snapshots:
+        for tag in tags:
+            await cleanup_new_rows(kernel, case_id=case_id, snapshots=snapshots, tag=tag)
         return
-    await cleanup_tagged_rows(
-        kernel,
-        case_id=case_id,
-        table=str(state.get("table") or ""),
-        columns=[str(column) for column in state.get("columns") or []],
-        tag=tag,
-    )
+    for tag in tags:
+        await cleanup_tagged_rows(
+            kernel,
+            case_id=case_id,
+            table=table,
+            columns=[str(column) for column in state.get("columns") or []],
+            tag=tag,
+        )
 
 
 async def _run_trigger(
@@ -734,6 +739,9 @@ async def _run_trigger(
         site=slice_doc,
     )
     notes.update({"tag": tag, "context_hint": context_hint, "sink_class": sink_class.name})
+    base_tag = tag
+    used_tags: list[str] = []
+    kept_tag = tag
     pk_columns = list(table_meta.get("primary_key") or [])
     value_columns = columns or [
         c["name"] for c in table_meta["columns"] if c["name"] not in pk_columns
@@ -775,6 +783,7 @@ async def _run_trigger(
             "table": table,
             "columns": value_columns,
             "tag": tag,
+            "tags": used_tags,
             "snapshots": snapshots,
         }
 
@@ -807,6 +816,14 @@ async def _run_trigger(
         write_mode = "update" if head == "update" else "insert"
     notes["write_mode"] = write_mode
 
+    # One writer and verifier per table: hold the lease across write -> read
+    # verification -> undo so parallel cases cannot overwrite each other's row.
+    locks: TableLocks | None = None
+    if sink_class.writes_database() and table:
+        locks = TableLocks(get_runtime().store, owner=case_id, tables=[table])
+        await locks.acquire()
+    if case is not None:
+        case["locks"] = locks
     change: dict[str, Any] | None = None
     db_error: str | None = None
     verify: dict[str, Any] | None = None
@@ -816,6 +833,12 @@ async def _run_trigger(
     entry_request: tuple[str, dict[str, str]] | None = None
 
     for shape, payload in payloads:
+        # A fresh tag per attempt: a value is used once, so an echo from a
+        # failed attempt can never be mistaken for this attempt's payload.
+        tag = _tag()
+        used_tags.append(tag)
+        if base_tag and base_tag != tag:
+            payload = payload.replace(base_tag, tag)
         if not template:
             payload_attempts.append(
                 {
@@ -1028,7 +1051,7 @@ async def _run_trigger(
                     verify = attempt_verify
                 entry_request = (candidate.method, candidate.values)
                 chosen = {"shape": shape, "payload": payload, "values": candidate.values,
-                          "method": candidate.method}
+                          "method": candidate.method, "tag": tag}
                 if attempt["executable"]:
                     break
         payload_attempts[-1]["found"] = bool(attempt_verify and attempt_verify.get("found"))
@@ -1044,11 +1067,19 @@ async def _run_trigger(
         # payload shape.
         if change_id:
             if attempt_verify is not None and not bool(attempt_verify.get("found")):
+                kept_tag = tag
                 break
             with contextlib.suppress(ToolCallError):
                 await kernel.call("db_undo", {"change_id": change_id})
             change = None
+        else:
+            kept_tag = tag
 
+    if chosen is not None:
+        kept_tag = str(chosen.get("tag") or kept_tag)
+    tag = kept_tag
+    notes["tag"] = kept_tag
+    notes["tags"] = used_tags
     if chosen is None and verify is not None:
         chosen = {"shape": "unknown", "payload": payloads[0][1], "values": {}, "method": "GET"}
     # P3/P5 attribution: database-only branch conditions ----------------------

@@ -36,6 +36,7 @@ from tia.cap.entry import (
     resolve_values_with_guess,
 )
 from tia.cap.forms import FormField, PageForm, find_form, forms_from_document
+from tia.cap.locks import TableLocks
 from tia.cap.request_plan import plan_request
 from tia.cap.requests import (
     endpoints_from_html,
@@ -52,6 +53,7 @@ from tia.inf.runtime import get_runtime
 from tia.inf.settings import attempt_limit
 from tia.orch.kernel import Kernel, LocalToolClient, ToolCallError, ToolClient
 from tia.orch.learning import preferred_payload_shape, record_case
+from tia.schemas.envelope import ToolError
 from tia.sinks.base import Observation, inject_verdict
 from tia.sinks.registry import sink_class_for
 
@@ -760,6 +762,18 @@ async def _run_inject(
         "snapshots": snapshots,
     }
     _ACTIVE_CLEANUP.set(state)
+    # One writer/verifier per table; released when I7 (or the guard) finishes.
+    try:
+        locks = TableLocks(
+            get_runtime().store,
+            owner=result.case_id,
+            tables=[str(item) for item in write_tables if item],
+        )
+        await locks.acquire()
+        state["locks"] = locks
+    except ToolError as exc:
+        notes["lock_error"] = f"{exc.code.value}: {exc.message}"
+        state["locks"] = None
     notes["_cleanup_needed"] = True
     stage("I3", True, f"payload {len(payload)} chars, column {chosen_column} width={widths.get(chosen_column)}")
     stage("I4", True, f"intersect: field={field_name}, column={chosen_column}, payload {len(payload)} chars")
@@ -1938,6 +1952,9 @@ async def run_inject(
         if cleanup and state and state.get("pending"):
             with contextlib.suppress(Exception):
                 await _cleanup_tagged_rows(state["kernel"], state)
+        if state and state.get("locks") is not None:
+            with contextlib.suppress(Exception):
+                state["locks"].release()
         _ACTIVE_CLEANUP.reset(token)
 
 
