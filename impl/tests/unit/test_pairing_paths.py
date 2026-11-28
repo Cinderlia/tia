@@ -149,8 +149,9 @@ def test_pairing_exposes_copy_paths(tmp_path) -> None:
     assert path["hops"][0]["is_copy"] is True
     assert path["hops"][-1]["is_copy"] is False
     queued = store.list_injection_queue("run-paths")
-    if queued:
-        attached = [item for item in queued if item.get("copy_paths")]
-        assert attached, queued
-        assert attached[0]["copy_paths"][0]["path_id"] == path["path_id"]
+    copies = [item for item in queued if item.get("kind") == "copy"]
+    assert copies, queued
+    assert copies[0]["copy_paths"][0]["path_id"] == path["path_id"]
+    assert copies[0]["write_slice_id"] == path["hops"][0]["write_slice_id"]
+    assert all(int(item["score"]) <= 74 for item in queued if item.get("kind") != "copy")
     assert path["unverified_hops"] == 1

@@ -181,6 +181,7 @@ async def test_queue_item_carries_its_copy_path_into_the_injector(
                 "score": 88,
                 "direction": "write_then_read",
                 "reasons": ["copy"],
+                "kind": "copy",
                 "copy_paths": [
                     {
                         "path_id": "cp-x",
@@ -217,3 +218,4 @@ async def test_queue_item_carries_its_copy_path_into_the_injector(
     paths = captured[0]["copy_paths"]
     assert paths[0]["path_id"] == "cp-x"
     assert paths[0]["hops"][0]["raw"]["sinkFile"] == "app/drafts.php"
+    assert captured[0]["copy_only"] is True

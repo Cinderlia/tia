@@ -441,6 +441,7 @@ def build_pairing_queue(
                         "path_id": "cp-" + hashlib.sha1("|".join(signature).encode()).hexdigest()[:10],
                         "table": target[0],
                         "column": target[1],
+                        "read_slice_id": read_entry.slice_id,
                         "score": score,
                         "unverified_hops": unverified,
                         "copy_hops": copies,
@@ -558,6 +559,41 @@ def build_pairing_queue(
                 ],
             }
         )
+    # A copy chain is a candidate in its own right, not a fallback: the same
+    # sink can be reached through several injection methods, and a successful
+    # direct write must not hide the copy route.  The direct score is capped so
+    # that it cannot crowd the copies out of the window.
+    for copy_path in result.paths:
+        hops = list(copy_path.get("hops") or [])
+        entry_slice = str(hops[0].get("write_slice_id") or "") if hops else ""
+        if not entry_slice:
+            continue
+        digest = hashlib.sha1(
+            f"{run_id}|copy|{copy_path.get('path_id')}|{entry_slice}".encode()
+        ).hexdigest()[:10]
+        ranked.append(
+            {
+                "item_id": f"iq-cp-{digest}",
+                "kind": "copy",
+                "write_slice_id": entry_slice,
+                "read_slice_id": str(copy_path.get("read_slice_id") or ""),
+                "pair_id": str(copy_path.get("path_id") or ""),
+                "table": str(copy_path.get("table") or ""),
+                "columns": [str(copy_path.get("column") or "")],
+                "score": int(copy_path.get("score") or 60),
+                "direction": "copy_path",
+                "reasons": [
+                    f"copy path with {copy_path.get('copy_hops')} copy hop(s)"
+                    f", {copy_path.get('unverified_hops')} unverified"
+                ],
+                "copy_paths": [copy_path],
+                "alternates": [],
+            }
+        )
+    for item in ranked:
+        if item.get("kind") != "copy":
+            item["kind"] = "direct"
+            item["score"] = min(int(item["score"]), 74)
     ranked.sort(key=lambda item: (-int(item["score"]), item["item_id"]))
     # Adaptive bar: with plenty of good candidates the queue keeps only
     # confident pairs; when the supply is thin, lower-scored pairs are kept

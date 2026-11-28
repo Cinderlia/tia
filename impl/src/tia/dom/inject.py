@@ -416,6 +416,7 @@ async def _run_inject(
     feedback: str = "",
     shape_hint: str = "",
     copy_paths: list[dict[str, Any]] | None = None,
+    copy_only: bool = False,
 ) -> InjectResult:
     kernel = Kernel(
         profile="inject", budget=budget, client=client or LocalToolClient(profile="inject")
@@ -900,11 +901,49 @@ async def _run_inject(
             armed = True
         except ToolCallError as exc:
             notes["probe_error"] = str(exc.envelope.error.message if exc.envelope.error else exc)
+    copy_delivery: dict[str, Any] | None = None
+    if copy_only and copy_paths:
+        chain_path = next((path for path in copy_paths if path.get("hops")), None)
+        if chain_path is not None:
+            from tia.dom.copy_run import run_copy_chain
+
+            notes["copy_path_id"] = str(chain_path.get("path_id") or "")
+            chain = await run_copy_chain(
+                call,
+                case_id=result.case_id,
+                copy_path=chain_path,
+                base_url=base_url,
+                payload=payload,
+                tag=tag,
+            )
+            notes["copy_hops"] = chain["hops"]
+            if chain["ok"]:
+                copy_delivery = {
+                    "accepted": True,
+                    "probed": True,
+                    "stored": int(chain["stored"] or 0),
+                    "submitted": dict(chain["submitted"] or {}),
+                }
+                notes["write_signal"] = "copy_path"
+                target["columns"] = list(
+                    dict.fromkeys(
+                        [
+                            *[str(column) for column in target.get("columns") or []],
+                            *[
+                                str(hop.get("column") or "")
+                                for hop in chain_path.get("hops") or []
+                                if hop.get("column")
+                            ],
+                        ]
+                    )
+                )
+            else:
+                notes["copy_failure"] = chain["failed_kind"]
     delivery_page_url = (
         forms[0].action if notes.get("entry_fallback") == "endpoint" else base_url
     )
     entry_method = "GET" if notes.get("entry_method") == "GET" else "POST"
-    delivery = await deliver(
+    delivery = None if (copy_only and copy_paths) else await deliver(
         client=LlmClient.from_env(),
         goal=(
             "submit this form so the application stores the payload as a record of "
@@ -937,8 +976,9 @@ async def _run_inject(
         ),
         schema=schema_text,
     )
-    notes["write_attempts"] = [item.to_dict() for item in delivery.attempts]
-    if delivery.plan is not None:
+    if delivery is not None:
+        notes["write_attempts"] = [item.to_dict() for item in delivery.attempts]
+    if delivery is not None and delivery.plan is not None:
         notes["request_plan"] = delivery.plan.to_dict()
         if delivery.plan.warnings:
             notes["request_plan_warnings"] = delivery.plan.warnings
@@ -962,24 +1002,39 @@ async def _run_inject(
             "fields": dict(form.fields),
             "planned_by": delivery.plan.source,
         }
-    probed = armed and delivery.last is not None and bool(delivery.last.probe_hit)
-    stored = 0
-    if delivery.last is not None and int(delivery.last.status or 0) < 400 and not probed:
-        # The application may write a different statement than the modelled one
-        # (or a new row); look for the tag in the stored data instead.
-        try:
-            stored = await _count_tagged_rows(kernel, str(target["table"]), tag)
-        except ToolCallError:
-            stored = 0
-    accepted = (
-        delivery.last is not None
-        and int(delivery.last.status or 0) < 400
-        and (not armed or probed or stored > 0)
-    )
+    if copy_delivery is not None:
+        probed = True
+        stored = int(copy_delivery["stored"] or 0)
+        submitted = dict(copy_delivery["submitted"] or {})
+        accepted = True
+    else:
+        probed = armed and delivery is not None and delivery.last is not None and bool(
+            delivery.last.probe_hit
+        )
+        stored = 0
+        if (
+            delivery is not None
+            and delivery.last is not None
+            and int(delivery.last.status or 0) < 400
+            and not probed
+        ):
+            # The application may write a different statement than the modelled
+            # one (or a new row); look for the tag in the stored data instead.
+            try:
+                stored = await _count_tagged_rows(kernel, str(target["table"]), tag)
+            except ToolCallError:
+                stored = 0
+        accepted = (
+            delivery is not None
+            and delivery.last is not None
+            and int(delivery.last.status or 0) < 400
+            and (not armed or probed or stored > 0)
+        )
     notes["write_signal"] = (
         "probe" if probed else ("db_read" if stored > 0 else ("status" if not armed else "none"))
     )
-    submitted = dict((delivery.last.extra.get("raw") if delivery.last else {}) or {})
+    if copy_delivery is None and delivery is not None:
+        submitted = dict((delivery.last.extra.get("raw") if delivery.last else {}) or {})
     if not accepted and sent_values and target.get("table"):
         # The application's INSERT may need rows it never created (a parent key,
         # a non-null scope column).  Resolve them once and send the same request.
@@ -987,10 +1042,10 @@ async def _run_inject(
         if plan is not None:
             try:
                 retry = await _send(
-                    delivery.plan.method if delivery.plan else "POST",
+                    delivery.plan.method if delivery is not None and delivery.plan else "POST",
                     dict(sent_values),
                     {},
-                    delivery.plan.account if delivery.plan else "",
+                    delivery.plan.account if delivery is not None and delivery.plan else "",
                 )
             except ToolCallError as exc:
                 notes["state_probe_retry_error"] = f"{exc.code.value}: {exc.message}"
@@ -1012,9 +1067,9 @@ async def _run_inject(
                     accepted = True
                     stored = retry_stored or 1
                     notes["write_signal"] = "probe" if retry_probed else "db_read"
-    if delivery.last is not None and not submitted:
+    if delivery is not None and delivery.last is not None and not submitted:
         submitted = {"http": {"status": delivery.last.status, "html": delivery.last.html}}
-    if not accepted and copy_paths:
+    if not accepted and copy_paths and not copy_only:
         # A direct write cannot carry the marker; walk the copy chain instead:
         # the entry hop stores the payload, later hops make the application
         # copy it into the column the read path renders.
@@ -1408,7 +1463,7 @@ async def _run_inject(
             },
         )
         notes["verify_on"] = "probe_page"
-        notes["verify_attempts"] = [{"values": dict(delivery.plan.values) if delivery.plan else {}, "source": "probe_page",
+        notes["verify_attempts"] = [{"values": dict(delivery.plan.values) if delivery is not None and delivery.plan else {}, "source": "probe_page",
                                      "found": bool(verify.get("found"))}]
     elif read_channel != "sql_probe" and verify_url and verify_url != form.action:
         entry_method = str((verify_entry or {}).get("method") or "GET").upper()
@@ -1694,7 +1749,11 @@ async def _run_inject(
     if executable and verify is not None and read_channel != "sql_probe":
         try:
             if notes.get("verify_on") == "probe_page":
-                page_values = dict(delivery.plan.values) if delivery.plan else {}
+                page_values = (
+                    dict(delivery.plan.values)
+                    if delivery is not None and delivery.plan
+                    else {}
+                )
                 method, target_url, fields = "POST", form.action, page_values
             else:
                 attempts = notes.get("verify_attempts") or []
@@ -1774,6 +1833,7 @@ async def run_inject(
     feedback: str = "",
     shape_hint: str = "",
     copy_paths: list[dict[str, Any]] | None = None,
+    copy_only: bool = False,
 ) -> InjectResult:
     """Run the inject agent and always remove the rows it wrote through the app.
 
@@ -1803,6 +1863,7 @@ async def run_inject(
             feedback=feedback,
             shape_hint=shape_hint,
             copy_paths=copy_paths,
+            copy_only=copy_only,
         )
     finally:
         state = _ACTIVE_CLEANUP.get()

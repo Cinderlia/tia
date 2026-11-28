@@ -538,6 +538,7 @@ async def walk_injection_queue(
             constraint_plan=constraint_plan,
             pair_candidates=pair_map,
             copy_paths=copy_paths,
+            copy_only=item.get("kind") == "copy",
         )
         if (
             len(hints) > 1
@@ -563,6 +564,7 @@ async def walk_injection_queue(
                     constraint_plan=constraint_plan,
                     pair_candidates=pair_map,
                     copy_paths=copy_paths,
+                    copy_only=item.get("kind") == "copy",
                 )
                 inject.notes["alternate_attempt"] = {
                     "slice_id": hints[1]["alternate_write_slice_id"],
