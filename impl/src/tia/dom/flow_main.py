@@ -263,17 +263,31 @@ async def run_flow_queue(
         read_url = url_for(target_raw) if url_for is not None else base_url
         started = time.monotonic()
         if flow.get("family") == "direct":
-            # First-order flows have no database step: the direct agent delivers
-            # the payload straight to the page and verifies the reflection.
+            # First-order flows have no database step. A sink class that never
+            # persists a payload is proved through the request itself, exactly
+            # as the trigger agent does; only storing sinks go to the direct agent.
+            sink_class = sink_class_for(str(target_raw.get("kind") or "Xss"))
             try:
-                direct = await run_direct(
-                    target_raw,
-                    base_url=read_url,
-                    payload_base=payload_base,
-                    budget=min(budget, 40),
-                    client=inject_client,
-                    slice_id=str(flow["target_slice_id"]),
-                )
+                if not sink_class.writes_database():
+                    from tia.dom.request_prover import run_request_prover
+
+                    direct = await run_request_prover(
+                        target_raw,
+                        base_url=read_url,
+                        payload_base=payload_base,
+                        budget=min(budget, 40),
+                        client=inject_client,
+                        slice_id=str(flow["target_slice_id"]),
+                    )
+                else:
+                    direct = await run_direct(
+                        target_raw,
+                        base_url=read_url,
+                        payload_base=payload_base,
+                        budget=min(budget, 40),
+                        client=inject_client,
+                        slice_id=str(flow["target_slice_id"]),
+                    )
             except Exception as exc:  # noqa: BLE001 - keep the queue alive
                 store.archive_flow(str(flow["flow_id"]), "failed", "ERROR", notes={"error": str(exc)})
                 continue

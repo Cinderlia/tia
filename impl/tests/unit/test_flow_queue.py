@@ -288,3 +288,47 @@ async def test_request_only_flow_ends_at_the_prover(tmp_path, _runtime) -> None:
     assert [outcome.verdict for outcome in result.outcomes] == ["EXECUTED"]
     assert inject.calls == []
     assert store.list_flow_jobs("run-sql")[0]["status"] == "reported"
+
+
+SQLI_READ_SLICE = {
+    "kind": "SqlRead",
+    "sinkFile": "home.php",
+    "sinkLine": 61,
+    "sinkCode": "SELECT * FROM caffaine WHERE itemname LIKE '%\".$search.\"%'",
+    "params": ["search"],
+    "sqlProbe": {"extensionConfig": {"file": "home.php", "line": "61"}},
+}
+
+
+@pytest.mark.asyncio
+async def test_direct_flow_with_a_sql_read_sink_uses_the_request_prover(
+    tmp_path, _runtime
+) -> None:
+    store = Store(tmp_path / "tia.db")
+    read_id = store.insert_site(
+        "run-sqldir",
+        SQLI_READ_SLICE,
+        family="direct",
+        chain="sqlread-direct",
+        role=READ,
+        identity="home.php:61:read",
+        score=70,
+        reasons=[],
+        digest={},
+    )
+    flow = build_flows([_site(SQLI_READ_SLICE, READ, "caffaine", ("itemname",), score=70)])[0]
+    flow = flow.__class__(
+        **{**flow.__dict__, "target_slice_id": read_id, "writer_slice_ids": []}
+    )
+    store.seed_flows("run-sqldir", [flow.to_row()])
+
+    prover = ProvingSqliClient()
+    inject = ExplodingInjectClient()
+    result = await run_flow_queue(
+        store, "http://app/home.php", "run-sqldir", trigger_client=prover, inject_client=inject
+    )
+
+    assert result.stop_reason == "DONE"
+    assert [outcome.verdict for outcome in result.outcomes] == ["EXECUTED"]
+    assert inject.calls == []
+    assert "probe_run" in prover.calls
