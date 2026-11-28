@@ -26,6 +26,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
+from tia.inf.pair_cache import PairCache, fingerprint
 from tia.orch.identity import identity_of
 from tia.orch.identity import write_identity as write_identity_of
 from tia.orch.pairing import (
@@ -119,6 +120,36 @@ def _has_sink(raw: dict[str, Any]) -> bool:
         str(raw.get("sinkFile") or (sink.get("file") if isinstance(sink, dict) else "") or "").strip()
     )
 
+
+
+def _ops_payload(ops: list[DbOp]) -> list[dict[str, Any]]:
+    return [
+        {
+            "op": op.op,
+            "table": op.table,
+            "columns": list(op.columns),
+            "has_where": op.has_where,
+            "sql": op.sql,
+        }
+        for op in ops
+    ]
+
+
+def _ops_from_payload(items: Any) -> list[DbOp]:
+    ops: list[DbOp] = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        ops.append(
+            DbOp(
+                op=str(item.get("op") or ""),
+                table=str(item.get("table") or ""),
+                columns=tuple(str(c) for c in item.get("columns") or ()),
+                has_where=bool(item.get("has_where")),
+                sql=str(item.get("sql") or ""),
+            )
+        )
+    return ops
 
 
 def _pair_candidates(
@@ -223,6 +254,7 @@ def build_pairing_queue(
     reader: Reader | None = None,
     modeler: DbOpModeler | None = None,
     config: PairingConfig | None = None,
+    cache: PairCache | None = None,
 ) -> PairingResult:
     """Pair proven trigger slices with injection slices; persists a ranked queue.
 
@@ -232,6 +264,7 @@ def build_pairing_queue(
     trigger stage; their ids are reused so evidence stays linked.
     """
     cfg = config or PairingConfig()
+    cache = cache or PairCache(store)
     result = PairingResult(run_id=run_id)
 
     # R0: the trigger proof is the precondition; no proof means no queue.
@@ -290,12 +323,18 @@ def build_pairing_queue(
             if not window:
                 continue
             text = "\n".join(line for _, line in window)
-            ops = extract_ops(text)
-            if not ops and modeler is not None:
-                try:
-                    ops = list(modeler(text))
-                except Exception:  # noqa: BLE001 - the modeler is best-effort
-                    ops = []
+            window_key = fingerprint(text)
+            cached = cache.get("window", window_key)
+            if cached is not None:
+                ops = _ops_from_payload(cached)
+            else:
+                ops = extract_ops(text)
+                if not ops and modeler is not None:
+                    try:
+                        ops = list(modeler(text))
+                    except Exception:  # noqa: BLE001 - the modeler is best-effort
+                        ops = []
+                cache.put("window", window_key, _ops_payload(ops))
             if ops:
                 entry.ops = merge_ops(ops, entry.ops)
                 modelled += 1
@@ -485,5 +524,6 @@ def build_pairing_queue(
         "modeled": result.n_modeled,
         "deduped_pairs": len(pairs) - len(groups),
         "skipped_concluded": skipped_concluded,
+        "pair_cache": cache.stats(),
     }
     return result

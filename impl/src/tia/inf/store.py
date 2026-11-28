@@ -211,6 +211,12 @@ CREATE TABLE IF NOT EXISTS learning (
     updated_at TEXT NOT NULL,
     UNIQUE(signature, attribute, value)
 );
+CREATE TABLE IF NOT EXISTS pair_cache (
+    key        TEXT PRIMARY KEY,
+    kind       TEXT NOT NULL,
+    payload    TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS state_plan (
     case_id          TEXT PRIMARY KEY,
     table_name       TEXT NOT NULL DEFAULT '',
@@ -349,6 +355,37 @@ class Store:
                 " report=COALESCE(?, report), status='closed', updated_at=? WHERE id=?",
                 (verdict, ceiling, report, now_iso(), case_id),
             )
+
+    def get_pair_cache(self, key: str) -> Any | None:
+        """Cached pure-function result (window parse, slice model, pair decision)."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT payload FROM pair_cache WHERE key=?", (key,)
+            ).fetchone()
+        return json.loads(row["payload"]) if row is not None else None
+
+    def set_pair_cache(self, key: str, kind: str, payload: Any) -> None:
+        now = now_iso()
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO pair_cache (key, kind, payload, updated_at) VALUES (?,?,?,?)
+                   ON CONFLICT(key) DO UPDATE SET
+                     kind=excluded.kind, payload=excluded.payload, updated_at=excluded.updated_at""",
+                (key, kind, json.dumps(payload, ensure_ascii=False, default=str), now),
+            )
+
+    def prune_pair_cache(self, keep: int = 50000) -> int:
+        """Drop the oldest keys beyond ``keep``; returns the number of rows removed."""
+        with self._conn() as conn:
+            total = int(conn.execute("SELECT COUNT(*) AS n FROM pair_cache").fetchone()["n"])
+            extra = max(0, total - keep)
+            if extra:
+                conn.execute(
+                    "DELETE FROM pair_cache WHERE key IN ("
+                    " SELECT key FROM pair_cache ORDER BY updated_at ASC LIMIT ?)",
+                    (extra,),
+                )
+        return extra
 
     def save_state_plan(self, case_id: str, plan: dict[str, Any]) -> None:
         """Store the latest state probe plan for a case (one row per case)."""
