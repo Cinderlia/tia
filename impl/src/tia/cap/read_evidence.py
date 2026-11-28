@@ -141,6 +141,10 @@ async def collect_read_sql(
         },
     )
     result["trace_id"] = str(trace.get("trace_id") or "")
+    from tia.cap.trace_view import slice_trace
+
+    entries = trace.get("entries") or []
+    result["trace"] = slice_trace(entries, sink_file=sink_file, sink_line=sink_line)
     executed: dict[str, list[int]] = {}
     for entry in trace.get("entries") or []:
         name = str(entry.get("file") or "")

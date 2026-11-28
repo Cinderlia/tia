@@ -129,6 +129,7 @@ async def plan_action(
     route_evidence: list[dict[str, Any]] | None = None,
     app_url: str = "",
     action_stem: str = "",
+    trace: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Let the model choose candidate action URLs; the caller validates them."""
 
@@ -158,6 +159,7 @@ async def plan_action(
             "action_source": writer_code[-4000:],
             "route_evidence": route_evidence or [],
             "switchable_users": users,
+            "executed_trace": trace or {},
         },
         ensure_ascii=False,
     )
@@ -206,6 +208,7 @@ async def build_steps(
     *,
     read_raw: dict[str, Any] | None = None,
     read_sql: str = "",
+    read_trace: dict[str, Any] | None = None,
     planner: Any | None = None,
 ) -> dict[str, Any]:
     """One constraint step per read predicate whose column a write slice sets."""
@@ -345,6 +348,7 @@ async def build_steps(
                     route_evidence=evidence,
                     app_url=app_url,
                     action_stem=stem,
+                    trace=read_trace,
                 )
                 if planned.get("urls"):
                     replay_urls = list(planned["urls"])

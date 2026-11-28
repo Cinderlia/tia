@@ -18,6 +18,8 @@ from tia.ad.llm import LlmClient
 from tia.cap.domscan import echo_snapshot
 from tia.cap.forms import PageForm
 from tia.cap.request_plan import PlannedRequest, plan_request
+from tia.cap.trace import diff_entries
+from tia.cap.trace_view import diff_view
 
 _PAGE_ERROR = re.compile(
     r"(fatal error|parse error|warning|error|invalid|required|missing|"
@@ -30,6 +32,7 @@ Send = Callable[
 ]
 _LOGIN_FORM = re.compile(r"<input[^>]+type=[\"']?password", re.IGNORECASE)
 Accept = Callable[["DeliveryAttempt", dict[str, Any]], Awaitable[bool]]
+TraceProbe = Callable[["DeliveryAttempt"], Awaitable[dict[str, Any]]]
 
 
 @dataclass
@@ -38,6 +41,7 @@ class DeliveryAttempt:
 
     round: int
     method: str
+    url: str = ""
     values: dict[str, str] = field(default_factory=dict)
     files: dict[str, str] = field(default_factory=dict)
     payload: str = ""
@@ -55,6 +59,7 @@ class DeliveryAttempt:
         return {
             "round": self.round,
             "method": self.method,
+            "url": self.url,
             "values": self.values,
             "files": self.files,
             "payload": self.payload,
@@ -151,10 +156,15 @@ async def deliver(
     send: Send,
     accept: Accept,
     accounts: list[dict[str, Any]] | None = None,
+    trace: dict[str, Any] | None = None,
+    trace_probe: TraceProbe | None = None,
 ) -> Delivery:
     """Plan and send a request, replanning with the failure as feedback."""
 
     delivery = Delivery()
+    trace_view: dict[str, Any] | None = trace
+    trace_diff: dict[str, Any] | None = None
+    baseline_raw: list[Any] | None = None
     rounds = max(1, max_rounds)
     for round_index in range(rounds):
         plan = await plan_request(
@@ -173,6 +183,8 @@ async def deliver(
             fallback_fields=fallback_fields,
             fallback_method=fallback_method,
             accounts=accounts,
+            trace=trace_view,
+            trace_diff=trace_diff,
         )
         if plan is None:
             return delivery
@@ -187,6 +199,7 @@ async def deliver(
         attempt = DeliveryAttempt(
             round=round_index,
             method=plan.method,
+            url=plan.url,
             values=values,
             files=files,
             payload=plan.payload or payload,
@@ -235,6 +248,25 @@ async def deliver(
             )
         if snapshot:
             observation = f"{observation}\n\nECHO AROUND TAG (only the markup wrapping it):\n{snapshot}"
+        if trace_probe is not None:
+            try:
+                probe = await trace_probe(attempt)
+            except Exception:  # noqa: BLE001 - trace evidence is optional
+                probe = None
+            view = (probe or {}).get("slice") or None
+            raw = (probe or {}).get("raw") or None
+            if view:
+                attempt.extra["trace"] = view
+                if trace_view is None:
+                    trace_view = view
+                    baseline_raw = raw
+                elif baseline_raw and raw:
+                    try:
+                        trace_diff = diff_view(
+                            diff_entries(baseline_raw, raw, max_regions=8)
+                        )
+                    except Exception:  # noqa: BLE001
+                        trace_diff = None
     last_plan = delivery.plan
     if last_plan is not None and last_plan.payload_field:
         values = {last_plan.payload_field: last_plan.payload or payload}

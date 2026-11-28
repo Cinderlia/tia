@@ -36,6 +36,7 @@ from tia.cap.entry import (
 )
 from tia.cap.forms import FormField, PageForm, find_form, forms_from_document
 from tia.cap.request_plan import plan_request
+from tia.cap.trace_view import make_trace_probe
 from tia.dom.trigger import StageRecord
 from tia.inf.accounts import public_catalog
 from tia.inf.reports import write_case_report
@@ -705,6 +706,9 @@ async def _run_inject(
         send=_send,
         accept=_accept,
         accounts=public_catalog(get_runtime().settings.accounts_path),
+        trace_probe=make_trace_probe(
+            call, case_id=result.case_id, file=read_file, line=read_line
+        ),
     )
     notes["write_attempts"] = [item.to_dict() for item in delivery.attempts]
     if delivery.plan is not None:

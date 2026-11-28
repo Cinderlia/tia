@@ -34,6 +34,7 @@ from tia.cap.forms import (
     forms_from_formparse,
     merge_forms,
 )
+from tia.cap.trace_view import make_trace_probe
 from tia.dom.trigger import _POST_VAR_RE, StageRecord, TriggerResult, normalize_slice
 from tia.inf.accounts import public_catalog
 from tia.inf.reports import write_case_report
@@ -215,6 +216,9 @@ async def run_direct(
         send=_send,
         accounts=public_catalog(get_runtime().settings.accounts_path),
         accept=_accept,
+        trace_probe=make_trace_probe(
+            kernel.call, case_id=case_id, file=file, line=line
+        ),
     )
     notes["delivery"] = {
         "plan": delivery.plan.to_dict() if delivery.plan is not None else None,

@@ -77,6 +77,8 @@ def _prompt(
     tag: str = "",
     sink: str = "",
     accounts: list[dict[str, Any]] | None = None,
+    trace: dict[str, Any] | None = None,
+    trace_diff: dict[str, Any] | None = None,
 ) -> str:
     shape = []
     for index, item in enumerate(forms):
@@ -118,6 +120,24 @@ def _prompt(
             "this identity cannot finish the action:\n"
             f"{json.dumps(rows, ensure_ascii=False)[:2500]}\n"
         )
+    trace_block = ""
+    if trace and trace.get("entries"):
+        from tia.cap.trace_view import render_trace
+
+        trace_block = (
+            "EXECUTED TRACE (directed and bounded: depth + function + file:line + opcode; "
+            "this is what the target really ran for the last request):\n"
+            f"{render_trace(trace)}\n"
+        )
+    diff_block = ""
+    if trace_diff:
+        from tia.cap.trace_view import render_diff
+
+        diff_block = (
+            "TRACE DIVERGENCE FROM THE BASELINE REQUEST (use it to see which branch "
+            "the failed request missed):\n"
+            f"{render_diff(trace_diff)}\n"
+        )
     return (
         f"GOAL: {goal}\n"
         f"PAGE: {page_url}\n"
@@ -125,6 +145,8 @@ def _prompt(
         f"HINT: {hint}\n"
         f"STORAGE COLUMNS: {constraints[:1200]}\n"
         f"SLICE SINK (build the payload for THIS context, not for any SQL nearby): {sink[:1500]}\n"
+        f"{trace_block}"
+        f"{diff_block}"
         f"LAST ATTEMPT OBSERVATION: {observation[:800]}\n"
         f"TAG: {tag}\n"
         f"PAYLOAD SEED: {payload!r}\n"
@@ -177,6 +199,8 @@ async def plan_request(
     fallback_fields: dict[str, str] | None = None,
     fallback_method: str = "POST",
     accounts: list[dict[str, Any]] | None = None,
+    trace: dict[str, Any] | None = None,
+    trace_diff: dict[str, Any] | None = None,
 ) -> PlannedRequest | None:
     """Ask the model for a request plan; validate it; fall back to a local fill."""
     allowed = {entry.name for form in forms for entry in form.fields}
@@ -196,6 +220,8 @@ async def plan_request(
                 html=html,
                 tag=tag,
                 accounts=accounts,
+                trace=trace,
+                trace_diff=trace_diff,
             ),
         )
         url = str(reply.get("url") or "")

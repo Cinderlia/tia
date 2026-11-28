@@ -374,6 +374,7 @@ async def run_flow_queue(
                 return dict(data or {})
 
             read_sql = ""
+            read_trace: dict[str, Any] = {}
             if not plan.get("constraints"):
                 # The template shows a row; the query that selected it lives one
                 # level up. Trace points at the executed lines and the probe
@@ -389,6 +390,9 @@ async def run_flow_queue(
                     )
                     notes["read_trace"] = evidence.get("trace_id") or ""
                     notes["read_executed"] = evidence.get("executed") or {}
+                    read_trace = evidence.get("trace") or {}
+                    if read_trace.get("entries"):
+                        notes["read_trace_slice"] = read_trace
                     statements = evidence.get("statements") or []
                     if statements:
                         read_sql = str(statements[0])
@@ -431,6 +435,7 @@ async def run_flow_queue(
                         public_catalog(get_runtime().settings.accounts_path),
                         read_raw=target_raw,
                         read_sql=read_sql,
+                        read_trace=read_trace,
                         planner=planner,
                     )
             entry = _read_entry_for(reader, target_raw)
