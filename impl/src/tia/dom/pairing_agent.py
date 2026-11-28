@@ -34,11 +34,14 @@ from tia.orch.pairing import (
     Reader,
     SliceEntry,
     build_pairs,
+    build_write_index,
     extract_ops,
     group_by_slice,
     merge_ops,
     pair_id_for,
+    path_stats,
     resolve_entry,
+    resolve_paths,
 )
 from tia.orch.slicing import score_slice
 
@@ -86,6 +89,7 @@ class PairingResult:
     queue: list[dict[str, Any]] = field(default_factory=list)
     seeded_ids: list[str] = field(default_factory=list)
     capped: bool = False
+    paths: list[dict[str, Any]] = field(default_factory=list)
     notes: dict[str, Any] = field(default_factory=dict)
 
 
@@ -120,6 +124,19 @@ def _has_sink(raw: dict[str, Any]) -> bool:
         str(raw.get("sinkFile") or (sink.get("file") if isinstance(sink, dict) else "") or "").strip()
     )
 
+
+
+def _sink_targets(entry: SliceEntry) -> list[tuple[str, str]]:
+    """Columns a proven read slice renders, i.e. the targets a copy path must reach."""
+    targets: list[tuple[str, str]] = []
+    for op in entry.ops:
+        if op.op != "select" or not op.table:
+            continue
+        for column in op.columns:
+            key = (op.table, column)
+            if key not in targets:
+                targets.append(key)
+    return targets
 
 
 def _ops_payload(ops: list[DbOp]) -> list[dict[str, Any]]:
@@ -402,6 +419,47 @@ def build_pairing_queue(
         )
     )
 
+    # R3.5: copy paths, expanded on demand for the proven read columns only.
+    # A copy edge whose write was already proven does not consume a hop, so a
+    # previously proven entry path is reused for free.
+    write_index = build_write_index(entries)
+    copy_paths: list[dict[str, Any]] = []
+    seen_paths: set[tuple[str, ...]] = set()
+    for read_entry in entries[:read_count]:
+        for target in _sink_targets(read_entry):
+            for path in resolve_paths(write_index, target[0], target[1]):
+                copy_hops = [edge for edge in path if edge.is_copy]
+                if len(path) < 2 or not copy_hops:
+                    continue
+                signature = tuple(edge.edge_id for edge in path)
+                if signature in seen_paths:
+                    continue
+                seen_paths.add(signature)
+                score, unverified, copies = path_stats(path)
+                copy_paths.append(
+                    {
+                        "path_id": "cp-" + hashlib.sha1("|".join(signature).encode()).hexdigest()[:10],
+                        "table": target[0],
+                        "column": target[1],
+                        "score": score,
+                        "unverified_hops": unverified,
+                        "copy_hops": copies,
+                        "hops": [
+                            {
+                                "write_slice_id": edge.entry.slice_id,
+                                "table": edge.table,
+                                "column": edge.column,
+                                "is_copy": edge.is_copy,
+                                "read_table": edge.read_table,
+                                "read_columns": list(edge.read_columns),
+                            }
+                            for edge in path
+                        ],
+                    }
+                )
+    copy_paths.sort(key=lambda item: (-int(item["score"]), int(item["unverified_hops"]), item["path_id"]))
+    result.paths = copy_paths[:10]
+
     # R4: fold duplicate slices into one candidate each, keep the rest as
     # alternates, then rank and cap the queue.
     write_identity: dict[str, str] = {}
@@ -525,5 +583,6 @@ def build_pairing_queue(
         "deduped_pairs": len(pairs) - len(groups),
         "skipped_concluded": skipped_concluded,
         "pair_cache": cache.stats(),
+        "copy_paths": len(result.paths),
     }
     return result

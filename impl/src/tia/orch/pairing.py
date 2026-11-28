@@ -418,3 +418,149 @@ def group_by_slice(pairs: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]
         for side in ("read_slice_id", "write_slice_id"):
             grouped.setdefault(str(pair[side]), []).append(pair)
     return grouped
+
+# ---------------------------------------------------------------------------
+# Copy paths: the same "who writes this column" query, applied recursively.
+# A write that derives its value from a read (SQL-level ``INSERT ... SELECT``
+# or an application-level read-then-write) is a *copy edge*; a copy that has
+# already been proven in a previous run does not consume the hop budget.
+# ---------------------------------------------------------------------------
+
+_SELECT_IN_WRITE = re.compile(r"\bselect\b(?P<cols>.*?)\bfrom\b\s*`?(?P<table>[A-Za-z_][\w.$]*)`?", re.I | re.S)
+_SET_QUALIFIED = re.compile(r"\bset\b(?P<body>.*?)(?:\bwhere\b|$)", re.I | re.S)
+_QUALIFIED = re.compile(r"\b([A-Za-z_]\w*)\.([A-Za-z_]\w*)\b")
+
+
+@dataclass(frozen=True)
+class WriteEdge:
+    """One write slice, seen as an edge into ``(table, column)``."""
+
+    entry: SliceEntry
+    table: str
+    column: str
+    read_table: str = ""
+    read_columns: tuple[str, ...] = ()
+
+    @property
+    def is_copy(self) -> bool:
+        return bool(self.read_columns)
+
+    @property
+    def edge_id(self) -> str:
+        raw = f"{self.entry.slice_id}|{self.table}.{self.column}|{'/'.join(self.read_columns)}"
+        return f"edge-{hashlib.sha1(raw.encode()).hexdigest()[:10]}"
+
+
+def copy_source(op: DbOp) -> tuple[str, tuple[str, ...]]:
+    """Columns (and their table) a write statement copies from, when visible in SQL."""
+    sql = op.sql or ""
+    select = _SELECT_IN_WRITE.search(sql)
+    if select and select.group("table"):
+        return str(select.group("table")).lower(), parse_columns(select.group("cols"))
+    body = _SET_QUALIFIED.search(sql)
+    if body:
+        columns = [
+            column.lower()
+            for table, column in _QUALIFIED.findall(body.group("body"))
+            if table.lower() != (op.table or "").lower()
+        ]
+        if columns:
+            return "", tuple(dict.fromkeys(columns))
+    return "", ()
+
+
+def write_edges(entry: SliceEntry) -> list[WriteEdge]:
+    """Edges a slice contributes: one per written column, with its copy source if any."""
+    edges: list[WriteEdge] = []
+    selects = [op for op in entry.ops if op.op == "select"]
+    fallback_table = selects[0].table if selects else ""
+    fallback_columns = tuple(column for op in selects for column in op.columns)
+    for op in entry.ops:
+        if op.op not in {"insert", "update", "write"} or not op.table:
+            continue
+        read_table, read_columns = copy_source(op)
+        if not read_columns and fallback_columns:
+            read_table, read_columns = fallback_table, fallback_columns
+        for column in op.columns:
+            edges.append(WriteEdge(entry, op.table, column, read_table, read_columns))
+    return edges
+
+
+def build_write_index(entries: Iterable[SliceEntry]) -> dict[tuple[str, str], list[WriteEdge]]:
+    """``(table, column)`` → the edges that can write it. One linear pass, no pairing."""
+    index: dict[tuple[str, str], list[WriteEdge]] = {}
+    seen: set[tuple[str, str, str]] = set()
+    for entry in entries:
+        for edge in write_edges(entry):
+            key = (edge.table, edge.column)
+            marker = (entry.slice_id, edge.table, edge.column)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            index.setdefault(key, []).append(edge)
+    return index
+
+
+def resolve_paths(
+    index: dict[tuple[str, str], list[WriteEdge]],
+    table: str,
+    column: str,
+    *,
+    max_unverified: int = 2,
+    max_columns: int = 50,
+    verified: frozenset[str] = frozenset(),
+) -> list[list[WriteEdge]]:
+    """Paths from a request entry to ``(table, column)``, on demand.
+
+    Recursion is the pairing query; only columns actually asked for are
+    expanded. Verified copy edges cost no hop, so a proven write is reused
+    for free.
+    """
+    memo: dict[tuple[str, str, int, frozenset[tuple[str, str]]], list[list[WriteEdge]]] = {}
+    budget = [max_columns]
+
+    def walk(
+        target_table: str,
+        target_column: str,
+        depth: int,
+        seen: frozenset[tuple[str, str]],
+    ) -> list[list[WriteEdge]]:
+        key = (target_table, target_column, depth, seen)
+        if key in memo:
+            return [list(path) for path in memo[key]]
+        if budget[0] <= 0:
+            return []
+        budget[0] -= 1
+        paths: list[list[WriteEdge]] = []
+        for edge in index.get((target_table, target_column), []):
+            if not edge.is_copy:
+                paths.append([edge])
+                continue
+            cost = 0 if edge.edge_id in verified else 1
+            if depth + cost > max_unverified:
+                continue
+            for read_column in edge.read_columns:
+                read_key = (edge.read_table or target_table, read_column)
+                if read_key in seen:
+                    continue
+                for tail in walk(read_key[0], read_key[1], depth + cost, seen | {(target_table, target_column)}):
+                    paths.append([edge] + tail)
+        memo[key] = paths
+        return paths
+
+    found = walk(table, column, 0, frozenset())
+    unique: dict[tuple[str, ...], list[WriteEdge]] = {}
+    for path in found:
+        signature = tuple(edge.edge_id for edge in path)
+        unique.setdefault(signature, path)
+    return list(unique.values())
+
+
+def path_stats(
+    path: list[WriteEdge], *, verified: frozenset[str] = frozenset()
+) -> tuple[int, int, int]:
+    """``(score, unverified copy hops, copy hops)`` for one path."""
+    copy_hops = [edge for edge in path if edge.is_copy]
+    unverified = sum(0 if edge.edge_id in verified else 1 for edge in copy_hops)
+    score = 70 + 10 * (len(copy_hops) - unverified) - 8 * unverified
+    return max(0, min(100, score)), unverified, len(copy_hops)
