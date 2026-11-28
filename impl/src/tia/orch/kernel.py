@@ -118,7 +118,10 @@ class Kernel:
                 )
             self.used += 1
 
-        envelope = await self.client.call(tool, args)
+        from tia.inf.calllog import case_scope
+
+        with case_scope(self.case_id or ""):
+            envelope = await self.client.call(tool, args)
         if not envelope.ok:
             self.trace.append(
                 StepRecord(

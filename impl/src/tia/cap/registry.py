@@ -478,7 +478,40 @@ async def dispatch(
     name: str,
     arguments: dict[str, Any] | None,
 ) -> Envelope:
-    """Execute a tool call; any failure converges to an envelope (H9)."""
+    """Execute a tool call; any failure converges to an envelope (H9).
+
+    Every call goes through here, so this is also the one place where the
+    optional call log (``TIA_TOOL_LOG``) sees all tools, whatever agent runs them.
+    """
+
+    envelope = await _dispatch(profile, name, arguments)
+    _log(profile, name, arguments, envelope)
+    return envelope
+
+
+def _log(
+    profile: str,
+    name: str,
+    arguments: dict[str, Any] | None,
+    envelope: Envelope,
+) -> None:
+    from tia.inf.calllog import log_call
+
+    log_call(
+        agent=profile,
+        tool=name,
+        ok=envelope.ok,
+        arguments=arguments,
+        data=envelope.data,
+        error=envelope.error.model_dump() if envelope.error else None,
+    )
+
+
+async def _dispatch(
+    profile: str,
+    name: str,
+    arguments: dict[str, Any] | None,
+) -> Envelope:
     started = time.perf_counter()
     spec = _BY_NAME.get(name)
     if spec is None or spec.name not in {s.name for s in tools_for_profile(profile)}:

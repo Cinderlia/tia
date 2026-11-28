@@ -53,6 +53,11 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="Model profile from config/local/llm.yaml (default: its active profile)",
     )
+    parser.add_argument(
+        "--tool-log",
+        default=None,
+        help="Append every tool call (agent, tool, time, args, first 40 chars of the result) to this file",
+    )
     sub = parser.add_subparsers(dest="command")
 
     trigger = sub.add_parser("trigger", help="Execute P0–P6 trigger forensics on the slice")
@@ -715,6 +720,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if getattr(args, "llm_profile", None):
         os.environ["TIA_LLM_PROFILE"] = args.llm_profile
+    if getattr(args, "tool_log", None):
+        os.environ["TIA_TOOL_LOG"] = args.tool_log
     if args.version:
         print(f"tia-agent {__version__}")
         return 0
