@@ -367,6 +367,17 @@ async def _probe_state(
     return plan if plan.status == "READY" else None
 
 
+def _merge_chain_columns(target: dict[str, Any], steps: list[dict[str, Any]]) -> None:
+    """Cleanup must sweep every column a chain hop writes, not only the sink column."""
+    columns = [str(column) for column in target.get("columns") or []]
+    for step in steps:
+        for column in step.get("columns") or ([step.get("column")] if step.get("column") else []):
+            text = str(column or "")
+            if text:
+                columns.append(text)
+    target["columns"] = list(dict.fromkeys(columns))
+
+
 async def _count_tagged_rows(kernel: Any, table: str, tag: str, *, max_columns: int = 8) -> int:
     """Count rows of ``table`` whose text columns already carry the tag.
 
@@ -962,6 +973,7 @@ async def _run_inject(
                 "submitted": dict(walked["submitted"] or {}),
             }
             notes["write_signal"] = "chain"
+            _merge_chain_columns(target, chain_steps)
         else:
             notes["chain_failure"] = walked["failed_kind"]
     delivery_page_url = (
@@ -1156,22 +1168,7 @@ async def _run_inject(
             stored = int(walked["stored"] or 0)
             submitted = dict(walked["submitted"] or {})
             notes["write_signal"] = "chain"
-            target["columns"] = list(
-                dict.fromkeys(
-                    [
-                        *[str(column) for column in target.get("columns") or []],
-                        *[
-                            str(column)
-                            for step in chain_steps
-                            for column in (
-                                step.get("columns")
-                                or ([step.get("column")] if step.get("column") else [])
-                            )
-                            if column
-                        ],
-                    ]
-                )
-            )
+            _merge_chain_columns(target, chain_steps)
         else:
             notes["chain_failure"] = walked["failed_kind"]
     if not accepted:

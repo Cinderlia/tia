@@ -141,6 +141,7 @@ CREATE TABLE IF NOT EXISTS injection_queue (
     score          INTEGER NOT NULL DEFAULT 0,
     direction      TEXT NOT NULL DEFAULT '',
     kind           TEXT NOT NULL DEFAULT 'direct',
+    chain          TEXT NOT NULL DEFAULT '[]',
     reasons        TEXT NOT NULL DEFAULT '[]',
     status         TEXT NOT NULL DEFAULT 'pending',
     verdict        TEXT NOT NULL DEFAULT '',
@@ -287,6 +288,7 @@ class Store:
                 ("alternates", "ALTER TABLE injection_queue ADD COLUMN alternates TEXT NOT NULL DEFAULT '[]'"),
                 ("copy_paths", "ALTER TABLE injection_queue ADD COLUMN copy_paths TEXT NOT NULL DEFAULT '[]'"),
                 ("kind", "ALTER TABLE injection_queue ADD COLUMN kind TEXT NOT NULL DEFAULT 'direct'"),
+                ("chain", "ALTER TABLE injection_queue ADD COLUMN chain TEXT NOT NULL DEFAULT '[]'"),
             ):
                 if name not in queue_columns:
                     conn.execute(ddl)
@@ -1232,9 +1234,9 @@ class Store:
             for rank, item in enumerate(items):
                 conn.execute(
                     "INSERT INTO injection_queue (item_id, run_id, rank, write_slice_id, read_slice_id,"
-                    " pair_id, table_name, columns, score, direction, kind, reasons, status,"
+                    " pair_id, table_name, columns, score, direction, kind, chain, reasons, status,"
                     " read_identity, write_identity, alternates, copy_paths, created_at, updated_at)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?,?,?)",
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?,?,?)",
                     (
                         str(item["item_id"]),
                         run_id,
@@ -1247,6 +1249,7 @@ class Store:
                         int(item.get("score") or 0),
                         str(item.get("direction") or ""),
                         str(item.get("kind") or "direct"),
+                        json.dumps(item.get("chain") or [], ensure_ascii=False),
                         json.dumps(item.get("reasons") or [], ensure_ascii=False),
                         str(item.get("read_identity") or ""),
                         str(item.get("write_identity") or ""),
@@ -1317,6 +1320,7 @@ class Store:
             "score": row["score"],
             "direction": row["direction"],
             "kind": row["kind"],
+            "chain": json.loads(row["chain"] or "[]"),
             "reasons": json.loads(row["reasons"] or "[]"),
             "status": row["status"],
             "verdict": row["verdict"],

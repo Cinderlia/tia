@@ -22,6 +22,7 @@ Stages: R0 load → R1 static extract → R2 model (source window / optional LLM
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
@@ -44,6 +45,12 @@ from tia.orch.pairing import (
     resolve_paths,
 )
 from tia.orch.slicing import score_slice
+
+#: Request parameters that usually identify the row a later hop needs.
+_ID_PARAM = re.compile(
+    r"(?:^id$|_id$|^(?:post|item|entry|record|comment|message|pid|tid)$)", re.I
+)
+
 
 _SUCCESS_VERDICTS = frozenset({"EXECUTABLE", "EXECUTED"})
 
@@ -436,6 +443,26 @@ def build_pairing_queue(
                     continue
                 seen_paths.add(signature)
                 score, unverified, copies = path_stats(path)
+                ordered = list(reversed(path))  # entry first, then the copy hops
+                steps: list[dict[str, Any]] = []
+                for index, edge in enumerate(ordered):
+                    needs: dict[str, str] = {}
+                    if index > 0:
+                        for param in edge.entry.params:
+                            if _ID_PARAM.search(param):
+                                needs[param] = f"step-{index - 1}.id"
+                    steps.append(
+                        {
+                            "write_slice_id": edge.entry.slice_id,
+                            "table": edge.table,
+                            "columns": [edge.column],
+                            "payload": index == 0,
+                            "needs": needs,
+                            "is_copy": edge.is_copy,
+                            "read_table": edge.read_table,
+                            "read_columns": list(edge.read_columns),
+                        }
+                    )
                 copy_paths.append(
                     {
                         "path_id": "cp-" + hashlib.sha1("|".join(signature).encode()).hexdigest()[:10],
@@ -445,17 +472,8 @@ def build_pairing_queue(
                         "score": score,
                         "unverified_hops": unverified,
                         "copy_hops": copies,
-                        "hops": [
-                            {
-                                "write_slice_id": edge.entry.slice_id,
-                                "table": edge.table,
-                                "column": edge.column,
-                                "is_copy": edge.is_copy,
-                                "read_table": edge.read_table,
-                                "read_columns": list(edge.read_columns),
-                            }
-                            for edge in path
-                        ],
+                        "chain": steps,
+                        "hops": steps,
                     }
                 )
     copy_paths.sort(key=lambda item: (-int(item["score"]), int(item["unverified_hops"]), item["path_id"]))
@@ -564,7 +582,7 @@ def build_pairing_queue(
     # direct write must not hide the copy route.  The direct score is capped so
     # that it cannot crowd the copies out of the window.
     for copy_path in result.paths:
-        hops = list(copy_path.get("hops") or [])
+        hops = list(copy_path.get("chain") or copy_path.get("hops") or [])
         entry_slice = str(hops[0].get("write_slice_id") or "") if hops else ""
         if not entry_slice:
             continue
@@ -574,7 +592,7 @@ def build_pairing_queue(
         ranked.append(
             {
                 "item_id": f"iq-cp-{digest}",
-                "kind": "copy",
+                "kind": "chain",
                 "write_slice_id": entry_slice,
                 "read_slice_id": str(copy_path.get("read_slice_id") or ""),
                 "pair_id": str(copy_path.get("path_id") or ""),
@@ -583,15 +601,16 @@ def build_pairing_queue(
                 "score": int(copy_path.get("score") or 60),
                 "direction": "copy_path",
                 "reasons": [
-                    f"copy path with {copy_path.get('copy_hops')} copy hop(s)"
-                    f", {copy_path.get('unverified_hops')} unverified"
+                    f"chain of {len(hops)} write slice(s)"
+                    f", {copy_path.get('unverified_hops')} unverified copy hop(s)"
                 ],
-                "copy_paths": [copy_path],
+                "chain": hops,
+                "copy_paths": [],
                 "alternates": [],
             }
         )
     for item in ranked:
-        if item.get("kind") != "copy":
+        if item.get("kind") != "chain":
             item["kind"] = "direct"
             item["score"] = min(int(item["score"]), 74)
     ranked.sort(key=lambda item: (-int(item["score"]), item["item_id"]))

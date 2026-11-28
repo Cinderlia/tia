@@ -32,19 +32,44 @@ def _step_place(step: dict[str, Any], base_url: str) -> tuple[str, str, int]:
     )
 
 
-def _step_values(step: dict[str, Any], payload: str, tag: str) -> dict[str, str]:
+def _resolve_needs(needs: dict[str, Any], emitted: dict[int, str]) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for field, ref in needs.items():
+        text = str(ref or "")
+        if text.startswith("step-") and text.endswith(".id"):
+            index = int(text[len("step-") : -len(".id")])
+            values[str(field)] = str(emitted.get(index) or "1")
+        elif text:
+            values[str(field)] = text
+    return values
+
+
+def _step_values(
+    step: dict[str, Any], payload: str, *, emitted: dict[int, str]
+) -> dict[str, str]:
     raw = dict(step.get("raw") or {})
     params = [str(item) for item in raw.get("params") or [] if str(item)]
     values = {str(k): str(v) for k, v in dict(step.get("values") or {}).items()}
+    for name in params:
+        values.setdefault(name, "1")
+    values.update(_resolve_needs(dict(step.get("needs") or {}), emitted))
     if step.get("payload"):
         if params:
             values[params[0]] = payload
         else:
             values.setdefault("tia", payload)
-    elif not values:
+    if not values:
         values = {"tia": "1"}
-    del tag
     return values
+
+
+def _emitted_id(envelope: dict[str, Any], index: int) -> str:
+    for query in envelope.get("queries") or []:
+        write = query.get("write") if isinstance(query.get("write"), dict) else {}
+        for value in (write.get("last_insert_id"), query.get("last_insert_id")):
+            if value:
+                return str(value)
+    return ""
 
 
 async def _tag_rows(
@@ -75,9 +100,10 @@ async def run_chain(
     submitted: dict[str, Any] = {}
     last_table = ""
     last_columns: list[str] = []
+    emitted: dict[int, str] = {}
     for index, step in enumerate(steps):
         url, file, line = _step_place(step, base_url)
-        values = _step_values(step, payload, tag)
+        values = _step_values(step, payload, emitted=emitted)
         table = str(step.get("table") or "")
         columns = [str(column) for column in step.get("columns") or [] if column]
         if not columns and step.get("column"):
@@ -140,6 +166,8 @@ async def run_chain(
                 stored = await _tag_rows(call, case_id, table, columns, tag)
             record["stored"] = stored
         record["ok"] = bool(hit) and (not step.get("payload") or stored > 0)
+        emitted[index] = _emitted_id(envelope, index)
+        record["emitted_id"] = emitted[index]
         submitted = envelope
         evidence.append(record)
         if not record["ok"]:

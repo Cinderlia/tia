@@ -131,8 +131,8 @@ def test_pairing_exposes_copy_paths(tmp_path) -> None:
             "kind": "xss",
             "sinkFile": "app/copy.php",
             "sinkLine": 20,
-            "sinkCode": "insert into comments (comment) select body from drafts",
-            "params": [],
+            "sinkCode": "insert into comments (comment) select body from drafts where id = :post",
+            "params": ["post"],
         },
         {
             "kind": "xss",
@@ -146,12 +146,15 @@ def test_pairing_exposes_copy_paths(tmp_path) -> None:
     assert result.paths, result.notes
     path = result.paths[0]
     assert path["table"] == "comments" and path["column"] == "comment"
-    assert path["hops"][0]["is_copy"] is True
-    assert path["hops"][-1]["is_copy"] is False
+    assert path["hops"][0]["is_copy"] is False
+    assert path["hops"][-1]["is_copy"] is True
+    assert path["hops"][0]["payload"] is True
+    assert path["hops"][-1]["payload"] is False
     queued = store.list_injection_queue("run-paths")
-    copies = [item for item in queued if item.get("kind") == "copy"]
-    assert copies, queued
-    assert copies[0]["copy_paths"][0]["path_id"] == path["path_id"]
-    assert copies[0]["write_slice_id"] == path["hops"][0]["write_slice_id"]
-    assert all(int(item["score"]) <= 74 for item in queued if item.get("kind") != "copy")
+    chains = [item for item in queued if item.get("kind") == "chain"]
+    assert chains, queued
+    assert chains[0]["chain"] == path["chain"]
+    assert chains[0]["write_slice_id"] == path["hops"][0]["write_slice_id"]
+    assert chains[0]["chain"][1]["needs"] == {"post": "step-0.id"}
+    assert all(int(item["score"]) <= 74 for item in queued if item.get("kind") != "chain")
     assert path["unverified_hops"] == 1

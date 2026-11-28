@@ -40,7 +40,15 @@ class ChainClient:
         url = str(arguments.get("url") or "")
         if url.endswith("seed.php"):
             self.a.append(str(values.get("body", [""])[0]))
-            return {"status": 200, "queries": [{"sql": "INSERT INTO a (body) VALUES (?)"}]}
+            return {
+                "status": 200,
+                "queries": [
+                    {
+                        "sql": "INSERT INTO a (body) VALUES (?)",
+                        "write": {"last_insert_id": 7},
+                    }
+                ],
+            }
         if url.endswith("transform.php"):
             if not self.a:
                 return {"status": 200, "queries": []}
@@ -120,3 +128,20 @@ async def test_chain_reports_a_step_that_did_not_run() -> None:
     assert result["ok"] is False
     assert result["failed_kind"] == CHAIN_STEP_NOT_REACHED
     assert result["hops"][0]["error"].startswith("RuntimeError")
+
+
+async def test_chain_binds_an_id_from_the_previous_step() -> None:
+    client = ChainClient()
+    steps = chain()
+    steps[1]["needs"] = {"post": "step-0.id"}
+    result = await run_chain(
+        client,
+        case_id="case-1",
+        chain=steps,
+        base_url="http://app/",
+        payload="<script>alert(1)</script>t1",
+        tag="t1",
+    )
+    assert result["ok"] is True
+    assert "post=7" in client.bodies[1]
+    assert result["hops"][0]["emitted_id"] == "7"

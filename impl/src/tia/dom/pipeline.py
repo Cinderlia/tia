@@ -439,6 +439,18 @@ async def _prepare_constraints(
     return mapping
 
 
+def _chain_with_raw(store: Any, item: dict[str, Any]) -> list[dict[str, Any]]:
+    steps: list[dict[str, Any]] = []
+    for step in item.get("chain") or []:
+        row = store.get_slice(str(step.get("write_slice_id") or ""))
+        if row is None:
+            continue
+        walked = dict(step)
+        walked["raw"] = row["slice"]
+        steps.append(walked)
+    return steps
+
+
 def _copy_paths_with_raw(
     store: Any, item: dict[str, Any], url_for: Callable[[dict[str, Any]], str] | None
 ) -> list[dict[str, Any]]:
@@ -539,7 +551,9 @@ async def walk_injection_queue(
             pair_candidates=pair_map,
             copy_paths=copy_paths,
             copy_only=item.get("kind") == "copy",
-            chain_steps=item.get("chain") or None,
+            chain_steps=(
+                _chain_with_raw(store, item) if item.get("kind") == "chain" else None
+            ),
             chain_only=item.get("kind") == "chain",
         )
         if (
@@ -567,7 +581,9 @@ async def walk_injection_queue(
                     pair_candidates=pair_map,
                     copy_paths=copy_paths,
                     copy_only=item.get("kind") == "copy",
-                    chain_steps=item.get("chain") or None,
+                    chain_steps=(
+                        _chain_with_raw(store, item) if item.get("kind") == "chain" else None
+                    ),
                     chain_only=item.get("kind") == "chain",
                 )
                 inject.notes["alternate_attempt"] = {
