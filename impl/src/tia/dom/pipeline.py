@@ -22,6 +22,12 @@ from typing import Any
 
 from tia.cap.entry import infer_read_entry
 from tia.cap.read_evidence import collect_read_sql
+from tia.cap.scoring import (
+    CANDIDATE_PROMPT,
+    CONFIRMED_SCORE,
+    compact,
+    score_records,
+)
 from tia.dom.direct import run_direct
 from tia.dom.inject import run_inject
 from tia.dom.lanes import publish_pairing, start_workers
@@ -34,12 +40,159 @@ from tia.inf.reports import RunReports
 from tia.inf.runtime import get_runtime
 from tia.orch.kernel import LocalToolClient, ToolCallError, ToolClient
 from tia.orch.learning import hints_for
+from tia.orch.slicing import score_slice, slice_digest
 from tia.schemas.objects import CaseOutcome
 from tia.sinks.registry import sink_class_for
 
 _RETRYABLE_INJECT = frozenset(
     {"WRITE_NOT_REACHED", "WRITE_NOT_REACHED_ENV", "ENV_ERROR", "TIMEOUT", "PATH_UNREACHABLE"}
 )
+
+
+def _default_scorer() -> Any | None:
+    """The LLM that turns slice facts into a prior; disabled with TIA_SLICE_SCORING=0."""
+    if os.environ.get("TIA_SLICE_SCORING", "1").strip().lower() in {"0", "off", "false", "no"}:
+        return None
+    try:
+        from tia.ad.llm import LlmClient
+
+        return LlmClient.from_env()
+    except Exception:  # noqa: BLE001 - a missing model only leaves the local prior
+        return None
+
+
+def _history_for(history: dict[str, list[str]], raw: dict[str, Any]) -> list[str]:
+    digest = slice_digest(raw)
+    key = f"{digest['sink']['file']}:{digest['sink']['line']}"
+    return list(history.get(key, []))[:5]
+
+
+def _already_ran(history: list[str]) -> bool:
+    return any(verdict in {"EXECUTED", "EXECUTABLE"} for verdict in history)
+
+
+async def _score_seeded_slices(store: Any, run_id: str, *, scorer: Any | None = None) -> int:
+    """Ask the model to score every pending slice before the consumers start.
+
+    A site that already executed is pinned at 100 without a model call; the model
+    never sees those, so it cannot overrule a fact.
+    """
+    if scorer is None:
+        return 0
+    rows = [row for row in store.list_slice_rows(run_id=run_id) if row.get("status") == "pending"]
+    if not rows:
+        return 0
+    history = store.verdict_history()
+    records: list[dict[str, Any]] = []
+    digests: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        raw = dict(row.get("slice") or {})
+        slice_id = str(row.get("id") or "")
+        digest = slice_digest(raw)
+        past = _history_for(history, raw)
+        if _already_ran(past):
+            store.set_slice_score(
+                slice_id,
+                CONFIRMED_SCORE,
+                ["100 confirmed: this site already executed in an earlier run"],
+                digest,
+            )
+            continue
+        prior = score_slice(
+            raw,
+            history=past,
+            order_mode=str(row.get("order_mode") or "second"),
+            learning=hints_for(store, raw),
+        )
+        records.append(
+            {
+                "id": slice_id,
+                "prompt": {
+                    "slice_id": slice_id,
+                    "order_mode": row.get("order_mode"),
+                    "kind": digest["kind"],
+                    "slice": compact(raw),
+                    "history": past,
+                    "learning": hints_for(store, raw),
+                    "local_prior": {"score": prior.score, "reasons": prior.reasons[:8]},
+                },
+                "fallback": {"score": prior.score, "reason": "model silent; local prior kept"},
+            }
+        )
+        digests[slice_id] = digest
+    if not records:
+        return 0
+    results = await score_records(scorer, records)
+    for slice_id, value in results.items():
+        digest_value = digests.get(slice_id)
+        if digest_value is None:
+            continue
+        store.set_slice_score(
+            slice_id,
+            int(value["score"]),
+            [f"{value['score']} ({value['band']}): {value['reason']}"],
+            digest_value,
+        )
+    return len(results)
+
+
+async def _score_pairing_candidates(
+    store: Any,
+    pairing: Any,
+    proven_raw: dict[str, Any],
+    *,
+    scorer: Any | None = None,
+) -> int:
+    """Score (read slice + write slice) candidates before they enter the lanes."""
+    if scorer is None or not getattr(pairing, "queue", None):
+        return 0
+    history = store.verdict_history()
+    records: list[dict[str, Any]] = []
+    items: dict[str, dict[str, Any]] = {}
+    for index, item in enumerate(pairing.queue):
+        candidate_id = str(item.get("item_id") or f"cand-{index}")
+        write_row = store.get_slice(str(item.get("write_slice_id") or "")) or {}
+        write_raw = dict(write_row.get("slice") or {})
+        past = _history_for(history, write_raw)
+        if _already_ran(past):
+            item["score"] = CONFIRMED_SCORE
+            item["reasons"] = list(item.get("reasons") or []) + ["100 confirmed: write site already ran"]
+            continue
+        records.append(
+            {
+                "id": candidate_id,
+                "prompt": {
+                    "candidate_id": candidate_id,
+                    "read_slice": compact(proven_raw),
+                    "write_slice": compact(write_raw),
+                    "match": {
+                        "table": item.get("table_name"),
+                        "columns": item.get("columns"),
+                        "confidence": item.get("confidence"),
+                        "direction": item.get("direction"),
+                        "reasons": list(item.get("reasons") or [])[:6],
+                    },
+                    "history": past,
+                    "local_prior": {"score": item.get("score")},
+                },
+                "fallback": {"score": item.get("score") or 0, "reason": "model silent; pairing prior kept"},
+            }
+        )
+        items[candidate_id] = item
+    if not records:
+        return 0
+    results = await score_records(scorer, records, prompt=CANDIDATE_PROMPT)
+    for candidate_id, value in results.items():
+        item = items.get(candidate_id)
+        if item is None:
+            continue
+        item["score"] = int(value["score"])
+        item["reasons"] = list(item.get("reasons") or []) + [
+            f"{value['score']} ({value['band']}): {value['reason']}"
+        ]
+    pairing.queue.sort(key=lambda entry: -int(entry.get("score") or 0))
+    return len(results)
+
 
 
 
@@ -260,6 +413,7 @@ async def _run_second_order_round(
     published: dict[str, str],
     reports: RunReports,
     reader: Any,
+    scorer: Any | None = None,
 ) -> None:
     """Trigger, second-order variant: prove the read, pair writes, publish a task."""
 
@@ -329,6 +483,9 @@ async def _run_second_order_round(
         config=PairingConfig(queue_cap=queue_cap),
     )
     record["queue_items"] = len(pairing.queue)
+    if pairing.queue:
+        proven_raw = dict((proven or {}).get("slice") or raw)
+        await _score_pairing_candidates(store, pairing, proven_raw, scorer=scorer)
     if not pairing.queue:
         record["stopped_at"] = "pairing"
         finding_db_only(store, trigger.case_id)
@@ -387,6 +544,7 @@ async def run_trigger_round(
     published: dict[str, str],
     reports: RunReports,
     reader: Any,
+    scorer: Any | None = None,
 ) -> None:
     """Trigger consumer: the leased slice chooses which variant runs.
 
@@ -424,6 +582,7 @@ async def run_trigger_round(
         published=published,
         reports=reports,
         reader=reader,
+        scorer=scorer,
     )
 
 
@@ -445,6 +604,7 @@ async def _consume_rounds(
     published: dict[str, str],
     reports: RunReports,
     reader: Any,
+    scorer: Any | None = None,
 ) -> None:
     """Consume the slice queues until the budget or the slices run out."""
 
@@ -477,6 +637,7 @@ async def _consume_rounds(
             published=published,
             reports=reports,
             reader=reader,
+            scorer=scorer,
         )
 
 
@@ -502,6 +663,7 @@ async def run_pipeline(
     inject_workers: int = 2,
     trigger_workers: int = 1,
     queue_log: str = "",
+    scorer: Any | None = None,
 ) -> PipelineResult:
     """Loop over trigger/direct slices until the queue is empty or the timeout expires."""
     if mode not in MODES:
@@ -512,6 +674,9 @@ async def run_pipeline(
         seed_queue(store, trigger_run_id, trigger_slices, order_mode="second")
     if mode != "second" and direct_slices:
         seed_queue(store, trigger_run_id, direct_slices, order_mode="direct")
+    scorer = scorer if scorer is not None else _default_scorer()
+    if scorer is not None:
+        await _score_seeded_slices(store, trigger_run_id, scorer=scorer)
     deadline = time.monotonic() + max(timeout_sec, 0.0)
     reader = _reader()
     published: dict[str, str] = {}
@@ -558,6 +723,7 @@ async def run_pipeline(
                 published=published,
                 reports=reports,
                 reader=reader,
+                scorer=scorer,
             )
         )
         for _ in range(worker_count)
