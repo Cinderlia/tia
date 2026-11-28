@@ -215,6 +215,17 @@ def _parser() -> argparse.ArgumentParser:
     )
     pipeline.add_argument("--json", action="store_true")
 
+    db_restore = sub.add_parser(
+        "db-restore",
+        help="Restore a snapshot a killed run left behind and clear its pending marker",
+    )
+    db_restore.add_argument("--db-name", default=None)
+    db_restore.add_argument("--db-user", default=None)
+    db_restore.add_argument("--db-password", default=None)
+    db_restore.add_argument("--store", default=None)
+    db_restore.add_argument("--snapshot", required=True, help="Dump written before the run")
+    db_restore.add_argument("--json", action="store_true")
+
     llm = sub.add_parser("llm", help="List model profiles from config/local/llm.yaml")
     llm.add_argument("--json", action="store_true")
     llm.add_argument(
@@ -578,8 +589,16 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         seeded = seed_flow_queue(store, run_id, sites, family=family, reader=reader)
         snapshot_path = Path(args.db_snapshot) if args.db_snapshot else None
         if snapshot_path is not None:
-            from tia.inf.snapshot import snapshot_database
+            from tia.inf.snapshot import restore_pending, snapshot_database
 
+            leftover = restore_pending(get_runtime().settings.db, snapshot_path)
+            if leftover is not None:
+                print(
+                    f"[db] WARNING: a previous run did not restore its snapshot "
+                    f"({leftover['created_at'] or 'unknown time'}); restored it first: "
+                    f"{snapshot_path}",
+                    file=sys.stderr,
+                )
             snapshot_database(get_runtime().settings.db, snapshot_path)
             print(f"[db] snapshot {snapshot_path}", file=sys.stderr)
         try:
@@ -728,6 +747,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command is None:
         parser.error(
             "Subcommand required: direct | trigger | inject | main | pairing | pipeline"
+            " | db-restore"
             " | accounts | login | browser-install | browser-check"
         )
     handlers = {
@@ -742,8 +762,32 @@ def main(argv: list[str] | None = None) -> int:
         "browser-install": _run_browser_install,
         "browser-check": _run_browser_check,
         "llm": _run_llm,
+        "db-restore": _run_db_restore,
     }
     return handlers[args.command](args)
+
+
+def _run_db_restore(args: argparse.Namespace) -> int:
+    from tia.inf.snapshot import pending_restore, restore_database
+
+    settings = _configure(args, "pipeline")
+    path = Path(args.snapshot)
+    if not path.is_file():
+        raise SystemExit(f"No snapshot at {path}")
+    pending = pending_restore(path)
+    restore_database(settings.db, path)
+    data = {
+        "ok": True,
+        "snapshot": str(path),
+        "pending": pending,
+        "restored": True,
+    }
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False))
+    else:
+        when = (pending or {}).get("created_at") or "-"
+        print(f"restored {path} (pending marker from {when})")
+    return 0
 
 
 def _run_llm(args: argparse.Namespace) -> int:
