@@ -4,8 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, unquote
 
 import pytest
 
@@ -475,3 +474,35 @@ async def test_shape_hint_rewrites_the_payload_after_a_failed_attempt(runtime: A
     assert result.notes["payload_from_rollback"] is True
     assert result.notes["feedback"].startswith("read context kind=attr")
     assert any('"><script>' in unquote(body) for body in client.bodies)
+
+
+class HandlerPageClient(FakeInjectClient):
+    """The write handler is an action file; the form that posts to it lives elsewhere."""
+
+    FORM_PAGE = (
+        '<html><body><form action="/xvwa/actions/handler.php" method="post">'
+        '<input type="text" name="name"><textarea name="msg"></textarea>'
+        '<input type="submit" value="go"></form></body></html>'
+    )
+
+    def _data(self, tool: str, args: dict[str, Any]) -> dict[str, Any]:
+        if tool == "http_request" and str(args.get("method", "GET")).upper() == "GET":
+            url = str(args.get("url") or "")
+            if "/actions/handler.php" in url:
+                return {"status": 200, "body": PAGE_PLAIN, "content_type": "text/html"}
+            return {"status": 200, "body": self.FORM_PAGE, "content_type": "text/html"}
+        return super()._data(tool, args)
+
+
+async def test_inject_finds_the_form_that_targets_the_write_handler(runtime: Any) -> None:
+    client = HandlerPageClient()
+    slice_ = dict(_slice(), sinkFile="actions/handler.php")
+    result = await run_inject(
+        slice_,
+        base_url="http://127.0.0.1/xvwa/actions/handler.php",
+        verify_url="http://127.0.0.1/xvwa/index.php",
+        client=client,
+    )
+    assert result.verdict == "EXECUTABLE"
+    assert result.notes["entry_fallback"] == "handler"
+    assert result.notes["entry_url"] == "http://127.0.0.1/xvwa/index.php"

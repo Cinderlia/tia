@@ -14,6 +14,7 @@ import secrets
 import string
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
@@ -508,6 +509,28 @@ async def _run_inject(
         return await _finish(kernel, result)
     document = parse(str(page.get("body") or ""))
     forms = [f for f in _forms(document, base_url) if f.method == "post"]
+    if not forms and verify_url and verify_url != base_url:
+        # A write handler is not always a page: the form that posts to it may
+        # live on another page (commonly the page the reader came from). Accept
+        # a fallback page only when one of its forms really targets this handler.
+        stem = Path(str(raw_slice.get("sinkFile") or "")).stem
+        if stem:
+            try:
+                fallback_page = await call("http_request", {"method": "GET", "url": verify_url})
+            except ToolCallError as exc:
+                notes["entry_fallback_error"] = str(exc)
+            else:
+                fallback_document = parse(str(fallback_page.get("body") or ""))
+                matched = [
+                    item
+                    for item in _forms(fallback_document, verify_url)
+                    if item.method == "post" and stem in item.action
+                ]
+                if matched:
+                    forms = matched
+                    notes["entry_url"] = verify_url
+                    notes["entry_fallback"] = stem
+                    stage("I2", True, f"write form found on {verify_url} (targets {stem})")
     if not forms:
         stage("I2", False, "No POST form on page")
         result.verdict = "NO_HTTP_ENTRY"
