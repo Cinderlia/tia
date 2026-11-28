@@ -69,6 +69,19 @@ def test_finding_is_idempotent(tmp_path: Path, monkeypatch) -> None:
     assert index.count("Confirmed second-order XSS") == 1  # one index row, no duplicate
 
 
+def test_reconfirmation_refreshes_the_same_finding_file(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("TIA_REPORTS", str(tmp_path / "reports"))
+    store = Store(tmp_path / "tia.db")
+    first = finding_second_order(store, _case(store, SECOND))
+    changed = dict(SECOND, tag="n3w1", payload="<script>alert(1)</script>n3w1")
+    second = finding_second_order(store, _case(store, changed))
+    assert first == second
+    text = second.read_text(encoding="utf-8")
+    assert "n3w1" in text and "r074" not in text
+    index = (tmp_path / "reports" / "default" / "findings.md").read_text(encoding="utf-8")
+    assert index.count("Confirmed second-order XSS") == 1
+
+
 def test_db_only_finding_names_the_sql(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("TIA_REPORTS", str(tmp_path / "reports"))
     store = Store(tmp_path / "tia.db")

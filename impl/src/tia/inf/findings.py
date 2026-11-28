@@ -383,8 +383,9 @@ def write_finding(
     directory = reports_root(store) / "vulnerabilities"
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{kind}-{_safe(sink_file.replace('/', '-'))}-{key}.md"
-    if path.exists():
-        return path
+    # Confirming the same vulnerability again refreshes the evidence (payload,
+    # row id, constraint replay) instead of leaving the first run's snapshot.
+    refreshed = path.exists()
 
     title = KIND_TITLES.get(kind, kind)
     lines = [
@@ -422,6 +423,8 @@ def write_finding(
     lines += _constraint_section(notes, kind)
     lines += _verify_section(notes, kind)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if refreshed:
+        return path
 
     index = reports_root(store) / "findings.md"
     if not index.exists():
