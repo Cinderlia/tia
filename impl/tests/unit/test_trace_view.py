@@ -120,7 +120,14 @@ async def test_failed_attempt_adds_the_trace_and_its_diff_to_the_next_plan() -> 
     llm = FakeLlm()
     rounds = {"n": 0}
 
-    async def send(method: str, values: dict[str, str], files: dict[str, str], account: str) -> dict:
+    async def send(
+        method: str,
+        values: dict[str, str],
+        files: dict[str, str],
+        account: str,
+        url: str = "",
+        headers: dict[str, str] | None = None,
+    ) -> dict:
         return {
             "status": 200,
             "body": "<html>nothing</html>",

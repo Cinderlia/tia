@@ -18,6 +18,14 @@ from tia.cap.forms import PageForm
 
 MAX_FIELDS = 40
 MAX_SOURCE = 4000
+ALLOWED_HEADERS = {
+    "content-type",
+    "accept",
+    "x-requested-with",
+    "x-csrf-token",
+    "x-xsrf-token",
+    "x-wp-nonce",
+}
 
 
 @dataclass
@@ -27,6 +35,7 @@ class PlannedRequest:
     values: dict[str, str] = field(default_factory=dict)
     payload_field: str = ""
     files: dict[str, str] = field(default_factory=dict)
+    headers: dict[str, str] = field(default_factory=dict)
     source: str = "llm"
     reason: str = ""
     rejection: str = ""
@@ -42,6 +51,7 @@ class PlannedRequest:
             "model": self.values,
             "payload_field": self.payload_field,
             "files": self.files,
+            "headers": self.headers,
             "source": self.source,
             "reason": self.reason,
             "rejection": self.rejection,
@@ -77,6 +87,7 @@ def _prompt(
     tag: str = "",
     sink: str = "",
     accounts: list[dict[str, Any]] | None = None,
+    endpoints: list[Any] | None = None,
     trace: dict[str, Any] | None = None,
     trace_diff: dict[str, Any] | None = None,
     schema: str = "",
@@ -121,6 +132,17 @@ def _prompt(
             "this identity cannot finish the action:\n"
             f"{json.dumps(rows, ensure_ascii=False)[:2500]}\n"
         )
+    endpoint_block = ""
+    if endpoints:
+        from tia.cap.requests import describe
+
+        lines = [describe(item) for item in endpoints[:16]]
+        endpoint_block = (
+            "REQUEST ENDPOINTS (shapes this page, its scripts or its source expose; "
+            "pick one or build on it; a form is not required):\n"
+            + "\n".join(lines)
+            + "\n"
+        )
     trace_block = ""
     if trace and trace.get("entries"):
         from tia.cap.trace_view import render_trace
@@ -154,12 +176,16 @@ def _prompt(
         f"PAYLOAD SEED: {payload!r}\n"
         "FORMS:\n"
         f"{json.dumps(shape, ensure_ascii=False)[:6000]}\n"
-        "SINK SOURCE:\n"
+        + endpoint_block
+        + "SINK SOURCE:\n"
         f"{source_text[:MAX_SOURCE]}\n"
         "PAGE HTML (trimmed):\n"
         f"{html[:6000]}\n"
         "Return {\"url\", \"method\", \"fields\", \"payload_field\", "
-        "\"payload_field_file\", \"payload\", \"column\", \"account\", \"reason\"}. "
+        "\"payload_field_file\", \"headers\", \"payload\", \"column\", "
+        "\"account\", \"reason\"}. "
+        "\"headers\" is optional and may only name Content-Type, Accept, "
+        "X-Requested-With, X-CSRF-Token, X-XSRF-Token or X-WP-Nonce. "
         "\"account\" is a label from SWITCHABLE USERS or empty. "
         "\"payload\" must contain the TAG verbatim and be built for the sink context; "
         "\"column\" is the storage column the payload should end up in, if known."
@@ -201,6 +227,7 @@ async def plan_request(
     fallback_fields: dict[str, str] | None = None,
     fallback_method: str = "POST",
     accounts: list[dict[str, Any]] | None = None,
+    endpoints: list[Any] | None = None,
     trace: dict[str, Any] | None = None,
     trace_diff: dict[str, Any] | None = None,
     schema: str = "",
@@ -208,6 +235,10 @@ async def plan_request(
     """Ask the model for a request plan; validate it; fall back to a local fill."""
     allowed = {entry.name for form in forms for entry in form.fields}
     file_names = {name for form in forms for name in form.files}
+    for endpoint in endpoints or []:
+        names = getattr(endpoint, "names", None)
+        if names:
+            allowed |= set(names)
     if client is not None:
         reply = await client.complete_json(
             _SYSTEM,
@@ -223,6 +254,7 @@ async def plan_request(
                 html=html,
                 tag=tag,
                 accounts=accounts,
+                endpoints=endpoints,
                 trace=trace,
                 trace_diff=trace_diff,
                 schema=schema,
@@ -314,6 +346,20 @@ async def plan_request(
         files: dict[str, str] = {}
         if file_field:
             files[file_field] = "tia-upload.png"
+        headers: dict[str, str] = {}
+        raw_headers = reply.get("headers")
+        if isinstance(raw_headers, dict):
+            for name, value in raw_headers.items():
+                key = str(name).strip()
+                text = str(value).strip()
+                if len(headers) >= 4 or not key:
+                    continue
+                if key.lower() not in ALLOWED_HEADERS:
+                    warnings.append(f"header {key!r} is not allowed; dropped")
+                    continue
+                if not text or len(text) > 300 or "\n" in text or "\r" in text:
+                    continue
+                headers[key] = text
         chosen_account = str(reply.get("account") or "").strip()
         if chosen_account:
             labels = {str(item.get("label") or "") for item in accounts or []}
@@ -329,6 +375,7 @@ async def plan_request(
             values=values,
             payload_field=payload_field,
             files=files,
+            headers=headers,
             source="llm",
             reason=str(reply.get("reason") or "")[:300],
             warnings=warnings,

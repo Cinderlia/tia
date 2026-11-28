@@ -55,7 +55,14 @@ async def test_failed_login_page_offers_the_switchable_identities() -> None:
     llm = FakeLlm()
     sent: list[str] = []
 
-    async def send(method: str, values: dict[str, str], files: dict[str, str], account: str) -> dict:
+    async def send(
+        method: str,
+        values: dict[str, str],
+        files: dict[str, str],
+        account: str,
+        url: str = "",
+        headers: dict[str, str] | None = None,
+    ) -> dict:
         sent.append(account)
         return {"status": 200, "body": LOGIN_HTML, "content_type": "text/html", "probe_hit": False}
 
@@ -85,7 +92,14 @@ async def test_failed_login_page_offers_the_switchable_identities() -> None:
 async def test_a_normal_result_is_not_treated_as_a_login_gate() -> None:
     llm = FakeLlm()
 
-    async def send(method: str, values: dict[str, str], files: dict[str, str], account: str) -> dict:
+    async def send(
+        method: str,
+        values: dict[str, str],
+        files: dict[str, str],
+        account: str,
+        url: str = "",
+        headers: dict[str, str] | None = None,
+    ) -> dict:
         return {"status": 200, "body": "<p>saved</p>", "probe_hit": True}
 
     async def accept(attempt, page) -> bool:  # type: ignore[no-untyped-def]

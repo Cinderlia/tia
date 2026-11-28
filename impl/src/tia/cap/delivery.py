@@ -28,7 +28,8 @@ _PAGE_ERROR = re.compile(
 )
 
 Send = Callable[
-    [str, dict[str, str], dict[str, str], str], Awaitable[dict[str, Any]]
+    [str, dict[str, str], dict[str, str], str, str, dict[str, str]],
+    Awaitable[dict[str, Any]],
 ]
 _LOGIN_FORM = re.compile(r"<input[^>]+type=[\"']?password", re.IGNORECASE)
 Accept = Callable[["DeliveryAttempt", dict[str, Any]], Awaitable[bool]]
@@ -156,6 +157,7 @@ async def deliver(
     send: Send,
     accept: Accept,
     accounts: list[dict[str, Any]] | None = None,
+    endpoints: list[Any] | None = None,
     trace: dict[str, Any] | None = None,
     trace_probe: TraceProbe | None = None,
     schema: str = "",
@@ -184,6 +186,7 @@ async def deliver(
             fallback_fields=fallback_fields,
             fallback_method=fallback_method,
             accounts=accounts,
+            endpoints=endpoints,
             trace=trace_view,
             trace_diff=trace_diff,
             schema=schema,
@@ -210,7 +213,9 @@ async def deliver(
             warnings=list(plan.warnings),
         )
         try:
-            page = await send(plan.method, values, files, plan.account)
+            page = await send(
+                plan.method, values, files, plan.account, plan.url, plan.headers
+            )
         except Exception as exc:  # noqa: BLE001 - a failed send is just feedback
             attempt.error = f"{type(exc).__name__}: {exc}"
             delivery.attempts.append(attempt)
@@ -281,7 +286,14 @@ async def deliver(
             plan_source="single-field",
         )
         try:
-            page = await send(attempt.method, values, attempt.files, last_plan.account)
+            page = await send(
+                attempt.method,
+                values,
+                attempt.files,
+                last_plan.account,
+                last_plan.url,
+                last_plan.headers,
+            )
         except Exception as exc:  # noqa: BLE001
             attempt.error = f"{type(exc).__name__}: {exc}"
             delivery.attempts.append(attempt)

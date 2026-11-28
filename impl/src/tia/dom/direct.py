@@ -160,16 +160,26 @@ async def run_direct(
     constraints = f"max payload length {allowed} characters" if allowed else ""
 
     async def _send(
-        method: str, values: dict[str, str], files: dict[str, str], account: str = ""
+        method: str,
+        values: dict[str, str],
+        files: dict[str, str],
+        account: str = "",
+        url: str = "",
+        headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        request: dict[str, Any] = {"method": method, "url": form.action}
+        target = url or form.action
+        request: dict[str, Any] = {"method": method, "url": target}
         if account:
             request["account_label"] = account
-        if method == "POST":
+        extra = dict(headers or {})
+        if method.upper() == "POST":
             request["body"] = urlencode(values)
-            request["headers"] = {"Content-Type": form.enctype}
+            extra.setdefault("Content-Type", form.enctype)
+            request["headers"] = extra
         else:
             request["params"] = values
+            if extra:
+                request["headers"] = extra
         if files:
             request["files"] = files
         result = await kernel.call("http_request", request)

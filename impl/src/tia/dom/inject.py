@@ -37,6 +37,12 @@ from tia.cap.entry import (
 )
 from tia.cap.forms import FormField, PageForm, find_form, forms_from_document
 from tia.cap.request_plan import plan_request
+from tia.cap.requests import (
+    endpoints_from_html,
+    endpoints_from_source,
+    extract_token,
+    nonces_from,
+)
 from tia.cap.schema import fetch_brief, render_brief
 from tia.cap.trace_view import make_trace_probe
 from tia.dom.trigger import StageRecord
@@ -508,7 +514,14 @@ async def _run_inject(
         result.verdict = "PATH_UNREACHABLE"
         return await _finish(kernel, result)
     document = parse(str(page.get("body") or ""))
-    forms = [f for f in _forms(document, base_url) if f.method == "post"]
+    discovered = _forms(document, base_url)
+    forms = [f for f in discovered if f.method == "post"]
+    if not forms:
+        # A GET endpoint carries the attack in the query string; the same
+        # candidate and delivery machinery applies, only the sender differs.
+        forms = [f for f in discovered if f.method == "get"]
+        if forms:
+            notes["entry_method"] = "GET"
     if not forms and verify_url and verify_url != base_url:
         # A write handler is not always a page: the form that posts to it may
         # live on another page (commonly the page the reader came from). Accept
@@ -531,6 +544,68 @@ async def _run_inject(
                     notes["entry_url"] = verify_url
                     notes["entry_fallback"] = stem
                     stage("I2", True, f"write form found on {verify_url} (targets {stem})")
+    if not forms:
+        # The entry is often not a <form>: an AJAX handler, a link with a query
+        # string, an admin-post endpoint mentioned only in source. Build request
+        # shapes from the page, its scripts and the source, keep the ones whose
+        # names can carry this record, and resolve their hidden tokens.
+        html_text = str(page.get("body") or "")
+        wanted = set(params) | set(_column_params(text))
+        shapes = endpoints_from_html(html_text, base_url)
+        shapes += endpoints_from_source(text or "", base_url, base_url=base_url)
+        picked: list[_Form] = []
+        endpoint_notes: list[dict[str, Any]] = []
+        page_nonces = nonces_from(html_text, base_url)
+        stem = Path(str(raw_slice.get("sinkFile") or "")).stem
+        for shape in shapes:
+            direct = bool(set(shape.names) & wanted) or bool(stem and stem in shape.url)
+            scripted = shape.method.upper() == "POST" and shape.origin in {
+                "ajax",
+                "script",
+                "source",
+            }
+            if not (direct or scripted):
+                continue
+            tokens: dict[str, str] = {}
+            missing = False
+            for source_nonce in list(shape.nonces) or page_nonces:
+                token = extract_token(html_text, source_nonce)
+                if not token and source_nonce.page_url:
+                    try:
+                        token_page = await call(
+                            "http_request",
+                            {"method": "GET", "url": source_nonce.page_url},
+                        )
+                    except ToolCallError:
+                        token = ""
+                    else:
+                        token = extract_token(
+                            str(token_page.get("body") or ""), source_nonce
+                        )
+                if not token:
+                    missing = True
+                    break
+                tokens[source_nonce.name] = token
+            if missing:
+                continue
+            fields = {name: shape.fields.get(name, "") for name in shape.names}
+            for name in sorted(wanted):
+                fields.setdefault(name, "")
+            fields.update(tokens)
+            picked.append(
+                _Form(
+                    action=shape.url,
+                    method=shape.method.lower(),
+                    fields=fields,
+                )
+            )
+            endpoint_notes.append(shape.to_dict())
+        if picked:
+            forms = picked
+            notes["entry_endpoint"] = endpoint_notes
+            notes["entry_fallback"] = "endpoint"
+            notes["entry_url"] = picked[0].action
+            stage("I2", True, f"entry endpoint={picked[0].method} {picked[0].action}")
     if not forms:
         stage("I2", False, "No POST form on page")
         result.verdict = "NO_HTTP_ENTRY"
@@ -696,22 +771,37 @@ async def _run_inject(
     }:
         arm_targets.append({"file": read_file, "line": read_line})
     async def _send(
-        method: str, values: dict[str, str], files: dict[str, str], account: str = ""
+        method: str,
+        values: dict[str, str],
+        files: dict[str, str],
+        account: str = "",
+        url: str = "",
+        headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         sent_values.clear()
         sent_values.update(values)
-        body = urlencode(values)
+        target = url or form.action
+        extra = dict(headers or {})
+        get = method.upper() == "GET"
+        if get:
+            body = ""
+        else:
+            body = urlencode(values)
+            extra.setdefault("Content-Type", "application/x-www-form-urlencoded")
         if armed:
             page = await call(
                 "probe_run",
                 {
                     "case_id": result.case_id,
-                    "url": form.action,
+                    "url": target,
                     "method": method,
-                    "body": body,
-                    "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+                    **(
+                        {"params": dict(values), "files": {}}
+                        if get
+                        else {"body": body, "files": files}
+                    ),
+                    "headers": extra,
                     "capture_html": True,
-                    "files": files,
                     "account_label": account,
                 },
             )
@@ -729,10 +819,13 @@ async def _run_inject(
             "http_request",
             {
                 "method": method,
-                "url": form.action,
-                "body": body,
-                "headers": {"Content-Type": "application/x-www-form-urlencoded"},
-                "files": files,
+                "url": target,
+                **(
+                    {"params": dict(values)}
+                    if get
+                    else {"body": body, "files": files}
+                ),
+                "headers": extra,
                 "account_label": account,
             },
         )
@@ -762,6 +855,10 @@ async def _run_inject(
             armed = True
         except ToolCallError as exc:
             notes["probe_error"] = str(exc.envelope.error.message if exc.envelope.error else exc)
+    delivery_page_url = (
+        forms[0].action if notes.get("entry_fallback") == "endpoint" else base_url
+    )
+    entry_method = "GET" if notes.get("entry_method") == "GET" else "POST"
     delivery = await deliver(
         client=LlmClient.from_env(),
         goal=(
@@ -770,8 +867,9 @@ async def _run_inject(
             "own write path decides the columns, the payload only has to end up in "
             "the column the read path renders"
         ),
-        page_url=base_url,
+        page_url=delivery_page_url,
         forms=plan_forms,
+        fallback_method=entry_method,
         html=str(notes.get("page_html") or ""),
         source_text=text,
         tag=tag,
