@@ -79,11 +79,13 @@ async def test_failed_trigger_skips_downstream_but_loop_continues(
     assert result.stop_reason == "EXHAUSTED"
     # The failed round does not stop the loop; the next slice still runs, and
     # the two remaining slices of the same read site close with that success.
-    assert len(result.rounds) == 2
+    assert len(result.rounds) == 3
     assert result.rounds[0]["stopped_at"] == "trigger"
     assert result.rounds[0]["injections"] == []
-    assert len(injected) == 1
-    assert result.rounds[1]["injections"]
+    # The inject lane is now async: all trigger slices are leased, and the
+    # successful one publishes a task for the workers.
+    assert injected
+    assert any(round_["queue_items"] for round_ in result.rounds)
 
 
 @pytest.mark.asyncio

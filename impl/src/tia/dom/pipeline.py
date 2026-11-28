@@ -12,6 +12,7 @@ timeout. Pairing/verdict failures are data for the report, not loop ends.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import Callable
@@ -21,10 +22,11 @@ from typing import Any
 from tia.cap.entry import infer_read_entry
 from tia.dom.direct import run_direct
 from tia.dom.inject import run_inject
+from tia.dom.lanes import publish_pairing, start_workers
 from tia.dom.main import seed_queue
 from tia.dom.pairing_agent import PairingConfig, build_pairing_queue, respond
 from tia.dom.trigger import normalize_slice, run_trigger
-from tia.inf.findings import finding_db_only, finding_first_order, finding_second_order
+from tia.inf.findings import finding_db_only, finding_first_order
 from tia.inf.reports import RunReports
 from tia.inf.runtime import get_runtime
 from tia.orch.kernel import ToolCallError, ToolClient
@@ -172,6 +174,7 @@ async def run_pipeline(
     url_for: Callable[[dict[str, Any]], str] | None = None,
     direct_slices: list[dict[str, Any]] | None = None,
     mode: str = "second",
+    inject_workers: int = 2,
 ) -> PipelineResult:
     """Loop over trigger/direct slices until the queue is empty or the timeout expires."""
     if mode not in MODES:
@@ -184,6 +187,21 @@ async def run_pipeline(
         seed_queue(store, trigger_run_id, direct_slices, order_mode="direct")
     deadline = time.monotonic() + max(timeout_sec, 0.0)
     reader = _reader()
+    published: dict[str, str] = {}
+    stop_lane, tasks = start_workers(
+        store,
+        trigger_run_id,
+        workers=inject_workers,
+        deadline=deadline,
+        base_url=base_url,
+        payload_base=payload_base,
+        budget=budget,
+        inject_client=inject_client,
+        url_for=url_for,
+        reader=reader,
+        reports=reports,
+        outcomes=result.outcomes,
+    )
 
     while True:
         if time.monotonic() >= deadline:
@@ -281,50 +299,30 @@ async def run_pipeline(
             result.rounds.append(record)
             continue
 
-        try:
-            injected = await walk_injection_queue(
-                store,
-                pair_run_id,
-                base_url,
-                payload_base=payload_base,
-                budget=budget,
-                inject_client=inject_client,
-                url_for=url_for,
-                reader=reader,
-                payload_constraints=(trigger.notes or {}).get("payload_constraints"),
-                constraint_plan=(trigger.notes or {}).get("constraint_plan"),
-                read_values=(trigger.notes or {}).get("read_entry_values"),
-                read_notes=trigger.notes or {},
-            )
-        except ToolCallError as exc:
-            record["stopped_at"] = "inject_error"
-            record["error"] = exc.envelope.model_dump()
+        task_id = pairing.run_id or f"task-{round_index}"
+        queue_items = publish_pairing(
+            store,
+            run_id=trigger_run_id,
+            task_id=task_id,
+            trigger_case=trigger.case_id,
+            pairing=pairing,
+            notes=trigger.notes or {},
+            base_url=base_url,
+            payload_base=payload_base,
+        )
+        published[task_id] = str(trigger.case_id or "")
+        record["task_id"] = task_id
+        record["queue_items"] = queue_items
+        if not queue_items:
+            record["stopped_at"] = "no_injection_candidate"
+            result.stop_reason = "NO_INJECTION_CANDIDATE"
             result.rounds.append(record)
-            continue
-        except Exception as exc:  # noqa: BLE001 - keep the pipeline alive across one bad candidate
-            record["stopped_at"] = "inject_error"
-            record["error"] = f"{type(exc).__name__}: {exc}"
-            result.rounds.append(record)
-            continue
-        record["injections"] = [
-            {"item": item.slice_id, "verdict": item.verdict} for item in injected.outcomes
-        ]
-        result.outcomes.extend(injected.outcomes)
-        confirmed = [
-            item for item in injected.outcomes if item.verdict in ("EXECUTABLE", "EXECUTED")
-        ]
-        for outcome in confirmed:
-            finding_second_order(store, outcome.case_id)
-        if not confirmed:
-            finding_db_only(store, trigger.case_id)
-        for outcome in injected.outcomes:
-            reports.add(
-                outcome.case_id,
-                "inject",
-                outcome.verdict,
-                f"{outcome.notes.get('table', '?')}.{_columns_label(outcome.notes.get('columns'))}",
-            )
+            break
         result.rounds.append(record)
+
+    stop_lane.set()
+    await asyncio.gather(*tasks)
+    _close_unproven_tasks(store, trigger_run_id, published)
 
     index = reports.finish(result.stop_reason, len(result.rounds), len(result.outcomes))
     result.report_path = str(index)
@@ -489,151 +487,190 @@ async def walk_injection_queue(
 ) -> PipelineResult:
     """Inject every candidate in queue order; the read side is already proven."""
     result = PipelineResult()
+    result = PipelineResult()
     while True:
         item = store.next_injection_item(pair_run_id)
         if item is None:
             break
-        write_row = store.get_slice(str(item["write_slice_id"]))
-        if write_row is None:
-            store.archive_injection_item(str(item["item_id"]), "MISSING_SLICE")
+        try:
+            outcome = await _run_injection_item(
+                store,
+                item,
+                pair_run_id=pair_run_id,
+                base_url=base_url,
+                payload_base=payload_base,
+                budget=budget,
+                inject_client=inject_client,
+                url_for=url_for,
+                reader=reader,
+                payload_constraints=payload_constraints,
+                read_values=read_values,
+                constraint_plan=constraint_plan,
+                read_notes=read_notes,
+            )
+        except ToolCallError:
+            store.archive_injection_item(str(item["item_id"]), "ERROR")
             continue
-        write_raw = dict(write_row["slice"])
-        write_url = url_for(write_raw) if url_for is not None else base_url
-        read_row = store.get_slice(str(item["read_slice_id"]))
-        read_raw = dict(read_row["slice"]) if read_row is not None else {}
-        read_url = url_for(read_raw) if (url_for is not None and read_raw) else base_url
-        entry = _read_entry(reader, read_raw) if read_raw else None
-        pair_map = await _prepare_constraints(
-            store,
-            pair_run_id,
-            str(item["read_slice_id"]),
-            constraint_plan,
-            url_for,
-            read_url,
-        )
-        copy_paths = _copy_paths_with_raw(store, item, url_for)
-        hint = {
-            "pair_id": item["pair_id"],
-            "table": item["table"],
-            "columns": item["columns"],
-            "confidence": item["score"],
-            "direction": item["direction"],
-        }
-        # Duplicate slices of the same site stay as alternates: if the primary
-        # attempt fails before reaching the sink, one alternate gets a chance.
-        hints = [hint]
-        for alternate in (item.get("alternates") or [])[:1]:
-            hints.append(
-                {
-                    "pair_id": alternate.get("pair_id") or item["pair_id"],
-                    "table": item["table"],
-                    "columns": item["columns"],
-                    "confidence": alternate.get("score") or item["score"],
-                    "direction": item["direction"],
-                    "alternate_write_slice_id": alternate.get("write_slice_id"),
-                }
-            )
-        inject = await run_inject(
-            write_raw,
-            base_url=write_url,
-            payload_base=payload_base,
-            budget=min(budget, 40),
-            client=inject_client,
-            pair_hints=hints[:1],
-            verify_url=read_url,
-            verify_entry=entry,
-            verify_values=read_values,
-            payload_constraints=payload_constraints,
-            slice_id=str(item["write_slice_id"]),
-            learning=hints_for(store, read_raw or write_raw),
-            read_target=_read_target(read_raw, read_notes),
-            constraint_plan=constraint_plan,
-            pair_candidates=pair_map,
-            copy_paths=copy_paths,
-            copy_only=item.get("kind") == "copy",
-            chain_steps=(
-                _chain_with_raw(store, item) if item.get("kind") == "chain" else None
-            ),
-            chain_only=item.get("kind") == "chain",
-        )
-        if (
-            len(hints) > 1
-            and inject.verdict in _RETRYABLE_INJECT
-            and hints[1].get("alternate_write_slice_id")
-        ):
-            alternate_raw = store.get_slice(str(hints[1]["alternate_write_slice_id"]))
-            if alternate_raw is not None:
-                retry = await run_inject(
-                    dict(alternate_raw["slice"]),
-                    base_url=write_url,
-                    payload_base=payload_base,
-                    budget=min(budget, 40),
-                    client=inject_client,
-                    pair_hints=hints[1:],
-                    verify_url=read_url,
-                    verify_entry=entry,
-                    verify_values=read_values,
-                    payload_constraints=payload_constraints,
-                    slice_id=str(hints[1]["alternate_write_slice_id"]),
-                    learning=hints_for(store, read_raw or write_raw),
-                    read_target=_read_target(read_raw, read_notes),
-                    constraint_plan=constraint_plan,
-                    pair_candidates=pair_map,
-                    copy_paths=copy_paths,
-                    copy_only=item.get("kind") == "copy",
-                    chain_steps=(
-                        _chain_with_raw(store, item) if item.get("kind") == "chain" else None
-                    ),
-                    chain_only=item.get("kind") == "chain",
-                )
-                inject.notes["alternate_attempt"] = {
-                    "slice_id": hints[1]["alternate_write_slice_id"],
-                    "verdict": retry.verdict,
-                }
-                if retry.verdict in ("EXECUTABLE", "EXECUTED"):
-                    inject = retry
-                store.archive_slice(
-                    str(hints[1]["alternate_write_slice_id"]), retry.verdict,
-                    case_id=retry.case_id,
-                )
-        read_sink = _slice_label(read_raw) if read_raw else ""
-        extra = {
-            "read_url": read_url,
-            "read_sink": read_sink,
-            "read_sink_code": str((read_raw.get("sink") or {}).get("code") or "")
-            if isinstance(read_raw.get("sink"), dict)
-            else str(read_raw.get("sinkCode") or ""),
-        }
-        inject.notes.update(extra)
-        if inject.case_id:
-            store.merge_case_notes(inject.case_id, extra)
-        store.archive_injection_item(str(item["item_id"]), inject.verdict, case_id=inject.case_id)
-        store.archive_slice(str(item["write_slice_id"]), inject.verdict, case_id=inject.case_id)
-        read_identity = str(item.get("read_identity") or "")
-        write_identity = str(item.get("write_identity") or "")
-        if inject.verdict in ("EXECUTABLE", "EXECUTED") and read_identity and write_identity:
-            store.record_conclusion(read_identity, write_identity, inject.verdict, inject.case_id)
-            store.close_identity_group(read_identity, inject.verdict, inject.case_id,
-                                       keep=str(item["read_slice_id"]))
-            store.close_identity_group(write_identity, inject.verdict, inject.case_id,
-                                       keep=str(item["write_slice_id"]))
-        result.outcomes.append(
-            CaseOutcome(
-                slice_id=str(item["item_id"]),
-                case_id=inject.case_id,
-                verdict=inject.verdict,
-                evidence_refs=[step.evidence_ref for step in inject.trace if step.evidence_ref],
-                residue=inject.residue or 0,
-                notes={
-                    "stage": "inject",
-                    "pair_score": item["score"],
-                    "table": item["table"],
-                    "columns": item["columns"],
-                },
-                duration_ms=0,
-            )
-        )
+        if outcome is not None:
+            result.outcomes.append(outcome)
     return result
+
+
+async def _run_injection_item(
+    store: Any,
+    item: dict[str, Any],
+    *,
+    pair_run_id: str,
+    base_url: str,
+    payload_base: str,
+    budget: int,
+    inject_client: ToolClient | None,
+    url_for: Callable[[dict[str, Any]], str] | None,
+    reader: Callable[[str, int, int], list[tuple[int, str]]] | None = None,
+    payload_constraints: dict[str, Any] | None = None,
+    read_values: dict[str, str] | None = None,
+    constraint_plan: dict[str, Any] | None = None,
+    read_notes: dict[str, Any] | None = None,
+) -> CaseOutcome | None:
+    """Run one leased injection item and archive what it touched."""
+    write_row = store.get_slice(str(item["write_slice_id"]))
+    if write_row is None:
+        store.archive_injection_item(str(item["item_id"]), "MISSING_SLICE")
+        return None
+    write_raw = dict(write_row["slice"])
+    write_url = url_for(write_raw) if url_for is not None else base_url
+    read_row = store.get_slice(str(item["read_slice_id"]))
+    read_raw = dict(read_row["slice"]) if read_row is not None else {}
+    read_url = url_for(read_raw) if (url_for is not None and read_raw) else base_url
+    entry = _read_entry(reader, read_raw) if read_raw else None
+    pair_map = await _prepare_constraints(
+        store,
+        pair_run_id,
+        str(item["read_slice_id"]),
+        constraint_plan,
+        url_for,
+        read_url,
+    )
+    copy_paths = _copy_paths_with_raw(store, item, url_for)
+    hint = {
+        "pair_id": item["pair_id"],
+        "table": item["table"],
+        "columns": item["columns"],
+        "confidence": item["score"],
+        "direction": item["direction"],
+    }
+    # Duplicate slices of the same site stay as alternates: if the primary
+    # attempt fails before reaching the sink, one alternate gets a chance.
+    hints = [hint]
+    for alternate in (item.get("alternates") or [])[:1]:
+        hints.append(
+            {
+                "pair_id": alternate.get("pair_id") or item["pair_id"],
+                "table": item["table"],
+                "columns": item["columns"],
+                "confidence": alternate.get("score") or item["score"],
+                "direction": item["direction"],
+                "alternate_write_slice_id": alternate.get("write_slice_id"),
+            }
+        )
+    inject = await run_inject(
+        write_raw,
+        base_url=write_url,
+        payload_base=payload_base,
+        budget=min(budget, 40),
+        client=inject_client,
+        pair_hints=hints[:1],
+        verify_url=read_url,
+        verify_entry=entry,
+        verify_values=read_values,
+        payload_constraints=payload_constraints,
+        slice_id=str(item["write_slice_id"]),
+        learning=hints_for(store, read_raw or write_raw),
+        read_target=_read_target(read_raw, read_notes),
+        constraint_plan=constraint_plan,
+        pair_candidates=pair_map,
+        copy_paths=copy_paths,
+        copy_only=item.get("kind") == "copy",
+        chain_steps=(
+            _chain_with_raw(store, item) if item.get("kind") == "chain" else None
+        ),
+        chain_only=item.get("kind") == "chain",
+    )
+    if (
+        len(hints) > 1
+        and inject.verdict in _RETRYABLE_INJECT
+        and hints[1].get("alternate_write_slice_id")
+    ):
+        alternate_raw = store.get_slice(str(hints[1]["alternate_write_slice_id"]))
+        if alternate_raw is not None:
+            retry = await run_inject(
+                dict(alternate_raw["slice"]),
+                base_url=write_url,
+                payload_base=payload_base,
+                budget=min(budget, 40),
+                client=inject_client,
+                pair_hints=hints[1:],
+                verify_url=read_url,
+                verify_entry=entry,
+                verify_values=read_values,
+                payload_constraints=payload_constraints,
+                slice_id=str(hints[1]["alternate_write_slice_id"]),
+                learning=hints_for(store, read_raw or write_raw),
+                read_target=_read_target(read_raw, read_notes),
+                constraint_plan=constraint_plan,
+                pair_candidates=pair_map,
+                copy_paths=copy_paths,
+                copy_only=item.get("kind") == "copy",
+                chain_steps=(
+                    _chain_with_raw(store, item) if item.get("kind") == "chain" else None
+                ),
+                chain_only=item.get("kind") == "chain",
+            )
+            inject.notes["alternate_attempt"] = {
+                "slice_id": hints[1]["alternate_write_slice_id"],
+                "verdict": retry.verdict,
+            }
+            if retry.verdict in ("EXECUTABLE", "EXECUTED"):
+                inject = retry
+            store.archive_slice(
+                str(hints[1]["alternate_write_slice_id"]), retry.verdict,
+                case_id=retry.case_id,
+            )
+    read_sink = _slice_label(read_raw) if read_raw else ""
+    extra = {
+        "read_url": read_url,
+        "read_sink": read_sink,
+        "read_sink_code": str((read_raw.get("sink") or {}).get("code") or "")
+        if isinstance(read_raw.get("sink"), dict)
+        else str(read_raw.get("sinkCode") or ""),
+    }
+    inject.notes.update(extra)
+    if inject.case_id:
+        store.merge_case_notes(inject.case_id, extra)
+    store.archive_injection_item(str(item["item_id"]), inject.verdict, case_id=inject.case_id)
+    store.archive_slice(str(item["write_slice_id"]), inject.verdict, case_id=inject.case_id)
+    read_identity = str(item.get("read_identity") or "")
+    write_identity = str(item.get("write_identity") or "")
+    if inject.verdict in ("EXECUTABLE", "EXECUTED") and read_identity and write_identity:
+        store.record_conclusion(read_identity, write_identity, inject.verdict, inject.case_id)
+        store.close_identity_group(read_identity, inject.verdict, inject.case_id,
+                                   keep=str(item["read_slice_id"]))
+        store.close_identity_group(write_identity, inject.verdict, inject.case_id,
+                                   keep=str(item["write_slice_id"]))
+    return CaseOutcome(
+            slice_id=str(item["item_id"]),
+            case_id=inject.case_id,
+            verdict=inject.verdict,
+            evidence_refs=[step.evidence_ref for step in inject.trace if step.evidence_ref],
+            residue=inject.residue or 0,
+            notes={
+                "stage": "inject",
+                "pair_score": item["score"],
+                "table": item["table"],
+                "columns": item["columns"],
+            },
+        duration_ms=0,
+    )
 
 
 def _columns_label(value: Any) -> str:
@@ -673,3 +710,15 @@ def _report(result: PipelineResult) -> str:
     for item in result.outcomes:
         lines.append(f"| {item.notes.get('stage', '')} | {item.slice_id} | {item.verdict} |")
     return "\n".join(lines)
+
+
+def _close_unproven_tasks(store: Any, run_id: str, published: dict[str, str]) -> None:
+    """Write the db-only finding for every task whose slices all failed."""
+    successes: set[str] = set()
+    for item in store.list_injection_queue(run_id=run_id):
+        if item.get("verdict") in ("EXECUTABLE", "EXECUTED"):
+            successes.add(str(item.get("task_id") or ""))
+    for task_id, trigger_case in published.items():
+        if not trigger_case or task_id in successes:
+            continue
+        finding_db_only(store, trigger_case)

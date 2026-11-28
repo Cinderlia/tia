@@ -146,6 +146,12 @@ CREATE TABLE IF NOT EXISTS injection_queue (
     status         TEXT NOT NULL DEFAULT 'pending',
     verdict        TEXT NOT NULL DEFAULT '',
     case_id        TEXT NOT NULL DEFAULT '',
+    priority       TEXT NOT NULL DEFAULT 'low',
+    task_id        TEXT NOT NULL DEFAULT '',
+    is_payload     INTEGER NOT NULL DEFAULT 0,
+    trigger_case   TEXT NOT NULL DEFAULT '',
+    context        TEXT NOT NULL DEFAULT '{}',
+    attempts       INTEGER NOT NULL DEFAULT 0,
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL
 );
@@ -289,6 +295,12 @@ class Store:
                 ("copy_paths", "ALTER TABLE injection_queue ADD COLUMN copy_paths TEXT NOT NULL DEFAULT '[]'"),
                 ("kind", "ALTER TABLE injection_queue ADD COLUMN kind TEXT NOT NULL DEFAULT 'direct'"),
                 ("chain", "ALTER TABLE injection_queue ADD COLUMN chain TEXT NOT NULL DEFAULT '[]'"),
+                ("priority", "ALTER TABLE injection_queue ADD COLUMN priority TEXT NOT NULL DEFAULT 'low'"),
+                ("task_id", "ALTER TABLE injection_queue ADD COLUMN task_id TEXT NOT NULL DEFAULT ''"),
+                ("is_payload", "ALTER TABLE injection_queue ADD COLUMN is_payload INTEGER NOT NULL DEFAULT 0"),
+                ("trigger_case", "ALTER TABLE injection_queue ADD COLUMN trigger_case TEXT NOT NULL DEFAULT ''"),
+                ("context", "ALTER TABLE injection_queue ADD COLUMN context TEXT NOT NULL DEFAULT '{}'"),
+        ("attempts", "ALTER TABLE injection_queue ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"),
             ):
                 if name not in queue_columns:
                     conn.execute(ddl)
@@ -1245,14 +1257,15 @@ class Store:
                 conn.execute(
                     "INSERT INTO injection_queue (item_id, run_id, rank, write_slice_id, read_slice_id,"
                     " pair_id, table_name, columns, score, direction, kind, chain, reasons, status,"
-                    " read_identity, write_identity, alternates, copy_paths, created_at, updated_at)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?,?,?)",
+                    " read_identity, write_identity, alternates, copy_paths, priority, task_id,"
+                    " is_payload, trigger_case, context, attempts, created_at, updated_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?,?,?,?,?,?,0,?,?)",
                     (
                         str(item["item_id"]),
                         run_id,
                         rank,
                         str(item["write_slice_id"]),
-                        str(item["read_slice_id"]),
+                        str(item.get("read_slice_id") or ""),
                         str(item["pair_id"]),
                         str(item.get("table") or ""),
                         json.dumps(item.get("columns") or [], ensure_ascii=False),
@@ -1265,11 +1278,92 @@ class Store:
                         str(item.get("write_identity") or ""),
                         json.dumps(item.get("alternates") or [], ensure_ascii=False),
                         json.dumps(item.get("copy_paths") or [], ensure_ascii=False),
+                        str(item.get("priority") or "low"),
+                        str(item.get("task_id") or ""),
+                        1 if item.get("is_payload") else 0,
+                        str(item.get("trigger_case") or ""),
+                        json.dumps(item.get("context") or {}, ensure_ascii=False),
                         now,
                         now,
                     ),
                 )
         return len(items)
+
+    def append_injection_items(self, items: list[dict[str, Any]]) -> int:
+        """Publish task items without touching what another task already queued."""
+        now = now_iso()
+        with self._conn() as conn:
+            for rank, item in enumerate(items):
+                conn.execute(
+                    "INSERT OR IGNORE INTO injection_queue (item_id, run_id, rank, write_slice_id,"
+                    " read_slice_id, pair_id, table_name, columns, score, direction, kind, chain,"
+                    " reasons, status, read_identity, write_identity, alternates, copy_paths,"
+                    " priority, task_id, is_payload, trigger_case, context, created_at, updated_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?,?,?,?,?,?,?,?)"
+                    " ON CONFLICT(item_id) DO UPDATE SET run_id=excluded.run_id,"
+                    " priority=excluded.priority, task_id=excluded.task_id,"
+                    " is_payload=excluded.is_payload, trigger_case=excluded.trigger_case,"
+                    " context=excluded.context, score=excluded.score, status='pending',"
+                    " updated_at=excluded.updated_at",
+                    (
+                        str(item["item_id"]),
+                        str(item["run_id"]),
+                        rank,
+                        str(item["write_slice_id"]),
+                        str(item.get("read_slice_id") or ""),
+                        str(item.get("pair_id") or ""),
+                        str(item.get("table") or ""),
+                        json.dumps(item.get("columns") or [], ensure_ascii=False),
+                        int(item.get("score") or 0),
+                        str(item.get("direction") or ""),
+                        str(item.get("kind") or "direct"),
+                        json.dumps(item.get("chain") or [], ensure_ascii=False),
+                        json.dumps(item.get("reasons") or [], ensure_ascii=False),
+                        str(item.get("read_identity") or ""),
+                        str(item.get("write_identity") or ""),
+                        json.dumps(item.get("alternates") or [], ensure_ascii=False),
+                        json.dumps(item.get("copy_paths") or [], ensure_ascii=False),
+                        str(item.get("priority") or "low"),
+                        str(item.get("task_id") or ""),
+                        1 if item.get("is_payload") else 0,
+                        str(item.get("trigger_case") or ""),
+                        json.dumps(item.get("context") or {}, ensure_ascii=False),
+                        now,
+                        now,
+                    ),
+                )
+        return len(items)
+
+    def requeue_injection_item(self, item_id: str, *, delta: int = 0) -> bool:
+        """Park a leased item back at its (possibly lowered) score."""
+        with self._conn() as conn:
+            cursor = conn.execute(
+                "UPDATE injection_queue SET status=CASE WHEN attempts+1 < 2 THEN 'pending'"
+                " ELSE 'abandoned' END, attempts=attempts+1, score=MAX(0, score+?),"
+                " updated_at=? WHERE item_id=? AND status='running'",
+                (int(delta), now_iso(), item_id),
+            )
+        return cursor.rowcount == 1
+
+    def abandon_injection_task(self, task_id: str, *, keep_item_id: str = "") -> int:
+        """Drop the siblings of a task whose payload slice already failed."""
+        with self._conn() as conn:
+            cursor = conn.execute(
+                "UPDATE injection_queue SET status='abandoned', updated_at=?"
+                " WHERE task_id=? AND status='pending' AND item_id<>?",
+                (now_iso(), task_id, keep_item_id),
+            )
+        return cursor.rowcount
+
+    def count_pending_injections(self, run_id: str | None = None) -> int:
+        sql = "SELECT COUNT(*) AS n FROM injection_queue WHERE status='pending'"
+        args: tuple[Any, ...] = ()
+        if run_id:
+            sql += " AND run_id=?"
+            args = (run_id,)
+        with self._conn() as conn:
+            row = conn.execute(sql, args).fetchone()
+        return int(row["n"])
 
     def list_injection_queue(
         self, run_id: str | None = None, *, status: str | None = None, limit: int = 100
@@ -1289,12 +1383,19 @@ class Store:
         return [self._injection_row(row) for row in rows]
 
     def next_injection_item(self, run_id: str | None = None) -> dict[str, Any] | None:
-        sql = "SELECT item_id FROM injection_queue WHERE status='pending'"
+        # High priority is a strict gate: a low item is only visible once no
+        # high item is pending anywhere in the queue.
+        sql = (
+            "SELECT item_id FROM injection_queue WHERE status='pending'"
+            " AND priority = (CASE WHEN EXISTS("
+            "SELECT 1 FROM injection_queue WHERE status='pending' AND priority='high'"
+            ") THEN 'high' ELSE 'low' END)"
+        )
         args: tuple[Any, ...] = ()
         if run_id:
             sql += " AND run_id=?"
             args = (run_id,)
-        sql += " ORDER BY rank ASC LIMIT 1"
+        sql += " ORDER BY score DESC, rank ASC, created_at LIMIT 1"
         with self._conn() as conn:
             while True:
                 row = conn.execute(sql, args).fetchone()
@@ -1343,6 +1444,11 @@ class Store:
             "write_identity": row["write_identity"],
             "alternates": json.loads(row["alternates"] or "[]"),
             "copy_paths": json.loads(row["copy_paths"] or "[]"),
+            "priority": row["priority"],
+            "task_id": row["task_id"],
+            "is_payload": bool(row["is_payload"]),
+            "trigger_case": row["trigger_case"],
+            "context": json.loads(row["context"] or "{}"),
         }
 
     # -- identity-level conclusions --------------------------------------

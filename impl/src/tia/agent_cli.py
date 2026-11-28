@@ -215,6 +215,12 @@ def _parser() -> argparse.ArgumentParser:
         help="Stop leasing once this many minutes have passed (0 = no limit)",
     )
     pipeline.add_argument(
+        "--inject-workers",
+        type=int,
+        default=2,
+        help="Inject consumers draining the global write-slice queue",
+    )
+    pipeline.add_argument(
         "--batch-size",
         type=int,
         default=25,
@@ -676,6 +682,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
             url_for=url_for_fn,
             direct_slices=direct_slices,
             mode=args.mode,
+            inject_workers=args.inject_workers,
         )
     )
     for item in result.outcomes:
