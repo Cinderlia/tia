@@ -244,6 +244,189 @@ async def _constraint_plan_for(
     return plan if isinstance(plan, dict) else {}
 
 
+async def _run_second_order_round(
+    *,
+    store: Any,
+    result: PipelineResult,
+    leased: dict[str, Any],
+    write_slices: list[dict[str, Any]],
+    trigger_run_id: str,
+    base_url: str,
+    payload_base: str,
+    budget: int,
+    queue_cap: int,
+    trigger_client: ToolClient | None,
+    url_for: Callable[[dict[str, Any]], str] | None,
+    published: dict[str, str],
+    reports: RunReports,
+    reader: Any,
+) -> None:
+    """Trigger, second-order variant: prove the read, pair writes, publish a task."""
+
+    round_index = len(result.rounds)
+    raw = dict(leased["slice"])
+    trigger_url = url_for(raw) if url_for is not None else base_url
+    try:
+        trigger = await run_trigger(
+            normalize_slice(raw),
+            base_url=trigger_url,
+            payload_base=payload_base,
+            budget=min(budget, 40),
+            client=trigger_client,
+            slice_id=str(leased["id"]),
+        )
+    except ToolCallError as exc:
+        # A broken slice must not stop the loop: archive it and pick the next.
+        store.archive_slice(str(leased["id"]), "ERROR")
+        result.rounds.append(
+            {
+                "round": round_index,
+                "trigger_slice": str(leased["id"]),
+                "trigger_case": None,
+                "trigger_verdict": "ERROR",
+                "queue_items": 0,
+                "injections": [],
+                "stopped_at": "error",
+                "error": exc.envelope.model_dump(),
+            }
+        )
+        return
+    store.archive_slice(str(leased["id"]), trigger.verdict, case_id=trigger.case_id)
+    result.outcomes.append(
+        CaseOutcome(
+            slice_id=str(leased["id"]),
+            case_id=trigger.case_id,
+            verdict=trigger.verdict,
+            evidence_refs=[step.evidence_ref for step in trigger.trace if step.evidence_ref],
+            residue=trigger.residue or 0,
+            notes={"stage": "trigger"},
+            duration_ms=0,
+        )
+    )
+    reports.add(trigger.case_id, "trigger", trigger.verdict, _slice_label(raw))
+    record: dict[str, Any] = {
+        "round": round_index,
+        "trigger_slice": str(leased["id"]),
+        "trigger_case": trigger.case_id,
+        "trigger_verdict": trigger.verdict,
+        "queue_items": 0,
+        "injections": [],
+    }
+    if trigger.verdict != "EXECUTED" or (trigger.residue or 0) != 0:
+        # Not reachable: the rest of this chain is skipped, loop continues.
+        record["stopped_at"] = "trigger"
+        result.rounds.append(record)
+        return
+
+    pair_run_id = f"{trigger_run_id}-pair-{round_index}"
+    proven = store.get_slice(str(leased["id"]))
+    pairing = build_pairing_queue(
+        store,
+        pair_run_id,
+        write_slices,
+        [proven] if proven is not None else [],
+        reader=reader,
+        config=PairingConfig(queue_cap=queue_cap),
+    )
+    record["queue_items"] = len(pairing.queue)
+    if not pairing.queue:
+        record["stopped_at"] = "pairing"
+        finding_db_only(store, trigger.case_id)
+        result.rounds.append(record)
+        return
+
+    task_id = pairing.run_id or f"task-{round_index}"
+    notes = dict(trigger.notes or {})
+    if not notes.get("constraint_plan"):
+        plan = await _constraint_plan_for(
+            store,
+            trigger_client or LocalToolClient("trigger"),
+            raw,
+            trigger=trigger,
+            pair_run_id=pair_run_id,
+            pairing=pairing,
+            base_url=base_url,
+            url_for=url_for,
+        )
+        if plan.get("constraints"):
+            notes["constraint_plan"] = plan
+    queue_items = publish_pairing(
+        store,
+        run_id=trigger_run_id,
+        task_id=task_id,
+        trigger_case=trigger.case_id,
+        pairing=pairing,
+        notes=notes,
+        base_url=base_url,
+        payload_base=payload_base,
+    )
+    published[task_id] = str(trigger.case_id or "")
+    record["task_id"] = task_id
+    record["queue_items"] = queue_items
+    if not queue_items:
+        record["stopped_at"] = "no_injection_candidate"
+        result.stop_reason = "NO_INJECTION_CANDIDATE"
+        result.rounds.append(record)
+        return
+    result.rounds.append(record)
+
+
+async def run_trigger_round(
+    *,
+    store: Any,
+    result: PipelineResult,
+    leased: dict[str, Any],
+    write_slices: list[dict[str, Any]],
+    trigger_run_id: str,
+    base_url: str,
+    payload_base: str,
+    budget: int,
+    queue_cap: int,
+    trigger_client: ToolClient | None,
+    url_for: Callable[[dict[str, Any]], str] | None,
+    published: dict[str, str],
+    reports: RunReports,
+    reader: Any,
+) -> None:
+    """Trigger consumer: the leased slice chooses which variant runs.
+
+    The queue no longer knows "direct" as a separate agent. A first-order
+    slice runs the request/direct variant (formerly the direct agent); a
+    second-order slice runs the prove → pair → replay variant (formerly the
+    trigger agent). Both are the same trigger consumer.
+    """
+
+    if str(leased.get("order_mode") or "second") == "direct":
+        await _run_first_order_round(
+            store,
+            result,
+            leased,
+            base_url,
+            url_for,
+            reports,
+            payload_base=payload_base,
+            budget=budget,
+            client=trigger_client,
+        )
+        return
+    await _run_second_order_round(
+        store=store,
+        result=result,
+        leased=leased,
+        write_slices=write_slices,
+        trigger_run_id=trigger_run_id,
+        base_url=base_url,
+        payload_base=payload_base,
+        budget=budget,
+        queue_cap=queue_cap,
+        trigger_client=trigger_client,
+        url_for=url_for,
+        published=published,
+        reports=reports,
+        reader=reader,
+    )
+
+
 async def _consume_rounds(
     *,
     store: Any,
@@ -279,127 +462,23 @@ async def _consume_rounds(
         if leased is None:
             result.stop_reason = "EXHAUSTED" if result.rounds else "NO_TRIGGER_SLICE"
             break
-        family = str(leased.get("order_mode") or "second")
-        if family == "direct":
-            await _run_direct_round(
-                store,
-                result,
-                leased,
-                base_url,
-                url_for,
-                reports,
-                payload_base=payload_base,
-                budget=budget,
-                client=trigger_client,
-            )
-            continue
-
-        round_index = len(result.rounds)
-        raw = dict(leased["slice"])
-        trigger_url = url_for(raw) if url_for is not None else base_url
-        try:
-            trigger = await run_trigger(
-                normalize_slice(raw),
-                base_url=trigger_url,
-                payload_base=payload_base,
-                budget=min(budget, 40),
-                client=trigger_client,
-                slice_id=str(leased["id"]),
-            )
-        except ToolCallError as exc:
-            # A broken slice must not stop the loop: archive it and pick the next.
-            store.archive_slice(str(leased["id"]), "ERROR")
-            result.rounds.append(
-                {
-                    "round": round_index,
-                    "trigger_slice": str(leased["id"]),
-                    "trigger_case": None,
-                    "trigger_verdict": "ERROR",
-                    "queue_items": 0,
-                    "injections": [],
-                    "stopped_at": "error",
-                    "error": exc.envelope.model_dump(),
-                }
-            )
-            continue
-        store.archive_slice(str(leased["id"]), trigger.verdict, case_id=trigger.case_id)
-        result.outcomes.append(
-            CaseOutcome(
-                slice_id=str(leased["id"]),
-                case_id=trigger.case_id,
-                verdict=trigger.verdict,
-                evidence_refs=[step.evidence_ref for step in trigger.trace if step.evidence_ref],
-                residue=trigger.residue or 0,
-                notes={"stage": "trigger"},
-                duration_ms=0,
-            )
-        )
-        reports.add(trigger.case_id, "trigger", trigger.verdict, _slice_label(raw))
-        record: dict[str, Any] = {
-            "round": round_index,
-            "trigger_slice": str(leased["id"]),
-            "trigger_case": trigger.case_id,
-            "trigger_verdict": trigger.verdict,
-            "queue_items": 0,
-            "injections": [],
-        }
-        if trigger.verdict != "EXECUTED" or (trigger.residue or 0) != 0:
-            # Not reachable: the rest of this chain is skipped, loop continues.
-            record["stopped_at"] = "trigger"
-            result.rounds.append(record)
-            continue
-
-        pair_run_id = f"{trigger_run_id}-pair-{round_index}"
-        proven = store.get_slice(str(leased["id"]))
-        pairing = build_pairing_queue(
-            store,
-            pair_run_id,
-            write_slices,
-            [proven] if proven is not None else [],
-            reader=reader,
-            config=PairingConfig(queue_cap=queue_cap),
-        )
-        record["queue_items"] = len(pairing.queue)
-        if not pairing.queue:
-            record["stopped_at"] = "pairing"
-            finding_db_only(store, trigger.case_id)
-            result.rounds.append(record)
-            continue
-
-        task_id = pairing.run_id or f"task-{round_index}"
-        notes = dict(trigger.notes or {})
-        if not notes.get("constraint_plan"):
-            plan = await _constraint_plan_for(
-                store,
-                trigger_client or LocalToolClient("trigger"),
-                raw,
-                trigger=trigger,
-                pair_run_id=pair_run_id,
-                pairing=pairing,
-                base_url=base_url,
-                url_for=url_for,
-            )
-            if plan.get("constraints"):
-                notes["constraint_plan"] = plan
-        queue_items = publish_pairing(
-            store,
-            run_id=trigger_run_id,
-            task_id=task_id,
-            trigger_case=trigger.case_id,
-            pairing=pairing,
-            notes=notes,
+        await run_trigger_round(
+            store=store,
+            result=result,
+            leased=leased,
+            write_slices=write_slices,
+            trigger_run_id=trigger_run_id,
             base_url=base_url,
             payload_base=payload_base,
+            budget=budget,
+            queue_cap=queue_cap,
+            trigger_client=trigger_client,
+            url_for=url_for,
+            published=published,
+            reports=reports,
+            reader=reader,
         )
-        published[task_id] = str(trigger.case_id or "")
-        record["task_id"] = task_id
-        record["queue_items"] = queue_items
-        if not queue_items:
-            record["stopped_at"] = "no_injection_candidate"
-            result.stop_reason = "NO_INJECTION_CANDIDATE"
-            result.rounds.append(record)
-            break
-        result.rounds.append(record)
+
 
 
 
@@ -498,7 +577,7 @@ async def run_pipeline(
     return result
 
 
-async def _run_direct_round(
+async def _run_first_order_round(
     store: Any,
     result: PipelineResult,
     leased: dict[str, Any],
@@ -510,7 +589,7 @@ async def _run_direct_round(
     budget: int = 120,
     client: ToolClient | None = None,
 ) -> None:
-    """One first-order round: the sink class decides how it is proved."""
+    """Trigger, first-order variant: the sink class decides how it is proved."""
     round_index = len(result.rounds)
     raw = dict(leased["slice"])
     page_url = url_for(raw) if url_for is not None else base_url
