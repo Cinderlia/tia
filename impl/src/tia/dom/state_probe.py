@@ -53,6 +53,8 @@ class StateProbeRequest:
     context_values: dict[str, str] = field(default_factory=dict)
     verify_insert: bool = False
     probe_tag: str = ""
+    create_parents: bool = True
+    register_targets: Any = None
 
 
 @dataclass(slots=True)
@@ -86,6 +88,7 @@ class StateStep:
     request: dict[str, Any] | None = None
     undo_ref: str | None = None
     verified: bool = False
+    created: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -96,6 +99,7 @@ class StateStep:
             "request": self.request,
             "undo_ref": self.undo_ref,
             "verified": self.verified,
+            "created": self.created,
         }
 
 
@@ -158,6 +162,13 @@ def _safe_constant(fact: dict[str, Any]) -> tuple[str, int, bool]:
     return "tia", 30, True
 
 
+class _Unresolved(Exception):
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(detail)
+        self.code = code
+        self.detail = detail
+
+
 async def _pick_parent_row(
     call: Call, parent_table: str, parent_column: str, *, limit: int
 ) -> dict[str, Any] | None:
@@ -175,8 +186,187 @@ async def _pick_parent_row(
     return None
 
 
+def _literal(value: str) -> str:
+    if value == "NOW()":
+        return "NOW()"
+    if value.replace(".", "", 1).lstrip("-").isdigit():
+        return value
+    escaped = value.replace("\\", "\\\\").replace("'", "\\'")
+    return f"'{escaped}'"
+
+
+def _insert_sql(table: str, values: dict[str, str]) -> str:
+    columns = list(values)
+    return (
+        f"INSERT INTO `{table}` ({', '.join(f'`{c}`' for c in columns)}) "
+        f"VALUES ({', '.join(_literal(values[c]) for c in columns)})"
+    )
+
+
+async def _insert_row(
+    call: Call, table: str, values: dict[str, str], *, ref: str
+) -> dict[str, Any]:
+    """Insert one scaffold row and return its created key/values."""
+
+    sql = _insert_sql(table, values)
+    written = await call("db_write", {"sql": sql})
+    change = written.get("change") if isinstance(written, dict) else None
+    after = (change or {}).get("after_image") or []
+    row = after[0] if after and isinstance(after[0], dict) else {}
+    return {"sql": sql, "change_id": str((change or {}).get("change_id") or ""), "row": row}
+
+
+async def _resolve_table(
+    call: Call,
+    table: str,
+    payload_columns: list[str],
+    plan: StatePlan,
+    *,
+    depth: int,
+    visited: tuple[str, ...],
+    tables: set[str],
+    budget: StateProbeBudget,
+    create_rows: bool,
+    context: dict[str, str],
+    register: Any = None,
+) -> dict[str, str]:
+    """Return the values this table's INSERT needs, creating parent rows if allowed."""
+
+    if table in visited:
+        raise _Unresolved("STATE_BUDGET", f"cycle: {' -> '.join([*visited, table])}")
+    if depth < 0:
+        raise _Unresolved("STATE_BUDGET", f"parent depth exceeded at {table}")
+    if table not in tables and len(tables) >= budget.tables:
+        raise _Unresolved("STATE_BUDGET", f"table budget {budget.tables} exhausted")
+    tables.add(table)
+    brief = await fetch_brief(call, table, payload_columns=payload_columns)
+    parents = {item.column: item for item in brief.parents}
+    values: dict[str, str] = {}
+    for fact in brief.required:
+        column = str(fact.get("name") or "")
+        kind = str(fact.get("prerequisite") or "constant")
+        if kind == "row":
+            parent = parents.get(column)
+            if parent is None:
+                raise _Unresolved(
+                    "STATE_PARENT_MISSING", f"{table}.{column}: foreign key metadata missing"
+                )
+            row = await _pick_parent_row(
+                call, parent.parent_table, parent.parent_column, limit=budget.candidates
+            )
+            if row is not None:
+                value = str(row[parent.parent_column])
+                plan.prerequisites.append(
+                    Prerequisite(
+                        "row", parent.parent_table, parent.parent_column, value, "existing", 90
+                    )
+                )
+                plan.evidence.append(
+                    StateEvidence(
+                        "row",
+                        {
+                            "table": parent.parent_table,
+                            "column": parent.parent_column,
+                            "value": value,
+                            "reused": True,
+                        },
+                    )
+                )
+            elif not create_rows:
+                raise _Unresolved(
+                    "STATE_PARENT_MISSING",
+                    f"{table}.{column}: no {parent.parent_table}.{parent.parent_column} row",
+                )
+            else:
+                parent_values = await _resolve_table(
+                    call,
+                    parent.parent_table,
+                    [],
+                    plan,
+                    depth=depth - 1,
+                    visited=(*visited, table),
+                    tables=tables,
+                    budget=budget,
+                    create_rows=create_rows,
+                    context=context,
+                    register=register,
+                )
+                if register is not None:
+                    targets = [
+                        {"table": parent.parent_table, "column": column_name, "mode": "insert"}
+                        for column_name in parent_values
+                    ] or [{"table": parent.parent_table, "mode": "insert"}]
+                    register(targets)
+                created = await _insert_row(
+                    call, parent.parent_table, parent_values, ref=f"parent:{parent.parent_table}"
+                )
+                created_value = _created_value(created["row"], parent.parent_column)
+                if created_value is None:
+                    raise _Unresolved(
+                        "STATE_WRITE_DENIED",
+                        f"{parent.parent_table}: inserted row has no {parent.parent_column}",
+                    )
+                step = StateStep(
+                    action="db_write",
+                    ref=f"parent:{parent.parent_table}",
+                    table=parent.parent_table,
+                    sql=str(created["sql"]),
+                    undo_ref=str(created["change_id"]) or None,
+                    verified=True,
+                    created={"column": parent.parent_column, "value": created_value},
+                )
+                plan.steps.append(step)
+                plan.evidence.append(
+                    StateEvidence(
+                        "db_after",
+                        {
+                            "table": parent.parent_table,
+                            "insert": created["sql"][:400],
+                            "value": created_value,
+                        },
+                    )
+                )
+                plan.prerequisites.append(
+                    Prerequisite(
+                        "row",
+                        parent.parent_table,
+                        parent.parent_column,
+                        created_value,
+                        "inserted",
+                        50,
+                    )
+                )
+                value = created_value
+            values[column] = value
+        elif kind == "context":
+            context_value = context.get(f"{table}.{column}") or context.get(column)
+            if context_value is None:
+                raise _Unresolved(
+                    "STATE_REQUIRED_UNRESOLVED",
+                    f"{table}.{column}: no session/account value available",
+                )
+            plan.prerequisites.append(
+                Prerequisite("context", table, column, str(context_value), "session", 80)
+            )
+            values[column] = str(context_value)
+        else:
+            value, confidence, review = _safe_constant(fact)
+            plan.prerequisites.append(
+                Prerequisite("constant", table, column, value, "constant", confidence)
+            )
+            values[column] = value
+            if review:
+                plan.notes.append(f"{table}.{column}: safe constant {value!r} needs review")
+    return values
+
+
+def _created_value(row: dict[str, Any], column: str) -> str | None:
+    value = row.get(column)
+    return None if value is None else str(value)
+
+
 async def run_state_probe(call: Call, request: StateProbeRequest) -> StatePlan:
-    """Resolve the values a legal INSERT needs (read-only unless verify_insert)."""
+    """Resolve the values a legal INSERT needs (creating parent rows when allowed)."""
 
     started = time.monotonic()
     if not request.case_id:
@@ -192,97 +382,27 @@ async def run_state_probe(call: Call, request: StateProbeRequest) -> StatePlan:
         schema_brief=brief,
         evidence=[StateEvidence("schema", {"table": brief.table, "required": len(brief.required)})],
     )
-    parents = {item.column: item for item in brief.parents}
-    touched: set[str] = {request.table}
-    unresolved: list[str] = []
-
-    for fact in brief.required:
-        column = str(fact.get("name") or "")
-        kind = str(fact.get("prerequisite") or "constant")
-        if kind == "row":
-            parent = parents.get(column)
-            if parent is None:
-                unresolved.append(f"{column}: foreign key metadata missing")
-                continue
-            row = await _pick_parent_row(
-                call,
-                parent.parent_table,
-                parent.parent_column,
-                limit=request.budget.candidates,
-            )
-            if row is None:
-                unresolved.append(
-                    f"{column}: no {parent.parent_table}.{parent.parent_column} row to reuse"
-                )
-                plan.notes.append(
-                    f"{parent.parent_table} has no reusable row; creating one is M3"
-                )
-                continue
-            value = str(row[parent.parent_column])
-            touched.add(parent.parent_table)
-            plan.prerequisites.append(
-                Prerequisite(
-                    kind="row",
-                    table=parent.parent_table,
-                    column=parent.parent_column,
-                    value=value,
-                    source="existing",
-                    confidence=90,
-                )
-            )
-            plan.values[column] = value
-            plan.evidence.append(
-                StateEvidence(
-                    "row",
-                    {
-                        "table": parent.parent_table,
-                        "column": parent.parent_column,
-                        "value": value,
-                        "reused": True,
-                    },
-                )
-            )
-        elif kind == "context":
-            context_value = (
-                request.context_values.get(f"{request.table}.{column}")
-                or request.context_values.get(column)
-            )
-            if context_value is None:
-                unresolved.append(f"{column}: no session/account value available")
-                continue
-            plan.prerequisites.append(
-                Prerequisite("context", request.table, column, str(context_value), "session", 80)
-            )
-            plan.values[column] = str(context_value)
-        else:
-            value, confidence, review = _safe_constant(fact)
-            plan.prerequisites.append(
-                Prerequisite(
-                    "constant",
-                    request.table,
-                    column,
-                    value,
-                    "constant",
-                    confidence,
-                )
-            )
-            plan.values[column] = value
-            if review:
-                plan.notes.append(f"{column}: safe constant {value!r} needs review")
-
-    if len(touched) > request.budget.tables:
-        plan.status = "PARTIAL"
-        plan.stop_reason = "STATE_BUDGET"
-        plan.notes.append(f"budget allows {request.budget.tables} tables, touched {len(touched)}")
-    if unresolved:
-        plan.status = "UNRESOLVED"
-        plan.stop_reason = (
-            "STATE_PARENT_MISSING"
-            if any("no " in item and "row to reuse" in item for item in unresolved)
-            else "STATE_REQUIRED_UNRESOLVED"
+    tables: set[str] = set()
+    try:
+        values = await _resolve_table(
+            call,
+            request.table,
+            list(request.payload_columns),
+            plan,
+            depth=request.budget.depth,
+            visited=(),
+            tables=tables,
+            budget=request.budget,
+            create_rows=request.create_parents,
+            context=request.context_values,
+            register=request.register_targets,
         )
-        plan.notes.append("unresolved: " + "; ".join(unresolved))
+    except _Unresolved as exc:
+        plan.status = "UNRESOLVED"
+        plan.stop_reason = exc.code
+        plan.notes.append(exc.detail)
         return plan
+    plan.values.update(values)
 
     if request.verify_insert:
         await _verify_insert(call, request, plan, brief)
@@ -295,33 +415,12 @@ async def run_state_probe(call: Call, request: StateProbeRequest) -> StatePlan:
     return plan
 
 
-def _insert_sql(request: StateProbeRequest, plan: StatePlan) -> tuple[str, dict[str, str]]:
-    values = dict(plan.values)
-    for column in request.payload_columns:
-        values[column] = request.probe_tag or "tia-probe"
-    columns = list(values)
-    sql = (
-        f"INSERT INTO `{request.table}` ({', '.join(f'`{c}`' for c in columns)}) "
-        f"VALUES ({', '.join(_literal(values[c]) for c in columns)})"
-    )
-    return sql, values
-
-
-def _literal(value: str) -> str:
-    if value == "NOW()":
-        return "NOW()"
-    if value.replace(".", "", 1).lstrip("-").isdigit():
-        return value
-    escaped = value.replace("\\", "\\\\").replace("'", "\\'")
-    return f"'{escaped}'"
-
-
 async def _verify_insert(
     call: Call, request: StateProbeRequest, plan: StatePlan, brief: SchemaBrief
 ) -> None:
     """Prove the row is legal, then undo it (residue must be 0)."""
 
-    sql, values = _insert_sql(request, plan)
+    sql, values = _insert_sql_for(request, plan)
     step = StateStep(action="db_write", ref="insert", table=request.table, sql=sql)
     plan.steps.append(step)
     try:
@@ -346,3 +445,10 @@ async def _verify_insert(
     if residue not in (0, None):
         plan.status = "PARTIAL"
         plan.notes.append("RESIDUE_LEFT")
+
+
+def _insert_sql_for(request: StateProbeRequest, plan: StatePlan) -> tuple[str, dict[str, str]]:
+    values = dict(plan.values)
+    for column in request.payload_columns:
+        values[column] = request.probe_tag or "tia-probe"
+    return _insert_sql(request.table, values), values

@@ -348,3 +348,101 @@ async def test_inject_sql_read_channel_uses_probe(runtime: Any) -> None:
     assert result.notes["verify_on"] == "sql_probe"
     assert client.read_probes >= 1
     assert not [call for call in client.verify_calls if "list.php" in str(call.get("url") or "")]
+
+
+class FakeNeedsParentClient(FakeInjectClient):
+    """The write path only succeeds after a scaffold parent row exists."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.posts = 0
+        self.sent: list[dict[str, Any]] = []
+
+    def _data(self, tool: str, args: dict[str, Any]) -> dict[str, Any]:
+        if tool == "db_schema":
+            table = str(args.get("table") or "comments")
+            if table == "posts":
+                return {
+                    "tables": [
+                        {
+                            "name": "posts",
+                            "primary_key": ["id"],
+                            "columns": [
+                                {"name": "id", "type": "int", "column_type": "int(11)",
+                                 "nullable": False, "default": None,
+                                 "extra": "auto_increment", "length": None},
+                                {"name": "label", "type": "varchar",
+                                 "column_type": "varchar(20)", "nullable": False,
+                                 "default": None, "extra": "", "length": 20},
+                            ],
+                            "fks": [],
+                        }
+                    ]
+                }
+            return {
+                "tables": [
+                    {
+                        "name": "comments",
+                        "primary_key": ["id"],
+                        "columns": [
+                            {"name": "id", "type": "int", "column_type": "int(11)",
+                             "nullable": False, "default": None,
+                             "extra": "auto_increment", "length": None},
+                            {"name": "parent_id", "type": "int",
+                             "column_type": "int(11)", "nullable": False,
+                             "default": None, "extra": "", "length": None},
+                            {"name": "comment", "type": "varchar",
+                             "column_type": "varchar(100)", "nullable": False,
+                             "default": None, "extra": "", "length": 100},
+                        ],
+                        "fks": [
+                            {"column": "parent_id", "ref_table": "posts",
+                             "ref_column": "id", "delete_rule": "CASCADE"}
+                        ],
+                    }
+                ]
+            }
+        if tool == "probe_run":
+            self.sent.append(dict(parse_qs(str(args.get("body") or ""))))
+            if self.posts == 0:
+                return {
+                    "hit": False,
+                    "queries": [],
+                    "http": {"status": 200, "bytes": 100, "html": "<html>error</html>"},
+                }
+            self.submitted = True
+            return {
+                "hit": True,
+                "queries": [
+                    {
+                        "sql": "insert into comments (parent_id,comment) values(9,'tia')",
+                        "affected_rows": 1,
+                        "last_insert_id": 3,
+                    }
+                ],
+                "http": {"status": 200, "bytes": 100, "html": PAGE_WITH_FORM},
+            }
+        if tool == "db_write":
+            sql = str(args.get("sql") or "")
+            if sql.lower().startswith("insert into `posts`"):
+                self.posts = 1
+                return {"change": {"change_id": "ch-parent", "after_image": [{"id": 9}]}}
+            return {"change": {"change_id": "ch-write", "affected": 1}}
+        if tool == "db_read":
+            sql = str(args.get("sql") or "")
+            if "FROM `posts`" in sql:
+                return {"rows": []}
+            return {"rows": [{"n": self.posts}], "columns": ["n"]}
+        if tool == "verify_tag":
+            return self._verify(args)
+        return super()._data(tool, args)
+
+
+async def test_inject_creates_the_parent_row_the_write_path_needs(runtime: Any) -> None:
+    client = FakeNeedsParentClient()
+    result = await run_inject(_slice(), base_url="http://127.0.0.1/xvwa/", client=client)
+    assert result.verdict == "EXECUTABLE"
+    assert result.notes["state_plan"]["status"] == "READY"
+    assert result.notes["state_plan"]["values"] == {"parent_id": "9"}
+    assert result.notes["state_probe_retry"]["probed"] is True
+    assert client.posts == 1

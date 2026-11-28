@@ -8,6 +8,36 @@ from tia.dom.state_probe import StateProbeRequest, run_state_probe
 from tia.orch.kernel import ToolCallError
 from tia.schemas.envelope import Envelope, ErrorBody, ErrorCode
 
+PARENT_SCHEMA = {
+    "tables": [
+        {
+            "name": "parent",
+            "primary_key": ["id"],
+            "columns": [
+                {
+                    "name": "id",
+                    "type": "int",
+                    "column_type": "int(11)",
+                    "nullable": False,
+                    "default": None,
+                    "extra": "auto_increment",
+                    "length": None,
+                },
+                {
+                    "name": "label",
+                    "type": "varchar",
+                    "column_type": "varchar(20)",
+                    "nullable": False,
+                    "default": "p",
+                    "extra": "",
+                    "length": 20,
+                },
+            ],
+            "fks": [],
+        }
+    ]
+}
+
 SCHEMA = {
     "tables": [
         {
@@ -67,17 +97,26 @@ SCHEMA = {
 class FakeCall:
     def __init__(self, parent_rows: list[dict[str, Any]]) -> None:
         self.parent_rows = parent_rows
+        self.writes: list[str] = []
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     async def __call__(self, tool: str, args: dict[str, Any]) -> dict[str, Any]:
         self.calls.append((tool, args))
         sql = str(args.get("sql") or "")
         if tool == "db_schema":
-            return SCHEMA
+            return PARENT_SCHEMA if args.get("table") == "parent" else SCHEMA
         if tool == "db_read" and sql.startswith("SELECT * FROM `parent`"):
             return {"rows": self.parent_rows}
         if tool == "db_write":
-            return {"change": {"change_id": "ch-1", "undo_sql": "DELETE FROM child WHERE 1=0"}}
+            self.writes.append(sql)
+            insert_id = 100 + len(self.writes)
+            return {
+                "change": {
+                    "change_id": f"ch-{len(self.writes)}",
+                    "undo_sql": "DELETE FROM child WHERE 1=0",
+                    "after_image": [{"id": insert_id}],
+                }
+            }
         if tool == "db_undo":
             return {"residue": 0}
         raise AssertionError(f"unexpected call {tool} {sql[:120]}")
@@ -99,15 +138,35 @@ async def test_ready_plan_reuses_parent_row_and_fills_constants() -> None:
     assert {tool for tool, _ in call.calls} == {"db_schema", "db_read"}
 
 
-async def test_missing_parent_row_is_unresolved() -> None:
+async def test_missing_parent_row_is_unresolved_when_creation_is_off() -> None:
     call = FakeCall([])
     plan = await run_state_probe(
-        call, StateProbeRequest(case_id="case-1", table="child", payload_columns=["body"])
+        call,
+        StateProbeRequest(
+            case_id="case-1",
+            table="child",
+            payload_columns=["body"],
+            create_parents=False,
+        ),
     )
     assert plan.status == "UNRESOLVED"
     assert plan.stop_reason == "STATE_PARENT_MISSING"
     assert "parent_id" in plan.notes[-1]
-    assert plan.values == {"kind": "first"}
+    assert plan.values == {}
+    assert call.writes == []
+
+
+async def test_missing_parent_row_is_created_and_reused() -> None:
+    call = FakeCall([])
+    plan = await run_state_probe(
+        call, StateProbeRequest(case_id="case-1", table="child", payload_columns=["body"])
+    )
+    assert plan.status == "READY"
+    assert plan.values == {"parent_id": "101", "kind": "first"}
+    assert call.writes and call.writes[0].startswith("INSERT INTO `parent` (")
+    assert plan.steps[0].action == "db_write"
+    assert plan.steps[0].created == {"column": "id", "value": "101"}
+    assert plan.prerequisites[0].source == "inserted"
 
 
 async def test_verify_insert_writes_then_undoes() -> None:

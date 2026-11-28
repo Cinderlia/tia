@@ -1265,6 +1265,7 @@ async def _retry_insert_with_state(
         payload_columns=[payload_column] if payload_column else [],
         failed_sql=sql[:2000],
         error_text=exc.message[:500],
+        register_targets=getattr(kernel, "set_write_targets", None),
     )
     plan = await run_state_probe(kernel.call, request)
     notes["state_plan"] = plan.to_dict()

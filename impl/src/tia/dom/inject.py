@@ -293,6 +293,30 @@ def _column_type(table: dict[str, Any], column: str) -> str:
     return ""
 
 
+async def _probe_state(
+    kernel: Kernel, case_id: str, target: dict[str, Any], notes: dict[str, Any]
+) -> Any:
+    """Ask the state probe what values a legal INSERT into the target needs."""
+    from tia.dom.state_probe import StateProbeRequest, run_state_probe
+
+    table = str(target.get("table") or "")
+    if not table:
+        return None
+    request = StateProbeRequest(
+        case_id=case_id,
+        table=table,
+        payload_columns=[str(c) for c in target.get("columns") or [] if str(c)],
+        register_targets=kernel.set_write_targets,
+    )
+    try:
+        plan = await run_state_probe(kernel.call, request)
+    except ToolCallError as exc:
+        notes["state_probe_error"] = f"{exc.code.value}: {exc.message}"
+        return None
+    notes["state_plan"] = plan.to_dict()
+    return plan if plan.status == "READY" else None
+
+
 async def _count_tagged_rows(kernel: Any, table: str, tag: str, *, max_columns: int = 8) -> int:
     """Count rows of ``table`` whose text columns already carry the tag.
 
@@ -615,6 +639,7 @@ async def _run_inject(
 
     observation = ""
     submitted: dict[str, Any] = {}
+    sent_values: dict[str, str] = {}
     armed = False
     arm_targets: list[dict[str, Any]] = []
     # A single request can insert into several tables (a parent row plus the row
@@ -630,6 +655,8 @@ async def _run_inject(
     async def _send(
         method: str, values: dict[str, str], files: dict[str, str], account: str = ""
     ) -> dict[str, Any]:
+        sent_values.clear()
+        sent_values.update(values)
         body = urlencode(values)
         if armed:
             page = await call(
@@ -765,6 +792,38 @@ async def _run_inject(
         "probe" if probed else ("db_read" if stored > 0 else ("status" if not armed else "none"))
     )
     submitted = dict((delivery.last.extra.get("raw") if delivery.last else {}) or {})
+    if not accepted and sent_values and target.get("table"):
+        # The application's INSERT may need rows it never created (a parent key,
+        # a non-null scope column).  Resolve them once and send the same request.
+        plan = await _probe_state(kernel, result.case_id, target, notes)
+        if plan is not None:
+            try:
+                retry = await _send(
+                    delivery.plan.method if delivery.plan else "POST",
+                    dict(sent_values),
+                    {},
+                    delivery.plan.account if delivery.plan else "",
+                )
+            except ToolCallError as exc:
+                notes["state_probe_retry_error"] = f"{exc.code.value}: {exc.message}"
+            else:
+                retry_status = int(retry.get("status") or 0)
+                retry_probed = bool(retry.get("probe_hit"))
+                retry_stored = 0
+                if retry_status < 400 and not retry_probed:
+                    with contextlib.suppress(ToolCallError):
+                        retry_stored = await _count_tagged_rows(
+                            kernel, str(target["table"]), tag
+                        )
+                notes["state_probe_retry"] = {
+                    "status": retry_status,
+                    "probed": retry_probed,
+                    "stored": retry_stored,
+                }
+                if retry_status < 400 and (retry_probed or retry_stored > 0):
+                    accepted = True
+                    stored = retry_stored or 1
+                    notes["write_signal"] = "probe" if retry_probed else "db_read"
     if delivery.last is not None and not submitted:
         submitted = {"http": {"status": delivery.last.status, "html": delivery.last.html}}
     if not accepted:
