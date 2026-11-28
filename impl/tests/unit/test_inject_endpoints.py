@@ -15,6 +15,7 @@ from tia.schemas.envelope import Envelope
 PAGE_GET = (
     '<html><body><form action="" method="get">'
     '<input type="text" name="comment">'
+    '<input type="number" name="qty">'
     '<input type="submit" value="search"></form></body></html>'
 )
 PAGE_AJAX = (
@@ -191,5 +192,7 @@ async def test_inject_uses_the_query_string_for_a_get_endpoint(runtime: Any) -> 
     assert result.notes["entry_method"] == "GET"
     sent = client.posted[0]
     assert sent["method"].upper() == "GET"
-    assert "comment" in (sent.get("params") or {})
+    params = sent.get("params") or {}
+    assert "comment" in params
+    assert params.get("qty") == "1"
     assert not sent.get("body")

@@ -173,6 +173,41 @@ class _Form:
     method: str
     fields: dict[str, str]
     files: list[str] = field(default_factory=list)
+    types: dict[str, str] = field(default_factory=dict)
+
+
+def _default_field_value(name: str, kind: str, value: str) -> str:
+    """A value the page is likely to accept when the planner leaves a field empty.
+
+    Mirrors what a browser would do with a form the user only partly fills: the
+    field's own type decides a plausible value instead of one constant string.
+    """
+    if value:
+        return value
+    lowered = (kind or "text").lower()
+    if lowered in {"hidden", "submit", "button", "image", "reset"}:
+        return value or "1"
+    if lowered in {"number", "range"}:
+        return "1"
+    if lowered == "email":
+        return "tia@example.test"
+    if lowered == "url":
+        return "http://localhost/"
+    if lowered == "tel":
+        return "10000000000"
+    if lowered == "date":
+        return "2020-01-01"
+    if lowered == "checkbox":
+        return "on"
+    if lowered == "radio":
+        return "on"
+    if lowered == "password":
+        return "tia-dev-pass"
+    if lowered in {"file"}:
+        return ""
+    if name.lower() in {"quantity", "qty", "amount", "price"}:
+        return "1"
+    return "tia"
 
 
 def _tag() -> str:
@@ -193,6 +228,7 @@ def _forms(document: Document, page_url: str) -> list[_Form]:
             method=form.method,
             fields={field.name: field.value for field in form.fields},
             files=list(form.files),
+            types={field.name: field.type for field in form.fields},
         )
         for form in forms_from_document(document, page_url)
     ]
@@ -597,6 +633,7 @@ async def _run_inject(
                     action=shape.url,
                     method=shape.method.lower(),
                     fields=fields,
+                    types={name: "text" for name in fields},
                 )
             )
             endpoint_notes.append(shape.to_dict())
@@ -715,14 +752,21 @@ async def _run_inject(
     # ---- I4/I5 delivery: use the application's own form ----
     # The model plans the request; local code only fills a page every field
     # blank and validates the plan. Execution (probe/verify) decides if it worked.
-    fallback = {name: (value or "tia") for name, value in form.fields.items()}
+    fallback = {
+        name: _default_field_value(name, form.types.get(name, "text"), value)
+        for name, value in form.fields.items()
+    }
     fallback[field_name] = payload
     plan_forms = [
         PageForm(
             action=item.action,
             method=item.method,
             fields=[
-                FormField(name=name, type="text", value=value)
+                FormField(
+                    name=name,
+                    type=item.types.get(name, "text"),
+                    value=value,
+                )
                 for name, value in item.fields.items()
             ],
             files=list(item.files),
