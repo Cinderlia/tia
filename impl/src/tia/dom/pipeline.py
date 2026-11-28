@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from tia.cap.entry import infer_read_entry
+from tia.cap.read_evidence import collect_read_sql
 from tia.dom.direct import run_direct
 from tia.dom.inject import run_inject
 from tia.dom.lanes import publish_pairing, start_workers
@@ -29,9 +30,10 @@ from tia.dom.trigger import normalize_slice, run_trigger
 from tia.inf.findings import finding_db_only, finding_first_order
 from tia.inf.reports import RunReports
 from tia.inf.runtime import get_runtime
-from tia.orch.kernel import ToolCallError, ToolClient
+from tia.orch.kernel import LocalToolClient, ToolCallError, ToolClient
 from tia.orch.learning import hints_for
 from tia.schemas.objects import CaseOutcome
+from tia.sinks.registry import sink_class_for
 
 _RETRYABLE_INJECT = frozenset(
     {"WRITE_NOT_REACHED", "WRITE_NOT_REACHED_ENV", "ENV_ERROR", "TIMEOUT", "PATH_UNREACHABLE"}
@@ -157,6 +159,89 @@ def _reader() -> Callable[[str, int, int], list[tuple[int, str]]] | None:
     return read
 
 
+
+async def _constraint_plan_for(
+    store: Any,
+    client: ToolClient,
+    raw: dict[str, Any],
+    *,
+    trigger: Any,
+    pair_run_id: str,
+    pairing: Any,
+    base_url: str,
+    url_for: Callable[[dict[str, Any]], str] | None,
+) -> dict[str, Any]:
+    """Translate the predicate the read page proved into inject replay steps."""
+
+    sink = sink_class_for(str(raw.get("kind") or "Xss"))
+    first = pairing.queue[0] if pairing.queue else {}
+    table = str(first.get("table") or "")
+    columns = [str(column) for column in (first.get("columns") or [])]
+    if not sink.writes_database() or not table or not columns:
+        return {}
+    writers: list[tuple[str, dict[str, Any]]] = []
+    for row in store.list_slice_rows(run_id=pair_run_id, limit=2000):
+        if str(row.get("role") or "") != "write":
+            continue
+        candidate = row.get("slice")
+        if isinstance(candidate, dict):
+            writers.append((str(row.get("id")), dict(candidate)))
+    if not writers:
+        return {}
+    page_url = url_for(raw) if url_for is not None else base_url
+
+    async def calling(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        envelope = await client.call(name, arguments)
+        data = getattr(envelope, "data", envelope)
+        return dict(data or {})
+
+    read_sql = ""
+    read_trace: dict[str, Any] = {}
+    try:
+        evidence = await collect_read_sql(
+            calling,
+            case_id=str(trigger.case_id),
+            url=page_url,
+            sink_file=str(raw.get("sinkFile") or ""),
+            sink_line=int(raw.get("sinkLine") or 0),
+        )
+        read_trace = evidence.get("trace") or {}
+        statements = evidence.get("statements") or []
+        if statements:
+            read_sql = str(statements[0])
+    except Exception:  # noqa: BLE001 - evidence is best effort
+        read_sql = ""
+    flow = {
+        "flow_id": pair_run_id,
+        "table_name": table,
+        "columns": columns,
+        "writer_slice_ids": [writer_id for writer_id, _ in writers],
+    }
+    from tia.dom.constraint_steps import build_steps
+    from tia.inf.accounts import public_catalog
+
+    planner = None
+    try:
+        from tia.ad.llm import LlmClient
+
+        planner = LlmClient.from_env()
+    except Exception:  # noqa: BLE001 - the planner is optional
+        planner = None
+    plan = await build_steps(
+        calling,
+        flow,
+        writers,
+        base_url,
+        url_for,
+        public_catalog(get_runtime().settings.accounts_path),
+        read_raw=raw,
+        read_sql=read_sql,
+        read_trace=read_trace,
+        planner=planner,
+    )
+    return plan if isinstance(plan, dict) else {}
+
+
 async def run_pipeline(
     store: Any,
     trigger_run_id: str,
@@ -224,7 +309,17 @@ async def run_pipeline(
             result.stop_reason = "EXHAUSTED" if result.rounds else "NO_TRIGGER_SLICE"
             break
         if family == "direct":
-            await _run_direct_round(store, result, leased, base_url, url_for, reports)
+            await _run_direct_round(
+                store,
+                result,
+                leased,
+                base_url,
+                url_for,
+                reports,
+                payload_base=payload_base,
+                budget=budget,
+                client=trigger_client,
+            )
             continue
 
         round_index = len(result.rounds)
@@ -300,13 +395,27 @@ async def run_pipeline(
             continue
 
         task_id = pairing.run_id or f"task-{round_index}"
+        notes = dict(trigger.notes or {})
+        if not notes.get("constraint_plan"):
+            plan = await _constraint_plan_for(
+                store,
+                trigger_client or LocalToolClient("trigger"),
+                raw,
+                trigger=trigger,
+                pair_run_id=pair_run_id,
+                pairing=pairing,
+                base_url=base_url,
+                url_for=url_for,
+            )
+            if plan.get("constraints"):
+                notes["constraint_plan"] = plan
         queue_items = publish_pairing(
             store,
             run_id=trigger_run_id,
             task_id=task_id,
             trigger_case=trigger.case_id,
             pairing=pairing,
-            notes=trigger.notes or {},
+            notes=notes,
             base_url=base_url,
             payload_base=payload_base,
         )
@@ -337,17 +446,37 @@ async def _run_direct_round(
     base_url: str,
     url_for: Callable[[dict[str, Any]], str] | None,
     reports: RunReports,
+    *,
+    payload_base: str = "<script>alert(1)</script>",
+    budget: int = 120,
+    client: ToolClient | None = None,
 ) -> None:
-    """One first-order round: direct agent, no pairing, no injection queue."""
+    """One first-order round: the sink class decides how it is proved."""
     round_index = len(result.rounds)
     raw = dict(leased["slice"])
     page_url = url_for(raw) if url_for is not None else base_url
+    sink_class = sink_class_for(str(raw.get("kind") or "Xss"))
     try:
-        direct = await run_direct(
-            normalize_slice(raw),
-            base_url=page_url,
-            slice_id=str(leased["id"]),
-        )
+        if sink_class.writes_database():
+            direct = await run_direct(
+                normalize_slice(raw),
+                base_url=page_url,
+                payload_base=payload_base,
+                budget=min(budget, 40),
+                client=client,
+                slice_id=str(leased["id"]),
+            )
+        else:
+            from tia.dom.request_prover import run_request_prover
+
+            direct = await run_request_prover(
+                raw,
+                base_url=page_url,
+                payload_base=payload_base,
+                budget=min(budget, 40),
+                client=client,
+                slice_id=str(leased["id"]),
+            )
     except ToolCallError as exc:
         store.archive_slice(str(leased["id"]), "ERROR")
         result.rounds.append(

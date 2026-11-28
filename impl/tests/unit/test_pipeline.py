@@ -141,3 +141,44 @@ async def test_slice_error_is_recorded_and_skipped(tmp_path: Path, monkeypatch: 
     assert result.rounds[0]["stopped_at"] == "error"
     assert result.rounds[1]["trigger_verdict"] == "READ_NOT_REFLECTED"
 
+
+
+@pytest.mark.asyncio
+async def test_direct_round_dispatches_a_sql_read_slice_to_the_prover(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    store = Store(tmp_path / "tia.db")
+    calls: list[str] = []
+
+    async def fake_prover(raw: dict[str, Any], **kwargs: Any) -> _Result:
+        calls.append("prover")
+        return _Result("EXECUTED")
+
+    async def fake_direct(raw: dict[str, Any], **kwargs: Any) -> _Result:
+        calls.append("direct")
+        return _Result("EXECUTED")
+
+    monkeypatch.setattr("tia.dom.request_prover.run_request_prover", fake_prover)
+    monkeypatch.setattr(pipeline_mod, "run_direct", fake_direct)
+
+    result = await run_pipeline(
+        store,
+        "run-sqlread",
+        [],
+        [],
+        base_url="http://127.0.0.1/xvwa/",
+        mode="direct",
+        direct_slices=[
+            {
+                "kind": "SqlRead",
+                "sinkFile": "vulnerabilities/sqli/home.php",
+                "sinkLine": 61,
+                "sinkCode": "select * from caffaine where itemid = :item",
+                "params": ["item"],
+            }
+        ],
+        timeout_sec=5,
+    )
+
+    assert calls == ["prover"]
+    assert result.outcomes[0].verdict == "EXECUTED"
