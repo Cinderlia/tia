@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from tia.dom import trigger as trigger_module
 from tia.dom.trigger import run_trigger
 from tia.inf.config import Settings
 from tia.inf.runtime import configure, reset_runtime
@@ -155,3 +156,24 @@ async def test_trigger_reflected_encoded_is_not_executed(runtime: Any) -> None:
 async def test_trigger_not_reflected(runtime: Any) -> None:
     result = await run_trigger(_slice(), base_url="http://127.0.0.1/xvwa/", client=FakeClient(verify_found=False))
     assert result.verdict == "READ_NOT_REFLECTED"
+
+
+async def _fake_write_planner(model=None, **kwargs: Any) -> dict[str, Any]:
+    """Deterministic stand-in for the model-written SQL in offline tests."""
+    table = str(kwargs.get("table") or "")
+    columns = [str(name) for name in kwargs.get("columns") or []]
+    preferred = [name for name in ("comment", "content", "body") if name in columns]
+    column = preferred[0] if preferred else (columns[0] if columns else "id")
+    template = "UPDATE `" + table + "` SET `" + column + "` = {{PAYLOAD}} WHERE `id` = 9"
+    return {
+        "template": template,
+        "sql": template.replace("{{PAYLOAD}}", "'x'"),
+        "column": column,
+        "row_id": 9,
+        "reason": "offline test",
+    }
+
+
+@pytest.fixture(autouse=True)
+def _install_write_planner(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(trigger_module, "plan_write_sql", _fake_write_planner)

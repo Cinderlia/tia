@@ -160,3 +160,24 @@ async def test_unsatisfiable_condition_is_rolled_back() -> None:
     assert result.verdict != "EXECUTED"
     assert result.notes.get("constraints") in (None, [])
     assert "ch-update" in client.undo_ids
+
+
+async def _fake_write_planner(model=None, **kwargs: Any) -> dict[str, Any]:
+    """Deterministic stand-in for the model-written SQL in offline tests."""
+    table = str(kwargs.get("table") or "")
+    columns = [str(name) for name in kwargs.get("columns") or []]
+    preferred = [name for name in ("comment", "content", "body") if name in columns]
+    column = preferred[0] if preferred else (columns[0] if columns else "id")
+    template = "UPDATE `" + table + "` SET `" + column + "` = {{PAYLOAD}} WHERE `id` = 9"
+    return {
+        "template": template,
+        "sql": template.replace("{{PAYLOAD}}", "'x'"),
+        "column": column,
+        "row_id": 9,
+        "reason": "offline test",
+    }
+
+
+@pytest.fixture(autouse=True)
+def _install_write_planner(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(trigger_module, "plan_write_sql", _fake_write_planner)

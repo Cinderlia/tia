@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, unquote
 
 import pytest
 
+from tia.dom import trigger as trigger_module
 from tia.dom.inject import run_inject
 from tia.dom.main import run_main
 from tia.inf.config import Settings
@@ -506,3 +507,22 @@ async def test_inject_finds_the_form_that_targets_the_write_handler(runtime: Any
     assert result.verdict == "EXECUTABLE"
     assert result.notes["entry_fallback"] == "handler"
     assert result.notes["entry_url"] == "http://127.0.0.1/xvwa/index.php"
+
+
+async def _fake_write_planner(model=None, **kwargs: Any) -> dict[str, Any]:
+    table = str(kwargs.get("table") or "")
+    columns = [str(name) for name in kwargs.get("columns") or []]
+    column = "comment" if "comment" in columns else (columns[0] if columns else "id")
+    template = "UPDATE `" + table + "` SET `" + column + "` = {{PAYLOAD}} WHERE `id` = 7"
+    return {
+        "template": template,
+        "sql": template.replace("{{PAYLOAD}}", "'x'"),
+        "column": column,
+        "row_id": 7,
+        "reason": "offline test",
+    }
+
+
+@pytest.fixture(autouse=True)
+def _install_write_planner(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(trigger_module, "plan_write_sql", _fake_write_planner)

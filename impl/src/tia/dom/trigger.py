@@ -30,6 +30,8 @@ from tia.cap.entry import (
 from tia.cap.forms import FormField, PageForm
 from tia.cap.request_plan import plan_request
 from tia.cap.schema import fetch_brief, render_brief
+from tia.cap.write_sql import compile as compile_write
+from tia.cap.write_sql import plan_write_sql
 from tia.dom.state_probe import StateProbeRequest, constant_review, run_state_probe
 from tia.inf.reports import write_case_report
 from tia.inf.runtime import get_runtime
@@ -37,7 +39,7 @@ from tia.inf.settings import attempt_limit
 from tia.inf.store import now_iso
 from tia.orch.kernel import Kernel, LocalToolClient, StepRecord, ToolCallError, ToolClient
 from tia.orch.learning import record_case
-from tia.schemas.envelope import ErrorCode
+from tia.schemas.envelope import ToolError
 from tia.schemas.plan import ConstraintPlan, ConstraintWrite, PayloadPlan, Step
 from tia.schemas.verdict import TriggerVerdict
 from tia.sinks.base import Observation, trigger_verdict
@@ -134,6 +136,79 @@ async def _probe_sink_read(
             for row in query.get("rows") or []
             if tag in " ".join(str(value) for value in row.values())
         )
+    return note
+
+
+_MAX_READ_LINES = 4
+
+
+def _select_lines(lines: list[dict[str, Any]], table: str, limit: int = _MAX_READ_LINES) -> list[int]:
+    """Line numbers of SELECT statements that read the target table."""
+    found: list[int] = []
+    for item in lines:
+        text = str(item.get("text", ""))
+        match = _SELECT_RE.search(text)
+        number = item.get("n")
+        if match is None or match.group(1).lower() != table.lower():
+            continue
+        if isinstance(number, int) and number not in found:
+            found.append(number)
+            if len(found) >= limit:
+                break
+    return found
+
+
+async def _capture_read_sql(
+    kernel: Kernel,
+    case_id: str,
+    sink_file: str,
+    lines: list[dict[str, Any]],
+    table: str,
+    base_url: str,
+    tag: str,
+) -> dict[str, Any]:
+    """Run the read page once with the capture armed and keep the executed SQL."""
+    note: dict[str, Any] = {"lines": [], "reads": []}
+    candidates = _select_lines(lines, table)
+    if not candidates:
+        return note
+    note["lines"] = candidates
+    try:
+        await kernel.call(
+            "probe_arm",
+            {
+                "case_id": case_id,
+                "targets": [{"file": sink_file, "line": line} for line in candidates],
+            },
+        )
+    except ToolCallError as exc:
+        note["error"] = exc.code.value
+        return note
+    try:
+        run = await kernel.call("probe_run", {"case_id": case_id, "url": base_url})
+    except ToolCallError as exc:
+        note["error"] = exc.code.value
+        return note
+    finally:
+        with contextlib.suppress(ToolCallError):
+            await kernel.call("probe_disarm", {"case_id": case_id})
+    seen: set[str] = set()
+    for query in run.get("queries") or []:
+        sql = str(query.get("sql") or "").strip()
+        if not sql:
+            continue
+        key = " ".join(sql.lower().split())
+        if key in seen:
+            continue
+        seen.add(key)
+        note["reads"].append(
+            {
+                "sql": sql,
+                "line": query.get("matched_at_line") or query.get("matched_at"),
+                "rows": list(query.get("rows") or [])[:8],
+            }
+        )
+    note["hit"] = bool(note["reads"])
     return note
 
 
@@ -664,38 +739,30 @@ async def _run_trigger(
         c["name"] for c in table_meta["columns"] if c["name"] not in pk_columns
     ]
     column_length = {c["name"]: c.get("length") for c in table_meta["columns"]}
-    column_type = {c["name"]: str(c.get("type") or "") for c in table_meta["columns"]}
     payload_column = value_columns[0] if value_columns else ""
-    # Prefer changing one column of an existing row: an INSERT must satisfy every
-    # NOT NULL column (foreign keys included), while an UPDATE of a row the read
-    # path already returns needs only the row key. db_write records the before
-    # image, so undo restores the previous value.
-    write_mode = "insert"
-    update_row: dict[str, Any] | None = None
-    if pk_columns and value_columns:
-        order_by = ", ".join(f"`{c}` DESC" for c in pk_columns)
-        try:
-            existing = await kernel.call(
-                "db_read", {"sql": f"SELECT * FROM `{table}` ORDER BY {order_by} LIMIT 1"}
-            )
-            candidate = (existing.get("rows") or [None])[0]
-            if candidate and all(candidate.get(c) is not None for c in pk_columns):
-                update_row = candidate
-                write_mode = "update"
-        except ToolCallError:
-            update_row = None
-    notes["write_mode"] = write_mode
+    # Capture the statement the application actually runs before anything is
+    # written: its SELECT list fixes which `$rows[i]` maps to which column, and
+    # its rows tell the model which row the read path will render.
+    read_evidence = await _capture_read_sql(
+        kernel, case_id, sink_file, read_lines, table, base_url, tag
+    )
+    if read_evidence.get("reads"):
+        notes["read_sql"] = [str(item["sql"]) for item in read_evidence["reads"]]
+        notes["read_rows"] = [
+            dict(row) for item in read_evidence["reads"] for row in item.get("rows") or []
+        ][:8]
+    if read_evidence.get("error"):
+        notes["read_sql_error"] = read_evidence["error"]
+
     schema_text = ""
-    if write_mode == "insert":
-        # An INSERT must satisfy every NOT NULL column and parent row; give the
-        # planner those facts instead of letting it discover them by ENV_ERROR.
-        try:
-            brief = await fetch_brief(kernel.call, table, payload_columns=value_columns)
-        except (ToolCallError, ValueError) as exc:
-            notes["schema_brief_error"] = str(exc)
-        else:
-            schema_text = render_brief(brief)
-            notes["schema_brief"] = brief.to_dict()
+    # Give the model the NOT NULL/default/FK facts whether it updates or inserts.
+    try:
+        brief = await fetch_brief(kernel.call, table, payload_columns=value_columns)
+    except (ToolCallError, ValueError) as exc:
+        notes["schema_brief_error"] = str(exc)
+    else:
+        schema_text = render_brief(brief)
+        notes["schema_brief"] = brief.to_dict()
     # The application writes rows as well (the verification POST submits the
     # form), so tag-based cleanup covers both our direct writes and the app's.
     if case is not None:
@@ -711,46 +778,34 @@ async def _run_trigger(
             "snapshots": snapshots,
         }
 
-    # The model picks the storage column and shapes the payload for the sink
-    # context; the local candidate list stays only as a fallback when no model
-    # is configured. The write itself still happens through ``db_write``.
-    selection = await plan_request(
-        client=LlmClient.from_env(),
-        goal=(
-            "choose which column stores the payload so it is later rendered at the "
-            "sink, and construct a stored XSS payload (HTML/JavaScript, never SQL) "
-            "that executes there; the tag must survive verbatim"
-        ),
-        page_url=base_url,
-        forms=[
-            PageForm(
-                action=base_url,
-                method="post",
-                fields=[FormField(name=name) for name in value_columns],
-            )
-        ],
-        source_text=source_text,
-        payload=payloads[0][1] if payloads else f"{payload_base}{tag}",
-        hint=(
-            "pick one storage column; the read page echoes it without encoding. "
-            "The payload is HTML/JavaScript for an XSS sink, not a SQL statement."
-        ),
-        constraints=", ".join(
-            f"{name}: {column_type.get(name, '')} len={column_length.get(name)}"
-            for name in value_columns
-        ),
-        tag=tag,
-        sink=f"{sink.get('file')}:{sink.get('line')}\n{sink.get('code')}",
-        fallback_fields={name: f"tia-{tag}" for name in value_columns},
-        schema=schema_text,
-    )
-    if selection is not None:
-        notes["payload_plan"] = selection.to_dict()
-        if selection.payload and tag in selection.payload:
-            payloads = [(f"model:{selection.source}", selection.payload), *payloads]
-        if selection.column and selection.column in value_columns:
-            payload_column = selection.column
-            notes["column_chosen_by"] = "llm"
+    # The model writes the statement; local code only renders {{PAYLOAD}} and
+    # checks structure. The captured read fixes the column and the row.
+    write_plan: dict[str, Any] | None = None
+    template = ""
+    write_mode = "insert"
+    try:
+        write_plan = await plan_write_sql(
+            LlmClient.from_env(),
+            sink=f"{sink.get('file')}:{sink.get('line')}\n{sink.get('code')}",
+            table=table,
+            columns=value_columns,
+            schema=schema_text,
+            observed=list(read_evidence.get("reads") or []),
+            rows=list(notes.get("read_rows") or []),
+            payload=payloads[0][1] if payloads else f"{payload_base}{tag}",
+            tag=tag,
+        )
+    except (ToolCallError, ToolError) as exc:
+        notes["write_plan_error"] = f"{exc.code.value}: {exc.message}"
+    if write_plan is not None:
+        notes["write_plan"] = write_plan
+        template = str(write_plan["template"])
+        payload_column = str(write_plan["column"])
+        notes["payload_column"] = payload_column
+        notes["column_chosen_by"] = "llm_sql"
+        head = str(write_plan["sql"]).split(None, 1)[0].lower()
+        write_mode = "update" if head == "update" else "insert"
+    notes["write_mode"] = write_mode
 
     change: dict[str, Any] | None = None
     db_error: str | None = None
@@ -761,57 +816,75 @@ async def _run_trigger(
     entry_request: tuple[str, dict[str, str]] | None = None
 
     for shape, payload in payloads:
-        values = []
-        for col in value_columns:
-            value = _column_value(col, payload=payload, tag=tag, column_type=column_type.get(col, ""))
-            declared_length = column_length.get(col)
-            if value == payload and declared_length is not None and len(payload) > int(declared_length):
-                value = f"tia-{tag}"
-            values.append(value)
-
-        written_columns = [col for col, value in zip(value_columns, values, strict=True) if value == payload]
-        if written_columns:
-            payload_column = written_columns[0]
-        if write_mode == "update" and update_row is not None:
-            where = " AND ".join(f"`{c}` = {_sql_literal(update_row[c])}" for c in pk_columns)
-            sql = (
-                f"UPDATE `{table}` SET `{payload_column}` = {_sql_literal(payload)}"
-                f" WHERE {where}"
+        if not template:
+            payload_attempts.append(
+                {
+                    "shape": shape,
+                    "payload": payload,
+                    "written": False,
+                    "error": notes.get("write_plan_error", "NO_WRITE_SQL"),
+                }
             )
-        else:
-            sql = (
-                f"INSERT INTO `{table}` ({', '.join(f'`{c}`' for c in value_columns)}) "
-                f"VALUES ({', '.join(_sql_literal(v) for v in values)})"
-            )
-        try:
-            written = await kernel.call("db_write", {"sql": sql})
-        except ToolCallError as exc:
-            db_error = f"{exc.code.value}: {exc.message}"
-            recovered = None
-            if exc.code is ErrorCode.ENV_ERROR and write_mode == "insert":
-                recovered = await _retry_insert_with_state(
-                    kernel,
-                    case_id,
-                    table,
-                    value_columns,
-                    values,
-                    sql,
-                    exc,
-                    notes,
-                    payload_column=payload_column,
+            continue
+        rounds = 0
+        while True:
+            try:
+                sql, _statement = compile_write(
+                    template,
+                    table=table,
+                    columns=value_columns,
+                    payload=payload,
+                    row_id=write_plan.get("row_id") if write_plan else None,
                 )
-            if recovered is None:
-                payload_attempts.append(
-                    {"shape": shape, "payload": payload, "written": False, "error": db_error}
-                )
+                written = await kernel.call("db_write", {"sql": sql})
+            except (ToolCallError, ToolError) as exc:
+                db_error = f"{exc.code.value}: {exc.message}"
+                rounds += 1
+                if rounds > 2:
+                    payload_attempts.append(
+                        {
+                            "shape": shape,
+                            "payload": payload,
+                            "written": False,
+                            "error": db_error,
+                        }
+                    )
+                    break
+                try:
+                    write_plan = await plan_write_sql(
+                        LlmClient.from_env(),
+                        sink=f"{sink.get('file')}:{sink.get('line')}\n{sink.get('code')}",
+                        table=table,
+                        columns=value_columns,
+                        schema=schema_text,
+                        observed=list(read_evidence.get("reads") or []),
+                        rows=list(notes.get("read_rows") or []),
+                        payload=payload,
+                        tag=tag,
+                        error=db_error,
+                    )
+                except (ToolCallError, ToolError) as replan:
+                    payload_attempts.append(
+                        {
+                            "shape": shape,
+                            "payload": payload,
+                            "written": False,
+                            "error": f"{db_error}; replan: {replan.code.value}: {replan.message}",
+                        }
+                    )
+                    break
+                notes["write_plan"] = write_plan
+                template = str(write_plan["template"])
+                payload_column = str(write_plan["column"])
+                notes["payload_column"] = payload_column
                 continue
-            written, sql = recovered
-        change = written.get("change") if isinstance(written, dict) else None
-        change_id = change.get("change_id") if change else None
-        notes["change_id"] = change_id
-        notes["write_sql"] = sql
-        notes["insert_sql"] = sql
-        payload_attempts.append({"shape": shape, "payload": payload, "written": True})
+            change = written.get("change") if isinstance(written, dict) else None
+            change_id = change.get("change_id") if change else None
+            notes["change_id"] = change_id
+            notes["write_sql"] = sql
+            notes["insert_sql"] = sql
+            payload_attempts.append({"shape": shape, "payload": payload, "written": True})
+            break
 
         row: dict[str, Any] | None = None
         order = f" ORDER BY `{pk_columns[0]}` DESC" if pk_columns else ""
