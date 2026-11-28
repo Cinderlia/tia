@@ -197,17 +197,31 @@ def _same_origin(url: str, page_url: str) -> bool:
     return (left.scheme, left.netloc) == (right.scheme, right.netloc)
 
 
-def _clean_fields(raw: Any, allowed: set[str]) -> dict[str, str]:
-    if not isinstance(raw, dict):
-        return {}
-    cleaned: dict[str, str] = {}
-    for name, value in raw.items():
-        key = str(name)
-        if key not in allowed or len(cleaned) >= MAX_FIELDS:
-            continue
-        if isinstance(value, (str, int, float, bool)) or value is None:
-            cleaned[key] = "" if value is None else str(value)
-    return cleaned
+def _field_map(raw: Any) -> dict[str, str] | None:
+    """Accept the several shapes a model uses for the plan's request fields."""
+
+    if isinstance(raw, dict):
+        return {
+            str(name): "" if value is None else str(value)
+            for name, value in raw.items()
+            if str(name).strip()
+        }
+    if isinstance(raw, list):
+        fields: dict[str, str] = {}
+        for item in raw:
+            name: Any = None
+            value: Any = None
+            if isinstance(item, dict):
+                name = item.get("name") or item.get("field") or item.get("key")
+                value = item.get("value")
+            elif isinstance(item, (list, tuple)) and len(item) == 2:
+                name, value = item
+            elif isinstance(item, (str, int)):
+                name, value = item, "tia"
+            if isinstance(name, (str, int)) and str(name).strip():
+                fields[str(name).strip()] = "" if value is None else str(value)
+        return fields
+    return None
 
 
 async def plan_request(
@@ -273,13 +287,12 @@ async def plan_request(
             problems.append(f"url {url!r} is not same-origin with the page {page_url!r}")
         if method not in {"GET", "POST"}:
             problems.append(f"method {method!r} is not GET or POST")
-        if isinstance(raw_fields, list):
-            # Some models answer with a list of field names instead of a mapping;
-            # keep the names and fill non-payload fields with a harmless value.
-            raw_fields = {
-                str(name): "tia" for name in raw_fields if isinstance(name, (str, int))
-            }
-        if not isinstance(raw_fields, dict) or not raw_fields:
+        raw_fields = _field_map(raw_fields)
+        if not raw_fields and payload_field:
+            # A plan that names its payload field but omits the mapping still
+            # describes a usable request: the payload is the only value that matters.
+            raw_fields = {payload_field: payload}
+        if raw_fields is None or (not raw_fields and not payload_field):
             problems.append("the plan has no fields")
             raw_fields = {}
         if payload_field and payload_field not in raw_fields:

@@ -194,3 +194,56 @@ async def test_prompt_includes_schema_prerequisites() -> None:
         schema="SCHEMA PREREQUISITES for `t`: a: row (references parent)",
     )
     assert "SCHEMA PREREQUISITES for `t`" in text
+
+
+async def test_fields_given_as_a_list_of_name_value_objects_are_accepted() -> None:
+    llm = FakeLlm(
+        {
+            "url": "http://app.test/file/",
+            "method": "POST",
+            "fields": [
+                {"name": "item", "value": "x"},
+                {"name": "desc", "value": "old"},
+            ],
+            "payload_field": "desc",
+            "reason": "the model used the object form for its fields",
+        }
+    )
+    plan = await plan_request(
+        client=llm,  # type: ignore[arg-type]
+        goal="write",
+        page_url="http://app.test/file/",
+        forms=_forms(),
+        source_text="insert",
+        payload="<script>alert(1)</script>ab12",
+        fallback_fields={"desc": "fallback"},
+    )
+    assert plan is not None
+    assert plan.source == "llm"
+    assert plan.values["item"] == "x"
+    assert plan.values["desc"] == "<script>alert(1)</script>ab12"
+    assert plan.payload_field == "desc"
+
+
+async def test_payload_field_alone_is_enough_to_build_the_request() -> None:
+    llm = FakeLlm(
+        {
+            "url": "http://app.test/file/",
+            "method": "POST",
+            "fields": [],
+            "payload_field": "item",
+            "reason": "the model named the field but sent no mapping",
+        }
+    )
+    plan = await plan_request(
+        client=llm,  # type: ignore[arg-type]
+        goal="write",
+        page_url="http://app.test/file/",
+        forms=_forms(),
+        source_text="insert",
+        payload="<script>alert(1)</script>ab12",
+        fallback_fields={"desc": "fallback"},
+    )
+    assert plan is not None
+    assert plan.source == "llm"
+    assert plan.values["item"] == "<script>alert(1)</script>ab12"

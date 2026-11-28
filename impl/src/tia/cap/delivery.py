@@ -191,11 +191,28 @@ async def deliver(
             trace_diff=trace_diff,
             schema=schema,
         )
-        if plan is None:
-            return delivery
-        if plan.source == "rejected":
-            observation = f"the local validator rejected that plan: {plan.rejection}"
-            continue
+        if plan is None or plan.source == "rejected":
+            rejection = "" if plan is None else plan.rejection
+            if rejection:
+                observation = (
+                    f"{observation} and the local validator rejected the plan: "
+                    f"{rejection}"
+                    if observation
+                    else f"the local validator rejected that plan: {rejection}"
+                )
+            # A malformed model reply must not silence the run: on the last
+            # round, send the local fill so the page is still exercised.
+            if round_index != rounds - 1 or fallback_fields is None:
+                continue
+            plan = PlannedRequest(
+                url=page_url,
+                method=fallback_method,
+                values=dict(fallback_fields),
+                payload_field="",
+                payload=payload or tag,
+                source="local_fallback",
+                reason="the model plan was unusable; the local fill was sent instead",
+            )
         delivery.plan = plan
         values = dict(plan.values)
         if plan.payload_field and plan.payload:
