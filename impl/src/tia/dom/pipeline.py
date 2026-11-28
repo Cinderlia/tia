@@ -539,6 +539,8 @@ async def walk_injection_queue(
             pair_candidates=pair_map,
             copy_paths=copy_paths,
             copy_only=item.get("kind") == "copy",
+            chain_steps=item.get("chain") or None,
+            chain_only=item.get("kind") == "chain",
         )
         if (
             len(hints) > 1
@@ -565,6 +567,8 @@ async def walk_injection_queue(
                     pair_candidates=pair_map,
                     copy_paths=copy_paths,
                     copy_only=item.get("kind") == "copy",
+                    chain_steps=item.get("chain") or None,
+                    chain_only=item.get("kind") == "chain",
                 )
                 inject.notes["alternate_attempt"] = {
                     "slice_id": hints[1]["alternate_write_slice_id"],

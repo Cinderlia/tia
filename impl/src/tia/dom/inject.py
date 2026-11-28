@@ -417,6 +417,8 @@ async def _run_inject(
     shape_hint: str = "",
     copy_paths: list[dict[str, Any]] | None = None,
     copy_only: bool = False,
+    chain_steps: list[dict[str, Any]] | None = None,
+    chain_only: bool = False,
 ) -> InjectResult:
     kernel = Kernel(
         profile="inject", budget=budget, client=client or LocalToolClient(profile="inject")
@@ -939,11 +941,35 @@ async def _run_inject(
                 )
             else:
                 notes["copy_failure"] = chain["failed_kind"]
+    chain_delivery: dict[str, Any] | None = None
+    if chain_only and chain_steps:
+        from tia.dom.chain_run import run_chain
+
+        walked = await run_chain(
+            call,
+            case_id=result.case_id,
+            chain=chain_steps,
+            base_url=base_url,
+            payload=payload,
+            tag=tag,
+        )
+        notes["chain_hops"] = walked["hops"]
+        if walked["ok"]:
+            chain_delivery = {
+                "accepted": True,
+                "probed": True,
+                "stored": int(walked["stored"] or 0),
+                "submitted": dict(walked["submitted"] or {}),
+            }
+            notes["write_signal"] = "chain"
+        else:
+            notes["chain_failure"] = walked["failed_kind"]
     delivery_page_url = (
         forms[0].action if notes.get("entry_fallback") == "endpoint" else base_url
     )
     entry_method = "GET" if notes.get("entry_method") == "GET" else "POST"
-    delivery = None if (copy_only and copy_paths) else await deliver(
+    skip_delivery = (copy_only and copy_paths) or (chain_only and chain_steps)
+    delivery = None if skip_delivery else await deliver(
         client=LlmClient.from_env(),
         goal=(
             "submit this form so the application stores the payload as a record of "
@@ -1002,10 +1028,11 @@ async def _run_inject(
             "fields": dict(form.fields),
             "planned_by": delivery.plan.source,
         }
-    if copy_delivery is not None:
+    walked_delivery = copy_delivery or chain_delivery
+    if walked_delivery is not None:
         probed = True
-        stored = int(copy_delivery["stored"] or 0)
-        submitted = dict(copy_delivery["submitted"] or {})
+        stored = int(walked_delivery["stored"] or 0)
+        submitted = dict(walked_delivery["submitted"] or {})
         accepted = True
     else:
         probed = armed and delivery is not None and delivery.last is not None and bool(
@@ -1033,6 +1060,10 @@ async def _run_inject(
     notes["write_signal"] = (
         "probe" if probed else ("db_read" if stored > 0 else ("status" if not armed else "none"))
     )
+    if copy_delivery is not None:
+        notes["write_signal"] = "copy_path"
+    elif chain_delivery is not None:
+        notes["write_signal"] = "chain"
     if copy_delivery is None and delivery is not None:
         submitted = dict((delivery.last.extra.get("raw") if delivery.last else {}) or {})
     if not accepted and sent_values and target.get("table"):
@@ -1107,6 +1138,42 @@ async def _run_inject(
                 )
             else:
                 notes["copy_failure"] = chain["failed_kind"]
+    if not accepted and chain_steps and not chain_only:
+        from tia.dom.chain_run import run_chain
+
+        walked = await run_chain(
+            call,
+            case_id=result.case_id,
+            chain=chain_steps,
+            base_url=base_url,
+            payload=payload,
+            tag=tag,
+        )
+        notes["chain_hops"] = walked["hops"]
+        if walked["ok"]:
+            accepted = True
+            probed = True
+            stored = int(walked["stored"] or 0)
+            submitted = dict(walked["submitted"] or {})
+            notes["write_signal"] = "chain"
+            target["columns"] = list(
+                dict.fromkeys(
+                    [
+                        *[str(column) for column in target.get("columns") or []],
+                        *[
+                            str(column)
+                            for step in chain_steps
+                            for column in (
+                                step.get("columns")
+                                or ([step.get("column")] if step.get("column") else [])
+                            )
+                            if column
+                        ],
+                    ]
+                )
+            )
+        else:
+            notes["chain_failure"] = walked["failed_kind"]
     if not accepted:
         if armed:
             with contextlib.suppress(ToolCallError):
@@ -1834,6 +1901,8 @@ async def run_inject(
     shape_hint: str = "",
     copy_paths: list[dict[str, Any]] | None = None,
     copy_only: bool = False,
+    chain_steps: list[dict[str, Any]] | None = None,
+    chain_only: bool = False,
 ) -> InjectResult:
     """Run the inject agent and always remove the rows it wrote through the app.
 
@@ -1864,6 +1933,8 @@ async def run_inject(
             shape_hint=shape_hint,
             copy_paths=copy_paths,
             copy_only=copy_only,
+            chain_steps=chain_steps,
+            chain_only=chain_only,
         )
     finally:
         state = _ACTIVE_CLEANUP.get()
