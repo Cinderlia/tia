@@ -86,7 +86,7 @@ class MysqlAdapter:
         placeholders = ",".join(["%s"] * len(tables))
         with self.connect() as conn, conn.cursor() as cur:
             cur.execute(
-                "SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT,"
+                "SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT,"
                 " COLUMN_KEY, EXTRA, CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION"
                 " FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()"
                 f" AND TABLE_NAME IN ({placeholders}) ORDER BY TABLE_NAME, ORDINAL_POSITION",
@@ -94,9 +94,14 @@ class MysqlAdapter:
             )
             column_rows = [dict(r) for r in cur.fetchall()]
             cur.execute(
-                "SELECT TABLE_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME"
-                " FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = DATABASE()"
-                f" AND REFERENCED_TABLE_NAME IS NOT NULL AND TABLE_NAME IN ({placeholders})",
+                "SELECT k.TABLE_NAME, k.COLUMN_NAME, k.REFERENCED_TABLE_NAME,"
+                " k.REFERENCED_COLUMN_NAME, r.DELETE_RULE"
+                " FROM information_schema.KEY_COLUMN_USAGE k"
+                " LEFT JOIN information_schema.REFERENTIAL_CONSTRAINTS r"
+                " ON r.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA"
+                " AND r.CONSTRAINT_NAME = k.CONSTRAINT_NAME"
+                " AND r.TABLE_NAME = k.TABLE_NAME WHERE k.TABLE_SCHEMA = DATABASE()"
+                f" AND k.REFERENCED_TABLE_NAME IS NOT NULL AND k.TABLE_NAME IN ({placeholders})",
                 tuple(tables),
             )
             fk_rows = [dict(r) for r in cur.fetchall()]
@@ -125,6 +130,7 @@ class MysqlAdapter:
                 {
                     "name": row["COLUMN_NAME"],
                     "type": str(row["DATA_TYPE"]),
+                    "column_type": str(row["COLUMN_TYPE"] or row["DATA_TYPE"]),
                     "nullable": row["IS_NULLABLE"] == "YES",
                     "default": row["COLUMN_DEFAULT"],
                     "extra": row["EXTRA"] or "",
@@ -141,6 +147,7 @@ class MysqlAdapter:
                         "column": row["COLUMN_NAME"],
                         "ref_table": row["REFERENCED_TABLE_NAME"],
                         "ref_column": row["REFERENCED_COLUMN_NAME"],
+                        "delete_rule": str(row.get("DELETE_RULE") or ""),
                     }
                 )
         for row in index_rows:

@@ -127,27 +127,44 @@ def test_columns_from_rows_converts_mysql_types() -> None:
     assert facts[1].width == 1
 
 
-async def test_fetch_brief_uses_db_read_only() -> None:
+async def test_fetch_brief_uses_the_schema_tool() -> None:
     calls: list[tuple[str, dict[str, Any]]] = []
 
     async def call(name: str, args: dict[str, Any]) -> dict[str, Any]:
         calls.append((name, args))
-        if "KEY_COLUMN_USAGE" in str(args.get("sql")) and "REFERENCED_TABLE_NAME" in str(
-            args.get("sql")
-        ):
-            return {"rows": [{"column_name": "parent_id", "parent_table": "parent", "parent_column": "id"}]}
-        if "REFERENCED_TABLE_NAME = " in str(args.get("sql")):
-            return {"rows": []}
         return {
-            "rows": [
+            "tables": [
                 {
-                    "name": "parent_id",
-                    "column_type": "int(11)",
-                    "is_nullable": "NO",
-                    "column_default": None,
-                    "extra": "",
-                    "width": None,
-                    "column_key": "MUL",
+                    "name": "child",
+                    "primary_key": ["id"],
+                    "columns": [
+                        {
+                            "name": "id",
+                            "type": "int",
+                            "column_type": "int(11)",
+                            "nullable": False,
+                            "default": None,
+                            "extra": "auto_increment",
+                            "length": None,
+                        },
+                        {
+                            "name": "parent_id",
+                            "type": "int",
+                            "column_type": "int(11)",
+                            "nullable": False,
+                            "default": None,
+                            "extra": "",
+                            "length": None,
+                        },
+                    ],
+                    "fks": [
+                        {
+                            "column": "parent_id",
+                            "ref_table": "parent",
+                            "ref_column": "id",
+                            "delete_rule": "CASCADE",
+                        }
+                    ],
                 }
             ]
         }
@@ -156,4 +173,4 @@ async def test_fetch_brief_uses_db_read_only() -> None:
     assert [item["name"] for item in brief.required] == ["parent_id"]
     assert brief.required[0]["prerequisite"] == "row"
     assert brief.parents[0].parent_table == "parent"
-    assert {name for name, _ in calls} == {"db_read"}
+    assert {name for name, _ in calls} == {"db_schema"}

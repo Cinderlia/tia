@@ -30,12 +30,14 @@ from tia.cap.entry import (
 from tia.cap.forms import FormField, PageForm
 from tia.cap.request_plan import plan_request
 from tia.cap.schema import fetch_brief, render_brief
+from tia.dom.state_probe import StateProbeRequest, run_state_probe
 from tia.inf.reports import write_case_report
 from tia.inf.runtime import get_runtime
 from tia.inf.settings import attempt_limit
 from tia.inf.store import now_iso
 from tia.orch.kernel import Kernel, LocalToolClient, StepRecord, ToolCallError, ToolClient
 from tia.orch.learning import record_case
+from tia.schemas.envelope import ErrorCode
 from tia.schemas.plan import ConstraintPlan, ConstraintWrite, PayloadPlan, Step
 from tia.schemas.verdict import TriggerVerdict
 from tia.sinks.base import Observation, trigger_verdict
@@ -785,10 +787,25 @@ async def _run_trigger(
             written = await kernel.call("db_write", {"sql": sql})
         except ToolCallError as exc:
             db_error = f"{exc.code.value}: {exc.message}"
-            payload_attempts.append(
-                {"shape": shape, "payload": payload, "written": False, "error": db_error}
-            )
-            continue
+            recovered = None
+            if exc.code is ErrorCode.ENV_ERROR and write_mode == "insert":
+                recovered = await _retry_insert_with_state(
+                    kernel,
+                    case_id,
+                    table,
+                    value_columns,
+                    values,
+                    sql,
+                    exc,
+                    notes,
+                    payload_column=payload_column,
+                )
+            if recovered is None:
+                payload_attempts.append(
+                    {"shape": shape, "payload": payload, "written": False, "error": db_error}
+                )
+                continue
+            written, sql = recovered
         change = written.get("change") if isinstance(written, dict) else None
         change_id = change.get("change_id") if change else None
         notes["change_id"] = change_id
@@ -1227,6 +1244,53 @@ async def _run_trigger(
     )
 
 
+
+async def _retry_insert_with_state(
+    kernel: Kernel,
+    case_id: str,
+    table: str,
+    value_columns: list[str],
+    values: list[str],
+    sql: str,
+    exc: ToolCallError,
+    notes: dict[str, Any],
+    *,
+    payload_column: str = "",
+) -> tuple[Any, str] | None:
+    """Ask state_probe which values make this INSERT legal, then retry once."""
+
+    request = StateProbeRequest(
+        case_id=case_id,
+        table=table,
+        payload_columns=[payload_column] if payload_column else [],
+        failed_sql=sql[:2000],
+        error_text=exc.message[:500],
+    )
+    plan = await run_state_probe(kernel.call, request)
+    notes["state_plan"] = plan.to_dict()
+    if plan.status != "READY":
+        return None
+    merged = dict(zip(value_columns, values, strict=True))
+    merged.update(plan.values)
+    columns = list(merged)
+    retry_sql = (
+        f"INSERT INTO `{table}` ({', '.join(f'`{c}`' for c in columns)}) "
+        f"VALUES ({', '.join(_state_literal(merged[c]) for c in columns)})"
+    )
+    written = await kernel.call("db_write", {"sql": retry_sql})
+    notes["state_plan_retry"] = True
+    return written, retry_sql
+
+
 def _sql_literal(value: object) -> str:
     escaped = str(value).replace("\\", "\\\\").replace("'", "\\'")
     return f"'{escaped}'"
+
+
+def _state_literal(value: object) -> str:
+    text = str(value)
+    if text == "NOW()":
+        return text
+    if re.fullmatch(r"-?\d+(\.\d+)?", text):
+        return text
+    return _sql_literal(text)
