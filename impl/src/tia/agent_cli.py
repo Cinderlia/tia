@@ -215,6 +215,17 @@ def _parser() -> argparse.ArgumentParser:
         help="Stop leasing once this many minutes have passed (0 = no limit)",
     )
     pipeline.add_argument(
+        "--trigger-workers",
+        type=int,
+        default=1,
+        help="Number of trigger/direct consumers sharing the slice queue",
+    )
+    pipeline.add_argument(
+        "--queue-log",
+        default="",
+        help="Append queue lengths with timestamps to this file (TIA_QUEUE_LOG)",
+    )
+    pipeline.add_argument(
         "--inject-workers",
         type=int,
         default=2,
@@ -683,6 +694,8 @@ def _run_pipeline(args: argparse.Namespace) -> int:
             direct_slices=direct_slices,
             mode=args.mode,
             inject_workers=args.inject_workers,
+            trigger_workers=args.trigger_workers,
+            queue_log=args.queue_log,
         )
     )
     for item in result.outcomes:

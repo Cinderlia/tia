@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -28,6 +29,7 @@ from tia.dom.main import seed_queue
 from tia.dom.pairing_agent import PairingConfig, build_pairing_queue, respond
 from tia.dom.trigger import normalize_slice, run_trigger
 from tia.inf.findings import finding_db_only, finding_first_order
+from tia.inf.queue_probe import QUEUE_LOG_ENV, QueueProbe
 from tia.inf.reports import RunReports
 from tia.inf.runtime import get_runtime
 from tia.orch.kernel import LocalToolClient, ToolCallError, ToolClient
@@ -242,51 +244,26 @@ async def _constraint_plan_for(
     return plan if isinstance(plan, dict) else {}
 
 
-async def run_pipeline(
+async def _consume_rounds(
+    *,
     store: Any,
+    result: PipelineResult,
     trigger_run_id: str,
-    trigger_slices: list[dict[str, Any]],
     write_slices: list[dict[str, Any]],
     base_url: str,
-    *,
-    timeout_sec: float = 600.0,
-    max_slices: int = 0,
-    payload_base: str = "<script>alert(1)</script>",
-    budget: int = 120,
-    queue_cap: int = 10,
-    trigger_client: ToolClient | None = None,
-    inject_client: ToolClient | None = None,
-    url_for: Callable[[dict[str, Any]], str] | None = None,
-    direct_slices: list[dict[str, Any]] | None = None,
-    mode: str = "second",
-    inject_workers: int = 2,
-) -> PipelineResult:
-    """Loop over trigger/direct slices until the queue is empty or the timeout expires."""
-    if mode not in MODES:
-        raise ValueError(f"unknown mode: {mode!r} (expected one of {MODES})")
-    result = PipelineResult()
-    reports = RunReports(store, trigger_run_id)
-    if mode != "direct":
-        seed_queue(store, trigger_run_id, trigger_slices, order_mode="second")
-    if mode != "second" and direct_slices:
-        seed_queue(store, trigger_run_id, direct_slices, order_mode="direct")
-    deadline = time.monotonic() + max(timeout_sec, 0.0)
-    reader = _reader()
-    published: dict[str, str] = {}
-    stop_lane, tasks = start_workers(
-        store,
-        trigger_run_id,
-        workers=inject_workers,
-        deadline=deadline,
-        base_url=base_url,
-        payload_base=payload_base,
-        budget=budget,
-        inject_client=inject_client,
-        url_for=url_for,
-        reader=reader,
-        reports=reports,
-        outcomes=result.outcomes,
-    )
+    payload_base: str,
+    budget: int,
+    queue_cap: int,
+    trigger_client: ToolClient | None,
+    url_for: Callable[[dict[str, Any]], str] | None,
+    deadline: float,
+    max_slices: int,
+    mode: str,
+    published: dict[str, str],
+    reports: RunReports,
+    reader: Any,
+) -> None:
+    """Consume the slice queues until the budget or the slices run out."""
 
     while True:
         if time.monotonic() >= deadline:
@@ -295,19 +272,14 @@ async def run_pipeline(
         if max_slices and len(result.rounds) >= max_slices:
             result.stop_reason = "SLICE_LIMIT"
             break
-        family = pick_family(
-            mode,
-            store.count_pending(trigger_run_id, "direct"),
-            store.count_pending(trigger_run_id, "second"),
-            len(result.rounds),
-        )
-        if family is None:
-            result.stop_reason = "EXHAUSTED" if result.rounds else "NO_TRIGGER_SLICE"
-            break
-        leased = store.next_slice(run_id=trigger_run_id, order_mode=family)
+        # One global queue: the highest scoring slice wins, whatever its order.
+        # The consumer then dispatches on the slice itself: a first-order slice
+        # goes to direct/prover, a second-order slice goes to trigger+pairing.
+        leased = store.next_slice(run_id=trigger_run_id)
         if leased is None:
             result.stop_reason = "EXHAUSTED" if result.rounds else "NO_TRIGGER_SLICE"
             break
+        family = str(leased.get("order_mode") or "second")
         if family == "direct":
             await _run_direct_round(
                 store,
@@ -428,6 +400,93 @@ async def run_pipeline(
             result.rounds.append(record)
             break
         result.rounds.append(record)
+
+
+
+async def run_pipeline(
+    store: Any,
+    trigger_run_id: str,
+    trigger_slices: list[dict[str, Any]],
+    write_slices: list[dict[str, Any]],
+    base_url: str,
+    *,
+    timeout_sec: float = 600.0,
+    max_slices: int = 0,
+    payload_base: str = "<script>alert(1)</script>",
+    budget: int = 120,
+    queue_cap: int = 10,
+    trigger_client: ToolClient | None = None,
+    inject_client: ToolClient | None = None,
+    url_for: Callable[[dict[str, Any]], str] | None = None,
+    direct_slices: list[dict[str, Any]] | None = None,
+    mode: str = "second",
+    inject_workers: int = 2,
+    trigger_workers: int = 1,
+    queue_log: str = "",
+) -> PipelineResult:
+    """Loop over trigger/direct slices until the queue is empty or the timeout expires."""
+    if mode not in MODES:
+        raise ValueError(f"unknown mode: {mode!r} (expected one of {MODES})")
+    result = PipelineResult()
+    reports = RunReports(store, trigger_run_id)
+    if mode != "direct":
+        seed_queue(store, trigger_run_id, trigger_slices, order_mode="second")
+    if mode != "second" and direct_slices:
+        seed_queue(store, trigger_run_id, direct_slices, order_mode="direct")
+    deadline = time.monotonic() + max(timeout_sec, 0.0)
+    reader = _reader()
+    published: dict[str, str] = {}
+    stop_lane, tasks = start_workers(
+        store,
+        trigger_run_id,
+        workers=inject_workers,
+        deadline=deadline,
+        base_url=base_url,
+        payload_base=payload_base,
+        budget=budget,
+        inject_client=inject_client,
+        url_for=url_for,
+        reader=reader,
+        reports=reports,
+        outcomes=result.outcomes,
+    )
+
+    probe: QueueProbe | None = None
+    probe_stop: asyncio.Event | None = None
+    probe_task: asyncio.Task[None] | None = None
+    log_path = queue_log or os.environ.get(QUEUE_LOG_ENV, "")
+    if log_path:
+        probe = QueueProbe(store, log_path, trigger_run_id)
+        probe_stop = asyncio.Event()
+        probe_task = asyncio.create_task(probe.run(probe_stop))
+    worker_count = max(1, trigger_workers)
+    consumers = [
+        asyncio.create_task(
+            _consume_rounds(
+                store=store,
+                result=result,
+                trigger_run_id=trigger_run_id,
+                write_slices=write_slices,
+                base_url=base_url,
+                payload_base=payload_base,
+                budget=budget,
+                queue_cap=queue_cap,
+                trigger_client=trigger_client,
+                url_for=url_for,
+                deadline=deadline,
+                max_slices=max_slices,
+                mode=mode,
+                published=published,
+                reports=reports,
+                reader=reader,
+            )
+        )
+        for _ in range(worker_count)
+    ]
+    await asyncio.gather(*consumers)
+    if probe_stop is not None and probe_task is not None:
+        probe_stop.set()
+        await asyncio.gather(probe_task)
 
     stop_lane.set()
     await asyncio.gather(*tasks)

@@ -1355,6 +1355,31 @@ class Store:
             )
         return cursor.rowcount
 
+    def queue_stats(self, run_id: str | None = None) -> dict[str, dict[str, int]]:
+        """Counts per queue and lane, for concurrency tuning and the probe log."""
+
+        slices: dict[str, int] = {}
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT order_mode, status, COUNT(*) AS n FROM slice "
+                + ("WHERE run_id=? " if run_id else "")
+                + "GROUP BY order_mode, status",
+                (run_id,) if run_id else (),
+            ).fetchall()
+        for row in rows:
+            slices[f"{row['order_mode']}.{row['status']}"] = int(row["n"])
+        injections: dict[str, int] = {}
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT priority, status, COUNT(*) AS n FROM injection_queue "
+                + ("WHERE run_id=? " if run_id else "")
+                + "GROUP BY priority, status",
+                (run_id,) if run_id else (),
+            ).fetchall()
+        for row in rows:
+            injections[f"{row['priority']}.{row['status']}"] = int(row["n"])
+        return {"slices": slices, "injections": injections}
+
     def count_pending_injections(self, run_id: str | None = None) -> int:
         sql = "SELECT COUNT(*) AS n FROM injection_queue WHERE status='pending'"
         args: tuple[Any, ...] = ()
