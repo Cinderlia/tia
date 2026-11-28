@@ -107,3 +107,15 @@ def test_pair_request_filters_and_no_path(tmp_path: Path) -> None:
         second
     ]
     assert store.get_pair_request("missing") is None
+
+
+def test_state_plan_round_trips_per_case(tmp_path: Path) -> None:
+    from tia.inf.store import Store
+
+    store = Store(tmp_path / "tia.db")
+    plan = {"table": "child", "status": "READY", "values": {"parent_id": "7"}}
+    store.save_state_plan("case-a", plan)
+    assert store.get_state_plan("case-a") == plan
+    store.save_state_plan("case-a", {**plan, "status": "PARTIAL"})
+    assert store.get_state_plan("case-a")["status"] == "PARTIAL"
+    assert store.get_state_plan("case-b") is None

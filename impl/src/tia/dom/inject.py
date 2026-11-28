@@ -297,7 +297,7 @@ async def _probe_state(
     kernel: Kernel, case_id: str, target: dict[str, Any], notes: dict[str, Any]
 ) -> Any:
     """Ask the state probe what values a legal INSERT into the target needs."""
-    from tia.dom.state_probe import StateProbeRequest, run_state_probe
+    from tia.dom.state_probe import StateProbeRequest, constant_review, run_state_probe
 
     table = str(target.get("table") or "")
     if not table:
@@ -307,6 +307,7 @@ async def _probe_state(
         table=table,
         payload_columns=[str(c) for c in target.get("columns") or [] if str(c)],
         register_targets=kernel.set_write_targets,
+        review=constant_review(),
     )
     try:
         plan = await run_state_probe(kernel.call, request)
@@ -314,6 +315,12 @@ async def _probe_state(
         notes["state_probe_error"] = f"{exc.code.value}: {exc.message}"
         return None
     notes["state_plan"] = plan.to_dict()
+    try:
+        from tia.inf.runtime import get_runtime
+
+        get_runtime().store.save_state_plan(case_id, plan.to_dict())
+    except Exception:  # noqa: BLE001 - persistence must not break the run
+        pass
     return plan if plan.status == "READY" else None
 
 

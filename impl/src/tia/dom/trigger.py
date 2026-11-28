@@ -30,7 +30,7 @@ from tia.cap.entry import (
 from tia.cap.forms import FormField, PageForm
 from tia.cap.request_plan import plan_request
 from tia.cap.schema import fetch_brief, render_brief
-from tia.dom.state_probe import StateProbeRequest, run_state_probe
+from tia.dom.state_probe import StateProbeRequest, constant_review, run_state_probe
 from tia.inf.reports import write_case_report
 from tia.inf.runtime import get_runtime
 from tia.inf.settings import attempt_limit
@@ -1266,9 +1266,16 @@ async def _retry_insert_with_state(
         failed_sql=sql[:2000],
         error_text=exc.message[:500],
         register_targets=getattr(kernel, "set_write_targets", None),
+        review=constant_review(),
     )
     plan = await run_state_probe(kernel.call, request)
     notes["state_plan"] = plan.to_dict()
+    try:
+        from tia.inf.runtime import get_runtime
+
+        get_runtime().store.save_state_plan(case_id, plan.to_dict())
+    except Exception:  # noqa: BLE001 - persistence must not break the run
+        pass
     if plan.status != "READY":
         return None
     merged = dict(zip(value_columns, values, strict=True))

@@ -257,6 +257,42 @@ def _constraint_section(notes: dict[str, Any], kind: str) -> list[str]:
     return lines
 
 
+def _state_section(notes: dict[str, Any]) -> list[str]:
+    """Rows and values the write path needed before it accepted the payload."""
+    plan = notes.get("state_plan")
+    if not isinstance(plan, dict) or plan.get("status") not in {"READY", "PARTIAL"}:
+        return []
+    prerequisites = [item for item in plan.get("prerequisites") or [] if isinstance(item, dict)]
+    steps = [item for item in plan.get("steps") or [] if isinstance(item, dict)]
+    if not prerequisites and not steps:
+        return []
+    lines = [
+        "",
+        "## State prerequisites",
+        "",
+        "The database refused the write until these facts held. They were resolved "
+        "before the payload request was sent (or retried):",
+        "",
+    ]
+    for item in prerequisites:
+        table = item.get("table") or "?"
+        column = item.get("column") or "?"
+        value = item.get("value")
+        source = item.get("source") or "?"
+        confidence = item.get("confidence")
+        line = f"- `{table}`.`{column}` = `{value}` (source: {source}"
+        if confidence is not None:
+            line += f", confidence: {confidence}"
+        lines.append(line + ")")
+    for step in steps:
+        sql = str(step.get("sql") or "").strip()
+        if sql:
+            lines.append(f"- created a row: `{sql[:300]}`")
+        elif step.get("request"):
+            lines.append(f"- created a row through the application: `{step.get('request')}`")
+    return lines
+
+
 def _browser_params(params: dict[str, Any]) -> str:
     parts: list[str] = []
     for name, value in params.items():
@@ -421,6 +457,7 @@ def write_finding(
             "This value was written to the database directly (no HTTP request was confirmed to store it).",
         ]
     lines += _constraint_section(notes, kind)
+    lines += _state_section(notes)
     lines += _verify_section(notes, kind)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     if refreshed:

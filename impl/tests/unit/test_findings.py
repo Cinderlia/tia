@@ -200,3 +200,39 @@ def test_second_order_finding_lists_extra_sql_requirements(tmp_path: Path, monke
     assert "tID=<id of the row you created>" in text
     index = (tmp_path / "reports" / "PhoenixCart" / "findings.md").read_text(encoding="utf-8")
     assert path.name in index
+
+
+def test_finding_lists_the_state_prerequisites(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("TIA_REPORTS", str(tmp_path / "reports"))
+    monkeypatch.setenv("TIA_REPORTS_TARGET", "PhoenixCart")
+    store = Store(tmp_path / "tia.db")
+    notes = dict(SECOND)
+    notes["state_plan"] = {
+        "status": "READY",
+        "table": "testimonials_description",
+        "prerequisites": [
+            {
+                "kind": "row",
+                "table": "testimonials",
+                "column": "testimonials_id",
+                "value": "31",
+                "source": "inserted",
+                "confidence": 50,
+            }
+        ],
+        "steps": [
+            {
+                "action": "db_write",
+                "table": "testimonials",
+                "sql": "INSERT INTO `testimonials` (`customers_id`) VALUES (1)",
+                "verified": True,
+            }
+        ],
+    }
+    case_id = _case(store, notes)
+    path = finding_second_order(store, case_id)
+    assert path is not None
+    text = path.read_text(encoding="utf-8")
+    assert "## State prerequisites" in text
+    assert "`testimonials`.`testimonials_id` = `31`" in text
+    assert "created a row: `INSERT INTO `testimonials`" in text

@@ -211,6 +211,15 @@ CREATE TABLE IF NOT EXISTS learning (
     updated_at TEXT NOT NULL,
     UNIQUE(signature, attribute, value)
 );
+CREATE TABLE IF NOT EXISTS state_plan (
+    case_id          TEXT PRIMARY KEY,
+    table_name       TEXT NOT NULL DEFAULT '',
+    status           TEXT NOT NULL DEFAULT '',
+    plan             TEXT NOT NULL DEFAULT '{}',
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS flow_job (
     flow_id          TEXT PRIMARY KEY,
     run_id           TEXT NOT NULL,
@@ -340,6 +349,34 @@ class Store:
                 " report=COALESCE(?, report), status='closed', updated_at=? WHERE id=?",
                 (verdict, ceiling, report, now_iso(), case_id),
             )
+
+    def save_state_plan(self, case_id: str, plan: dict[str, Any]) -> None:
+        """Store the latest state probe plan for a case (one row per case)."""
+        now = now_iso()
+        payload = json.dumps(plan, ensure_ascii=False, default=str)
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO state_plan (case_id, table_name, status, plan, created_at, updated_at)
+                   VALUES (?,?,?,?,?,?)
+                   ON CONFLICT(case_id) DO UPDATE SET
+                     table_name=excluded.table_name, status=excluded.status,
+                     plan=excluded.plan, updated_at=excluded.updated_at""",
+                (
+                    case_id,
+                    str(plan.get("table") or ""),
+                    str(plan.get("status") or ""),
+                    payload,
+                    now,
+                    now,
+                ),
+            )
+
+    def get_state_plan(self, case_id: str) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT plan FROM state_plan WHERE case_id=?", (case_id,)
+            ).fetchone()
+        return json.loads(row["plan"]) if row is not None else None
 
     def merge_case_notes(self, case_id: str, notes: dict[str, Any]) -> None:
         """Merge structured notes into the case (JSON-safe, best effort)."""

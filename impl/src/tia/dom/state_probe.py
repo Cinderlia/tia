@@ -13,6 +13,7 @@ M3, and that is where the plan starts carrying write steps with undo.
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -55,6 +56,7 @@ class StateProbeRequest:
     probe_tag: str = ""
     create_parents: bool = True
     register_targets: Any = None
+    review: Any = None
 
 
 @dataclass(slots=True)
@@ -360,6 +362,102 @@ async def _resolve_table(
     return values
 
 
+def constant_review(model: Any | None = None) -> Any:
+    """Build the optional model reviewer used for safe constants (None when no model)."""
+
+    if model is None:
+        try:
+            from tia.ad.llm import LlmClient
+
+            model = LlmClient.from_env()
+        except Exception:  # noqa: BLE001 - the probe works without a model
+            return None
+    if model is None:
+        return None
+
+    async def review(prompt: str) -> dict[str, Any]:
+        return await model.complete_json(
+            "You choose safe database constants. Reply with JSON only.", prompt
+        )
+
+    return review
+
+
+async def _review_constants(
+    request: StateProbeRequest,
+    brief: SchemaBrief,
+    plan: StatePlan,
+    values: dict[str, str],
+) -> None:
+    """Ask the model to review the safe defaults, once, then validate its answer."""
+
+    review = request.review
+    if review is None:
+        return
+    candidates = [
+        item
+        for item in plan.prerequisites
+        if item.kind == "constant" and item.confidence < 50 and item.value is not None
+    ]
+    if not candidates:
+        return
+    facts = [
+        {
+            "column": item.column,
+            "value": item.value,
+            "type": next(
+                (str(f.get("column_type") or f.get("type") or "") for f in brief.required
+                 if str(f.get("name")) == item.column),
+                "",
+            ),
+        }
+        for item in candidates
+    ]
+    prompt = (
+        "A PHP application INSERT failed. Choose a safe constant for each column below "
+        "so the statement is accepted; keep the value short and free of quotes.\n"
+        f"TABLE: {request.table}\n"
+        f"FAILED SQL: {request.failed_sql[:600]}\n"
+        f"ERROR: {request.error_text[:300]}\n"
+        f"COLUMNS: {json.dumps(facts, ensure_ascii=False)}\n"
+        'Reply as JSON: {"values": {"<column>": "<value>"}} and nothing else.'
+    )
+    try:
+        answer = await review(prompt)
+    except Exception as exc:  # noqa: BLE001 - the plan is still usable
+        plan.notes.append(f"llm review failed: {str(exc)[:200]}")
+        return
+    data: Any = answer
+    if isinstance(answer, str):
+        text = answer.strip()
+        if text.startswith("```"):
+            text = text.strip("`")
+            text = text.split("\n", 1)[1] if "\n" in text else text
+        try:
+            data = json.loads(text)
+        except ValueError:
+            plan.notes.append("llm review returned no JSON")
+            return
+    picked = data.get("values") if isinstance(data, dict) else None
+    if not isinstance(picked, dict):
+        plan.notes.append("llm review returned no values object")
+        return
+    allowed = {item.column for item in candidates}
+    for column, value in picked.items():
+        if str(column) not in allowed or not isinstance(value, (str, int)):
+            continue
+        text = str(value)
+        if not text or len(text) > 200:
+            continue
+        for item in candidates:
+            if item.column == str(column):
+                item.value = text
+                item.confidence = 70
+                values[str(column)] = text
+                plan.values[str(column)] = text
+    plan.notes.append("llm reviewed the safe constants")
+
+
 def _created_value(row: dict[str, Any], column: str) -> str | None:
     value = row.get(column)
     return None if value is None else str(value)
@@ -403,6 +501,7 @@ async def run_state_probe(call: Call, request: StateProbeRequest) -> StatePlan:
         plan.notes.append(exc.detail)
         return plan
     plan.values.update(values)
+    await _review_constants(request, brief, plan, values)
 
     if request.verify_insert:
         await _verify_insert(call, request, plan, brief)

@@ -293,3 +293,39 @@ async def test_trigger_retry_gives_up_when_the_plan_is_unresolved() -> None:
     )
     assert result is None
     assert notes["state_plan"]["status"] == "UNRESOLVED"
+
+
+async def test_constant_review_replaces_a_safe_default() -> None:
+    call = FakeCall([{"id": 7, "kind": "first"}])
+
+    async def review(prompt: str) -> dict[str, Any]:
+        assert "kind" in prompt
+        return {"values": {"kind": "second"}}
+
+    plan = await run_state_probe(
+        call,
+        StateProbeRequest(
+            case_id="case-1", table="child", payload_columns=["body"], review=review
+        ),
+    )
+    assert plan.status == "READY"
+    assert plan.values["kind"] == "second"
+    reviewed = next(item for item in plan.prerequisites if item.column == "kind")
+    assert reviewed.value == "second"
+    assert reviewed.confidence == 70
+
+
+async def test_constant_review_rejects_columns_outside_the_plan() -> None:
+    call = FakeCall([{"id": 7, "kind": "first"}])
+
+    async def review(prompt: str) -> dict[str, Any]:
+        return {"values": {"body": "<script>alert(1)</script>", "kind": "second"}}
+
+    plan = await run_state_probe(
+        call,
+        StateProbeRequest(
+            case_id="case-1", table="child", payload_columns=["body"], review=review
+        ),
+    )
+    assert "body" not in plan.values
+    assert plan.values["kind"] == "second"
