@@ -15,6 +15,8 @@ from urllib.parse import urlparse
 
 from tia.ad.llm import LlmClient
 from tia.cap.forms import PageForm
+from tia.cap.http import _file_fields
+from tia.schemas.envelope import ToolError
 
 MAX_FIELDS = 40
 MAX_SOURCE = 4000
@@ -34,7 +36,7 @@ class PlannedRequest:
     method: str
     values: dict[str, str] = field(default_factory=dict)
     payload_field: str = ""
-    files: dict[str, str] = field(default_factory=dict)
+    files: dict[str, dict[str, str]] = field(default_factory=dict)
     headers: dict[str, str] = field(default_factory=dict)
     source: str = "llm"
     reason: str = ""
@@ -115,6 +117,18 @@ def _prompt(
         )
     import json
 
+    file_fields = sorted({name for form in forms for name in form.files})
+    file_block = ""
+    if file_fields:
+        file_block = (
+            "FILE FIELDS (submit as multipart parts; a plain string value is not "
+            "enough): " + ", ".join(file_fields) + "\n"
+            "For each file field return files.<name> = {\"filename\": ..., "
+            "\"content_base64\": ..., \"content_type\": ...}. Use content_base64 only "
+            "when the application stores or serves the uploaded bytes and the payload "
+            "must ride inside the file; Base64-encode the exact bytes, never paste raw "
+            "binary into a field. Otherwise give just a filename.\n"
+        )
     users = ""
     if accounts:
         rows = [
@@ -181,9 +195,11 @@ def _prompt(
         f"{source_text[:MAX_SOURCE]}\n"
         "PAGE HTML (trimmed):\n"
         f"{html[:6000]}\n"
-        "Return {\"url\", \"method\", \"fields\", \"payload_field\", "
-        "\"payload_field_file\", \"headers\", \"payload\", \"column\", "
-        "\"account\", \"reason\"}. "
+        + file_block
+        + "Return {\"url\", \"method\", \"fields\", \"payload_field\", "
+        "\"payload_field_file\", \"files\", \"headers\", \"payload\", "
+        "\"column\", \"account\", \"reason\"}. "
+        "\"files\" is optional and maps a file field to its filename or spec. "
         "\"headers\" is optional and may only name Content-Type, Accept, "
         "X-Requested-With, X-CSRF-Token, X-XSRF-Token or X-WP-Nonce. "
         "\"account\" is a label from SWITCHABLE USERS or empty. "
@@ -356,9 +372,39 @@ async def plan_request(
         }
         if payload_field in values:
             values[payload_field] = planned_payload
-        files: dict[str, str] = {}
-        if file_field:
-            files[file_field] = "tia-upload.png"
+        files: dict[str, dict[str, str]] = {}
+        raw_files = reply.get("files")
+        if isinstance(raw_files, dict):
+            for raw_name, raw_spec in raw_files.items():
+                name = str(raw_name)
+                if name not in file_names:
+                    warnings.append(
+                        f"file field {name!r} is not a parsed file input; dropped"
+                    )
+                    continue
+                entry: dict[str, str] = {}
+                if isinstance(raw_spec, dict):
+                    filename = str(raw_spec.get("filename") or "").strip()
+                    content = str(raw_spec.get("content_base64") or "").strip()
+                    content_type = str(raw_spec.get("content_type") or "").strip()
+                    if filename:
+                        entry["filename"] = filename
+                    if content:
+                        entry["content_base64"] = content
+                    if content_type:
+                        entry["content_type"] = content_type[:100]
+                elif isinstance(raw_spec, (str, int)):
+                    entry["filename"] = str(raw_spec).strip()
+                if not entry:
+                    continue
+                try:
+                    _file_fields({name: entry})
+                except ToolError as exc:
+                    warnings.append(f"file {name!r} rejected: {exc.message}")
+                    continue
+                files[name] = entry
+        if file_field and file_field not in files:
+            files[file_field] = {"filename": "tia-upload.png"}
         headers: dict[str, str] = {}
         raw_headers = reply.get("headers")
         if isinstance(raw_headers, dict):

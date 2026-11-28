@@ -28,7 +28,7 @@ _PAGE_ERROR = re.compile(
 )
 
 Send = Callable[
-    [str, dict[str, str], dict[str, str], str, str, dict[str, str]],
+    [str, dict[str, str], dict[str, dict[str, str]], str, str, dict[str, str]],
     Awaitable[dict[str, Any]],
 ]
 _LOGIN_FORM = re.compile(r"<input[^>]+type=[\"']?password", re.IGNORECASE)
@@ -44,7 +44,7 @@ class DeliveryAttempt:
     method: str
     url: str = ""
     values: dict[str, str] = field(default_factory=dict)
-    files: dict[str, str] = field(default_factory=dict)
+    files: dict[str, dict[str, str]] = field(default_factory=dict)
     payload: str = ""
     status: Any = None
     content_type: str = ""
@@ -93,7 +93,7 @@ class Delivery:
         return self.last.payload if self.last else ""
 
     @property
-    def files(self) -> dict[str, str]:
+    def files(self) -> dict[str, dict[str, str]]:
         if self.plan is not None and self.plan.files:
             return dict(self.plan.files)
         return dict(self.last.files) if self.last else {}

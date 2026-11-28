@@ -60,7 +60,7 @@ async def test_model_plan_is_validated_and_payload_placed() -> None:
     assert plan.source == "llm"
     assert plan.payload_field == "desc"
     assert plan.values["desc"] == "<script>alert(1)</script>ab12"
-    assert plan.files == {"image": "tia-upload.png"}
+    assert plan.files == {"image": {"filename": "tia-upload.png"}}
     assert llm.calls == 1
 
 
@@ -247,3 +247,54 @@ async def test_payload_field_alone_is_enough_to_build_the_request() -> None:
     assert plan is not None
     assert plan.source == "llm"
     assert plan.values["item"] == "<script>alert(1)</script>ab12"
+
+
+async def test_model_can_ship_file_content_as_base64() -> None:
+    llm = FakeLlm(
+        {
+            "url": "http://app.test/file/",
+            "method": "POST",
+            "fields": {"item": "x", "desc": "y", "categ": "z", "price": "1"},
+            "payload_field": "desc",
+            "files": {"image": {"filename": "tia.png", "content_base64": "aGk="}},
+            "reason": "the application stores the uploaded bytes",
+        }
+    )
+    plan = await plan_request(
+        client=llm,  # type: ignore[arg-type]
+        goal="write",
+        page_url="http://app.test/file/",
+        forms=_forms(),
+        source_text="",
+        payload="<script>alert(1)</script>ab12",
+        hint="",
+        tag="ab12",
+    )
+    assert plan is not None
+    assert plan.files["image"]["filename"] == "tia.png"
+    assert plan.files["image"]["content_base64"] == "aGk="
+
+
+async def test_model_cannot_ship_an_invalid_file_field() -> None:
+    llm = FakeLlm(
+        {
+            "url": "http://app.test/file/",
+            "method": "POST",
+            "fields": {"desc": "y"},
+            "payload_field": "desc",
+            "files": {"nope": "tia.png", "image": {"filename": "bad/name.png"}},
+            "reason": "x",
+        }
+    )
+    plan = await plan_request(
+        client=llm,  # type: ignore[arg-type]
+        goal="write",
+        page_url="http://app.test/file/",
+        forms=_forms(),
+        source_text="",
+        payload="<script>alert(1)</script>ab12",
+        hint="",
+        tag="ab12",
+    )
+    assert plan is not None
+    assert plan.files == {}

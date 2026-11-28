@@ -6,6 +6,8 @@ Fields with missing values go into ``missing``; no default values are guessed fo
 
 from __future__ import annotations
 
+import base64
+import binascii
 import re
 from typing import Any
 
@@ -46,7 +48,7 @@ class HttpRequestInput(BaseModel):
     max_redirects: int = Field(default=5, ge=0, le=10)
     capture: dict[str, Any] | None = None
     #: Multipart file fields: field name -> filename. Content is a small marker.
-    files: dict[str, str] = Field(default_factory=dict)
+    files: dict[str, Any] = Field(default_factory=dict)
 
 
 async def _fetch(
@@ -154,17 +156,39 @@ async def form_fill(arguments: dict[str, Any]) -> ToolOutput:
     return ToolOutput(data={"requests": requests, "missing": sorted(set(missing))})
 
 
-def _file_fields(files: dict[str, str]) -> dict[str, tuple[str, bytes]] | None:
-    """Multipart parts for the upload fields a form advertises.
+MAX_UPLOAD_BYTES = 64 * 1024
+DEFAULT_FILE_BYTES = b"tia-upload"
 
-    The bytes only need to be a valid upload; the interesting value travels in
-    the ordinary fields (filename or description depending on the app).
+
+def _file_fields(
+    files: dict[str, Any] | None,
+) -> dict[str, tuple[str, bytes, str]] | None:
+    """Multipart parts for uploaded fields.
+
+    A field may name just a filename (a tiny valid upload) or carry a full
+    spec ``{filename, content_base64, content_type}`` when the application
+    stores or serves the uploaded bytes themselves.
     """
     if not files:
         return None
-    parts: dict[str, tuple[str, bytes]] = {}
-    for name, filename in files.items():
+    parts: dict[str, tuple[str, bytes, str]] = {}
+    for name, spec in files.items():
+        content_type = "application/octet-stream"
+        if isinstance(spec, str):
+            filename, content = spec, DEFAULT_FILE_BYTES
+        elif isinstance(spec, dict):
+            filename = str(spec.get("filename") or "").strip() or "tia-upload.bin"
+            raw = str(spec.get("content_base64") or "").strip()
+            try:
+                content = base64.b64decode(raw, validate=True) if raw else DEFAULT_FILE_BYTES
+            except (binascii.Error, ValueError) as exc:
+                raise _bad(f"Invalid file content for {name!r}") from exc
+            content_type = str(spec.get("content_type") or "").strip()[:100] or content_type
+        else:
+            raise _bad(f"Invalid file spec for {name!r}")
         if not MIME_OK.match(filename):
             raise _bad(f"Invalid upload filename: {filename!r}")
-        parts[name] = (filename, b"tia-upload")
+        if len(content) > MAX_UPLOAD_BYTES:
+            raise _bad(f"Upload {name!r} is larger than {MAX_UPLOAD_BYTES} bytes")
+        parts[name] = (filename, content, content_type)
     return parts

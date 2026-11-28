@@ -66,7 +66,7 @@ class HttpClient:
         max_bytes: int = 32 * 1024,
         marker: str | None = None,
         around: int = 800,
-        files: dict[str, tuple[str, bytes]] | None = None,
+        files: dict[str, tuple[str, bytes, str]] | None = None,
     ) -> HttpResult:
         chain: list[dict[str, Any]] = []
         started = time.perf_counter()

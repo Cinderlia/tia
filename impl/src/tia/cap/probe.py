@@ -249,7 +249,7 @@ class ProbeRunInput(BaseModel):
     output: str | None = None
     wait_ms: int = Field(default=0, ge=0, le=MAX_WAIT_MS)
     capture_html: bool = False
-    files: dict[str, str] = Field(default_factory=dict)
+    files: dict[str, Any] = Field(default_factory=dict)
     session_id: str | None = None
     account_label: str = ""
 

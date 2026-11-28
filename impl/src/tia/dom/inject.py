@@ -846,7 +846,7 @@ async def _run_inject(
     async def _send(
         method: str,
         values: dict[str, str],
-        files: dict[str, str],
+        files: dict[str, dict[str, str]],
         account: str = "",
         url: str = "",
         headers: dict[str, str] | None = None,
