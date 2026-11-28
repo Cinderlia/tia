@@ -18,6 +18,7 @@ from tia.inf.reports import _safe, reports_root
 
 KIND_TITLES = {
     "first_order": "Confirmed first-order XSS",
+    "first_order_sqli": "Confirmed SQL injection",
     "second_order": "Confirmed second-order XSS",
     "second_order_db_only": "Potential second-order XSS (database path only)",
 }
@@ -41,6 +42,11 @@ def _account(notes: dict[str, Any]) -> str:
 
 
 def _sink(notes: dict[str, Any]) -> str:
+    if str(notes.get("sink_class") or "") == "sqli":
+        file = str(notes.get("sink_file") or "").strip()
+        line = notes.get("probe_line") or notes.get("statement_origin")
+        if file and line:
+            return f"{file}:{line}"
     read_sink = str(notes.get("read_sink") or "").strip()
     if read_sink:
         return read_sink
@@ -70,6 +76,19 @@ def _request(notes: dict[str, Any]) -> tuple[str, str]:
             detail += f" — field `{field}` = `{payload}`"
         return f"{method} {url} field {field}", detail
     base = str(notes.get("base_url") or "")
+    form = notes.get("form")
+    if isinstance(form, dict) and form.get("action"):
+        method = str(form.get("method") or "post").upper()
+        url = str(form["action"])
+        field = str(notes.get("param") or notes.get("source_param") or "")
+        payload = str(notes.get("payload") or "")
+        fields = list(form.get("fields") or [])
+        detail = f"{method} {url}"
+        if field:
+            detail += f" — field `{field}` = `{payload}`"
+        if fields:
+            detail += f" (form fields: {', '.join(f'`{name}`' for name in fields)})"
+        return f"{method} {url} field {field}", detail
     probe = notes.get("probe")
     if isinstance(probe, dict) and probe.get("targets"):
         return f"direct DB write ({base})", f"no HTTP request used; see the SQL below (page {base})"
@@ -98,10 +117,33 @@ def _sql(notes: dict[str, Any]) -> str:
             return ";\n".join(statements)
         if probe.get("sql"):
             return str(probe["sql"])
+    attempts = [item for item in notes.get("attempts") or [] if isinstance(item, dict)]
+    for attempt in attempts:
+        statements = [str(sql) for sql in attempt.get("statements") or [] if sql]
+        if statements:
+            return ";\n".join(statements)
+    blind = notes.get("blind")
+    if isinstance(blind, dict):
+        detail = blind.get("detail") or {}
+        for value in detail.values():
+            if isinstance(value, dict):
+                statements = [str(sql) for sql in value.get("statements") or [] if sql]
+                if statements:
+                    return ";\n".join(statements)
     insert = notes.get("insert_sql")
     if insert:
         return str(insert)
     return ""
+
+
+def _injection_point(notes: dict[str, Any]) -> str:
+    field = str(notes.get("param") or notes.get("source_param") or "")
+    context = str(notes.get("context") or "")
+    if field and context:
+        return f"parameter `{field}` ({context} context)"
+    if field:
+        return f"parameter `{field}`"
+    return "(not recorded)"
 
 
 def _read_request(notes: dict[str, Any]) -> str:
@@ -309,6 +351,38 @@ def _browser_params(params: dict[str, Any]) -> str:
 def _verify_section(notes: dict[str, Any], kind: str) -> list[str]:
     """Steps a human can execute in a browser (URL, plus a form for POST)."""
 
+    if kind == "first_order_sqli":
+        raw_form = notes.get("form")
+        form: dict[str, Any] = raw_form if isinstance(raw_form, dict) else {}
+        url = str(form.get("action") or notes.get("base_url") or "")
+        method = str(form.get("method") or "post").lower()
+        field = str(notes.get("param") or "")
+        payload = str(notes.get("payload") or "")
+        lines = ["", "## Verify in a browser", ""]
+        if not url:
+            return lines + ["- No URL recorded for this finding."]
+        step = 1
+        if method == "get":
+            target = f"{url}{'&' if '?' in url else '?'}{quote(field)}={quote(payload, safe='')}"
+            lines.append(f"{step}. Open: {target}")
+        else:
+            lines += [
+                f"{step}. Open: {url}",
+                f"{step + 1}. POST the form with:",
+                "",
+                "| Field | Value |",
+                "| --- | --- |",
+                f"| `{field}` | `{payload}` |",
+            ]
+            step += 1
+        step += 1
+        lines.append(
+            f"{step}. The payload becomes part of the SQL the page executes "
+            "(see the statements above); the page itself may only show a database "
+            "error or different rows."
+        )
+        return lines
+
     payload = _payload(notes)
     raw_entry = notes.get("entry")
     entry: dict[str, Any] = raw_entry if isinstance(raw_entry, dict) else {}
@@ -393,6 +467,8 @@ def _evidence(notes: dict[str, Any]) -> str:
         parts.append(f"context={best.get('context_kind')}, reason={best.get('reason')}")
     if notes.get("tag_in_db") is not None:
         parts.append(f"tag_in_db={notes['tag_in_db']}")
+    if notes.get("sql_probe_level"):
+        parts.append(f"level={notes['sql_probe_level']}")
     return ", ".join(parts) or "(see case report)"
 
 
@@ -434,11 +510,13 @@ def write_finding(
     if code:
         lines[-1] += f" — `{code}`"
     sql = _sql(notes)
+    if kind == "first_order_sqli":
+        lines.append(f"- Injection point: {_injection_point(notes)}")
     if kind == "second_order_db_only":
         lines.append(f"- Read request: {_read_request(notes)}")
     else:
         lines.append(f"- Injection request: {request_detail}")
-    if kind != "first_order":
+    if kind not in {"first_order", "first_order_sqli"}:
         lines.append(f"- Storage (database field): {storage}")
     if sql:
         label = "Application SQL observed" if kind != "second_order_db_only" else "SQL executed"
@@ -488,7 +566,8 @@ def finding_first_order(store: Any, case_id: str) -> Path | None:
     notes = _notes(store, case_id)
     if not notes:
         return None
-    return write_finding(store, kind="first_order", case_id=case_id, notes=notes)
+    kind = "first_order_sqli" if str(notes.get("sink_class") or "") == "sqli" else "first_order"
+    return write_finding(store, kind=kind, case_id=case_id, notes=notes)
 
 
 def finding_second_order(store: Any, case_id: str) -> Path | None:

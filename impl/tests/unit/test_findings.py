@@ -236,3 +236,53 @@ def test_finding_lists_the_state_prerequisites(tmp_path: Path, monkeypatch) -> N
     assert "## State prerequisites" in text
     assert "`testimonials`.`testimonials_id` = `31`" in text
     assert "created a row: `INSERT INTO `testimonials`" in text
+
+
+SQLI = {
+    "sink": "vulnerabilities/sqli/home.php:57",
+    "sink_code": "$result = $conn->query($sql);",
+    "sink_class": "sqli",
+    "base_url": "http://127.0.0.1/xvwa/vulnerabilities/sqli/",
+    "form": {
+        "action": "http://127.0.0.1/xvwa/vulnerabilities/sqli/",
+        "method": "POST",
+        "fields": ["item", "search"],
+    },
+    "param": "item",
+    "context": "numeric",
+    "payload": "1 OR 1=1 -- tiaqkao",
+    "tag": "qkao",
+    "sql_probe_level": "SQLI_CONFIRMED",
+    "attempts": [
+        {
+            "shape": "numeric_or",
+            "payload": "1 OR 1=1 -- tiaqkao",
+            "fields": ["item"],
+            "status": 200,
+            "marker_seen": True,
+            "statements": ["select * from caffaine where itemid = 1 OR 1=1 -- tiaqkao"],
+        }
+    ],
+}
+
+
+def test_sqli_finding_is_not_title_xss(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("TIA_REPORTS", str(tmp_path / "reports"))
+    store = Store(tmp_path / "tia.db")
+    case_id = _case(store, SQLI)
+    path = finding_first_order(store, case_id)
+    assert path is not None
+    assert path.name.startswith("first_order_sqli-")
+    text = path.read_text(encoding="utf-8")
+    assert "Confirmed SQL injection" in text
+    assert "vulnerabilities/sqli/home.php:57" in text
+    assert "Confirmed first-order XSS" not in text
+    assert "POST http://127.0.0.1/xvwa/vulnerabilities/sqli/" in text
+    assert "field `item`" in text
+    assert "1 OR 1=1 -- tiaqkao" in text
+    assert "select * from caffaine" in text
+    assert "Injection point: parameter `item` (numeric context)" in text
+    assert "Storage (database field)" not in text
+    assert "level=SQLI_CONFIRMED" in text
+    index = (tmp_path / "reports" / "default" / "findings.md").read_text(encoding="utf-8")
+    assert "Confirmed SQL injection" in index
