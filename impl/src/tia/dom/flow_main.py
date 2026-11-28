@@ -111,15 +111,15 @@ def _read_identity_from_code(raw: dict[str, Any]) -> tuple[str, tuple[str, ...]]
     return table, matched
 
 
-def seed_flow_queue(
+def _score_sites(
     store: Any,
     run_id: str,
     sites: list[dict[str, Any]],
     *,
     family: str = "second",
     reader: Reader | None = None,
-) -> FlowSeedResult:
-    """Insert sites and build the flows the main agent will lease."""
+) -> tuple[FlowSeedResult, list[Site]]:
+    """Insert one batch of sites and return them as flow-building inputs."""
     result = FlowSeedResult()
     built: list[Site] = []
     for index, item in enumerate(sites):
@@ -174,11 +174,81 @@ def seed_flow_queue(
                 reasons=list(scored.reasons),
             )
         )
+    return result, built
+
+
+def seed_flow_queue(
+    store: Any,
+    run_id: str,
+    sites: list[dict[str, Any]],
+    *,
+    family: str = "second",
+    reader: Reader | None = None,
+) -> FlowSeedResult:
+    """Insert sites and build the flows the main agent will lease."""
+    result, built = _score_sites(store, run_id, sites, family=family, reader=reader)
     flows = build_flows(built)
     store.seed_flows(run_id, [flow.to_row() for flow in flows])
     result.flows = len(flows)
     result.flow_ids = [flow.flow_id for flow in flows]
     return result
+
+
+class SiteProducer:
+    """Score slices in batches and keep seeding flows while consumers run.
+
+    The batch is scored locally (no network), so the producer is always
+    ahead of the consumer.  Flows are rebuilt over every site seen so far
+    (``seed_flows`` keeps already-claimed rows untouched), which is what
+    lets a writer batch arrive after the read batch it belongs to.
+    """
+
+    def __init__(
+        self,
+        store: Any,
+        run_id: str,
+        sites: list[dict[str, Any]],
+        *,
+        family: str = "second",
+        reader: Reader | None = None,
+        batch_size: int = 25,
+    ) -> None:
+        self._store = store
+        self._run_id = run_id
+        self._sites = list(sites)
+        self._family = family
+        self._reader = reader
+        self._batch_size = max(1, batch_size)
+        self._cursor = 0
+        self._scored: list[Site] = []
+        self.done = False
+        self.seeded = 0
+        self.batches = 0
+
+    def next_batch(self) -> int:
+        """Score the next batch; return how many flows are now queued."""
+        if self.done:
+            return 0
+        block = self._sites[self._cursor : self._cursor + self._batch_size]
+        self._cursor += len(block)
+        if not block:
+            self.done = True
+            return 0
+        _result, built = _score_sites(
+            self._store,
+            self._run_id,
+            block,
+            family=self._family,
+            reader=self._reader,
+        )
+        self._scored.extend(built)
+        flows = build_flows(self._scored)
+        self._store.seed_flows(self._run_id, [flow.to_row() for flow in flows])
+        self.batches += 1
+        self.seeded = len(flows)
+        if self._cursor >= len(self._sites):
+            self.done = True
+        return len(flows)
 
 
 def _read_entry_for(
@@ -246,15 +316,28 @@ async def run_flow_queue(
     inject_client: ToolClient | None = None,
     url_for: Callable[[dict[str, Any]], str] | None = None,
     reader: Reader | None = None,
+    producer: Any | None = None,
+    max_minutes: float | None = None,
 ) -> MainResult:
     """Lease flows, prove the target, then replay the plan with legal requests."""
     result = MainResult()
     reports = RunReports(store, run_id or "flow")
-    for _ in range(max(limit, 0)):
+    deadline = None if not max_minutes else time.monotonic() + float(max_minutes) * 60
+    while len(result.outcomes) < max(limit, 0):
+        if deadline is not None and time.monotonic() >= deadline:
+            # Leave the tail pending: a later run resumes where this one stopped.
+            result.stop_reason = "TIME_BUDGET"
+            break
         flow = store.next_flow(run_id)
         if flow is None:
-            result.stop_reason = "DONE" if result.outcomes else "NO_FLOW"
-            break
+            while producer is not None and not producer.done:
+                producer.next_batch()
+                flow = store.next_flow(run_id)
+                if flow is not None:
+                    break
+            if flow is None:
+                result.stop_reason = "DONE" if result.outcomes else "NO_FLOW"
+                break
         target_row = store.get_slice(str(flow["target_slice_id"]))
         if target_row is None:
             store.archive_flow(str(flow["flow_id"]), "failed", "MISSING_SITE")

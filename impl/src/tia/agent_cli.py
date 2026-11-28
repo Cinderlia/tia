@@ -209,6 +209,18 @@ def _parser() -> argparse.ArgumentParser:
         help="Schedule attack flows (target site + writers) instead of single slices",
     )
     pipeline.add_argument(
+        "--max-minutes",
+        type=float,
+        default=0.0,
+        help="Stop leasing once this many minutes have passed (0 = no limit)",
+    )
+    pipeline.add_argument(
+        "--batch-size",
+        type=int,
+        default=25,
+        help="Slices scored per producer batch in the flow queue",
+    )
+    pipeline.add_argument(
         "--db-snapshot",
         default=None,
         help="Dump the target database to this file before the run and restore it afterwards",
@@ -577,7 +589,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
 
     url_for_fn = url_for if args.per_slice_url else None
     if args.flow_queue:
-        from tia.dom.flow_main import run_flow_queue, seed_flow_queue
+        from tia.dom.flow_main import SiteProducer, run_flow_queue
         from tia.dom.pipeline import _reader
 
         family = "direct" if args.mode == "direct" else "second"
@@ -586,7 +598,16 @@ def _run_pipeline(args: argparse.Namespace) -> int:
             {"raw": raw, "family": family, "role": "read"} for raw in read_slices
         ] + [{"raw": raw, "family": "second", "role": "write"} for raw in write_slices]
         reader = _reader()
-        seeded = seed_flow_queue(store, run_id, sites, family=family, reader=reader)
+        # Producer/consumer: score and seed in batches while the consumer
+        # leases; the pending tail is left in the store for a later run.
+        producer = SiteProducer(
+            store,
+            run_id,
+            sites,
+            family=family,
+            reader=reader,
+            batch_size=args.batch_size,
+        )
         snapshot_path = Path(args.db_snapshot) if args.db_snapshot else None
         if snapshot_path is not None:
             from tia.inf.snapshot import restore_pending, snapshot_database
@@ -612,6 +633,8 @@ def _run_pipeline(args: argparse.Namespace) -> int:
                     budget=args.budget,
                     url_for=url_for_fn,
                     reader=reader,
+                    producer=producer,
+                    max_minutes=args.max_minutes or None,
                 )
             )
         finally:
@@ -628,8 +651,9 @@ def _run_pipeline(args: argparse.Namespace) -> int:
             "mode": args.mode,
             "queue": "flow",
             "run_id": run_id,
-            "sites": seeded.sites,
-            "flows": seeded.flows,
+            "sites": len(sites),
+            "flows": store.count_pending_flows(run_id) + len(flow_result.outcomes),
+            "batches": producer.batches,
             "stop_reason": flow_result.stop_reason,
             "outcomes": [item.model_dump() for item in flow_result.outcomes],
         }

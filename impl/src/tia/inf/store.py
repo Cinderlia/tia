@@ -311,9 +311,14 @@ class Store:
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.path, timeout=10)
+        conn = sqlite3.connect(self.path, timeout=30)
         conn.row_factory = sqlite3.Row
         try:
+            # One writer at a time, readers never block it.  The lease
+            # methods below also guard with "AND status='pending'", so a
+            # second consumer that lost the race simply retries.
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
             yield conn
             conn.commit()
         finally:
@@ -1047,14 +1052,19 @@ class Store:
             " sink_file, sink_line LIMIT 1"
         )
         with self._conn() as conn:
-            row = conn.execute(sql, tuple(args)).fetchone()
-            if row is None:
-                return None
-            slice_id = str(row["id"])
-            conn.execute(
-                "UPDATE slice SET status='running', attempts=attempts+1, updated_at=? WHERE id=?",
-                (now_iso(), slice_id),
-            )
+            while True:
+                row = conn.execute(sql, tuple(args)).fetchone()
+                if row is None:
+                    return None
+                slice_id = str(row["id"])
+                cursor = conn.execute(
+                    "UPDATE slice SET status='running', attempts=attempts+1, updated_at=?"
+                    " WHERE id=? AND status='pending'",
+                    (now_iso(), slice_id),
+                )
+                if cursor.rowcount == 1:
+                    break
+                # Another consumer leased it first; look again.
             fresh = conn.execute("SELECT * FROM slice WHERE id=?", (slice_id,)).fetchone()
         loaded = dict(fresh)
         loaded["slice"] = json.loads(loaded.pop("slice_json"))
@@ -1286,14 +1296,18 @@ class Store:
             args = (run_id,)
         sql += " ORDER BY rank ASC LIMIT 1"
         with self._conn() as conn:
-            row = conn.execute(sql, args).fetchone()
-            if row is None:
-                return None
-            item_id = str(row["item_id"])
-            conn.execute(
-                "UPDATE injection_queue SET status='running', updated_at=? WHERE item_id=?",
-                (now_iso(), item_id),
-            )
+            while True:
+                row = conn.execute(sql, args).fetchone()
+                if row is None:
+                    return None
+                item_id = str(row["item_id"])
+                cursor = conn.execute(
+                    "UPDATE injection_queue SET status='running', updated_at=?"
+                    " WHERE item_id=? AND status='pending'",
+                    (now_iso(), item_id),
+                )
+                if cursor.rowcount == 1:
+                    break
             fresh = conn.execute("SELECT * FROM injection_queue WHERE item_id=?", (item_id,)).fetchone()
         return self._injection_row(fresh) if fresh is not None else None
 
@@ -1509,10 +1523,21 @@ class Store:
                 ).fetchone()
                 created_at = str(existing["created_at"]) if existing is not None else ts
                 conn.execute(
-                    "INSERT OR REPLACE INTO flow_job (flow_id, run_id, rank, family, sink_class,"
+                    "INSERT INTO flow_job (flow_id, run_id, rank, family, sink_class,"
                     " sink_kind, target_slice_id, writer_slice_ids, table_name, columns, score,"
                     " reasons, digest, created_at, updated_at)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                    # Re-scoring must never reset a flow a consumer already
+                    # leased or finished; only pending rows are refreshed.
+                    " ON CONFLICT(flow_id) DO UPDATE SET"
+                    " rank=excluded.rank, family=excluded.family,"
+                    " sink_class=excluded.sink_class, sink_kind=excluded.sink_kind,"
+                    " target_slice_id=excluded.target_slice_id,"
+                    " writer_slice_ids=excluded.writer_slice_ids,"
+                    " table_name=excluded.table_name, columns=excluded.columns,"
+                    " score=excluded.score, reasons=excluded.reasons,"
+                    " digest=excluded.digest, updated_at=excluded.updated_at"
+                    " WHERE flow_job.status='pending'",
                     (
                         flow_id_value,
                         run_id,
@@ -1552,14 +1577,18 @@ class Store:
             args.append(run_id)
         sql += " ORDER BY score DESC, rank, created_at LIMIT 1"
         with self._conn() as conn:
-            row = conn.execute(sql, tuple(args)).fetchone()
-            if row is None:
-                return None
-            flow_id_value = str(row["flow_id"])
-            conn.execute(
-                "UPDATE flow_job SET status='running', attempts=attempts+1, updated_at=? WHERE flow_id=?",
-                (now_iso(), flow_id_value),
-            )
+            while True:
+                row = conn.execute(sql, tuple(args)).fetchone()
+                if row is None:
+                    return None
+                flow_id_value = str(row["flow_id"])
+                cursor = conn.execute(
+                    "UPDATE flow_job SET status='running', attempts=attempts+1, updated_at=?"
+                    " WHERE flow_id=? AND status='pending'",
+                    (now_iso(), flow_id_value),
+                )
+                if cursor.rowcount == 1:
+                    break
             fresh = conn.execute("SELECT * FROM flow_job WHERE flow_id=?", (flow_id_value,)).fetchone()
         return self._flow_row(fresh)
 
