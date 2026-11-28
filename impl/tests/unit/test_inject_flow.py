@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 from urllib.parse import parse_qs
 
 import pytest
@@ -446,3 +447,31 @@ async def test_inject_creates_the_parent_row_the_write_path_needs(runtime: Any) 
     assert result.notes["state_plan"]["values"] == {"parent_id": "9"}
     assert result.notes["state_probe_retry"]["probed"] is True
     assert client.posts == 1
+
+
+class ShapeCapturingClient(FakeInjectClient):
+    """Records the form values the inject stage actually writes."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.bodies: list[str] = []
+
+    def _data(self, tool: str, args: dict[str, Any]) -> dict[str, Any]:
+        if tool == "probe_run":
+            self.bodies.append(str(args.get("body") or ""))
+        return super()._data(tool, args)
+
+
+async def test_shape_hint_rewrites_the_payload_after_a_failed_attempt(runtime: Any) -> None:
+    client = ShapeCapturingClient()
+    result = await run_inject(
+        _slice(),
+        base_url="http://127.0.0.1/xvwa/",
+        client=client,
+        shape_hint="attr_breakout",
+        feedback="read context kind=attr; the payload sits inside a double-quoted attribute",
+    )
+    assert result.notes["payload_shape"] == "attr_breakout"
+    assert result.notes["payload_from_rollback"] is True
+    assert result.notes["feedback"].startswith("read context kind=attr")
+    assert any('"><script>' in unquote(body) for body in client.bodies)

@@ -370,6 +370,8 @@ async def _run_inject(
     constraint_plan: dict[str, Any] | None = None,
     pair_candidates: dict[str, list[dict[str, Any]]] | None = None,
     flow: dict[str, Any] | None = None,
+    feedback: str = "",
+    shape_hint: str = "",
 ) -> InjectResult:
     kernel = Kernel(
         profile="inject", budget=budget, client=client or LocalToolClient(profile="inject")
@@ -546,6 +548,17 @@ async def _run_inject(
         stage("I3", True, f"learned payload shape {learned_shape} for this site")
     else:
         payload = f"{payload_base}{tag}"
+    if shape_hint:
+        # A previous attempt proved the write path and the read request; the
+        # only thing that failed is the shape the output context expects.
+        shaped = sink_class.render(shape_hint, tag)
+        if shaped and shaped != payload:
+            payload = shaped
+            notes["payload_shape"] = shape_hint
+            notes["payload_from_rollback"] = True
+            stage("I3", True, f"payload regenerated as {shape_hint} after a failed attempt")
+    if feedback:
+        notes["feedback"] = feedback
     if constraints:
         notes["payload_constraints"] = constraints
         max_length = constraints.get("max_length")
@@ -746,7 +759,9 @@ async def _run_inject(
         ),
         constraints=", ".join(f"{name}: {kind}" for name, kind in column_limits.items()),
         fallback_fields=fallback,
-        observation="\n".join(kernel.tool_errors[-3:]),
+        observation="\n".join(
+            [*kernel.tool_errors[-3:], *([feedback] if feedback else [])]
+        ),
         max_rounds=WRITE_ATTEMPTS,
         send=_send,
         accept=_accept,
@@ -1552,6 +1567,8 @@ async def run_inject(
     constraint_plan: dict[str, Any] | None = None,
     pair_candidates: dict[str, list[dict[str, Any]]] | None = None,
     flow: dict[str, Any] | None = None,
+    feedback: str = "",
+    shape_hint: str = "",
 ) -> InjectResult:
     """Run the inject agent and always remove the rows it wrote through the app.
 
@@ -1578,6 +1595,8 @@ async def run_inject(
             constraint_plan=constraint_plan,
             pair_candidates=pair_candidates,
             flow=flow,
+            feedback=feedback,
+            shape_hint=shape_hint,
         )
     finally:
         state = _ACTIVE_CLEANUP.get()

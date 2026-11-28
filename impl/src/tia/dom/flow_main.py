@@ -24,6 +24,8 @@ from tia.dom.direct import run_direct
 from tia.dom.inject import run_inject
 from tia.dom.main import MainResult, _read_target, _report
 from tia.dom.prover import run_flow_prover
+from tia.dom.rollback import classify_inject
+from tia.dom.stages import Stage, rollback
 from tia.inf.findings import finding_db_only, finding_first_order, finding_second_order
 from tia.inf.reports import RunReports
 from tia.inf.runtime import get_runtime
@@ -447,6 +449,47 @@ async def run_flow_queue(
                 "confidence": int(flow.get("score") or 60),
                 "direction": "write_then_read",
             }
+            inject: Any = None
+            async def _stage_inject(
+                ctx: dict[str, Any],
+                *,
+                _writer_raw: dict[str, Any] = writer_raw,
+                _write_url: str = write_url,
+                _payload_base: str = payload_base,
+                _budget: int = budget,
+                _client: Any = inject_client,
+                _hint: dict[str, Any] = hint,
+                _read_url: str = read_url,
+                _entry: Any = entry,
+                _probe: Any = probe,
+                _writer_id: str = writer_id,
+                _target_raw: dict[str, Any] = target_raw,
+                _plan: dict[str, Any] = plan,
+                _pair_map: dict[str, Any] = pair_map,
+                _flow: dict[str, Any] = flow,
+            ) -> None:
+                nonlocal inject
+                inject = await run_inject(
+                    _writer_raw,
+                    base_url=_write_url,
+                    payload_base=_payload_base,
+                    budget=min(_budget, 40),
+                    client=_client,
+                    pair_hints=[dict(_hint)],
+                    verify_url=_read_url,
+                    verify_entry=_entry,
+                    verify_values=(_probe.notes or {}).get("read_entry_values"),
+                    payload_constraints=_probe.notes.get("payload_constraints"),
+                    slice_id=_writer_id,
+                    learning=hints_for(store, _target_raw),
+                    read_target=_read_target(_target_raw, _probe.notes),
+                    constraint_plan=_plan,
+                    pair_candidates=_pair_map,
+                    flow=_flow,
+                    feedback=str(ctx.get("feedback") or ""),
+                    shape_hint=str(ctx.get("shape_hint") or ""),
+                )
+
             inject = await run_inject(
                 writer_raw,
                 base_url=write_url,
@@ -465,6 +508,34 @@ async def run_flow_queue(
                 pair_candidates=pair_map,
                 flow=flow,
             )
+            failure = classify_inject(inject)
+            if failure is not None:
+                # A failed final check is not a reason to restart the flow:
+                # trigger proved the read path and pairing produced the write
+                # slice, so only the stage the cause points at (and the stages
+                # that depend on it) is replayed once, with the failure detail.
+                stage_ctx: dict[str, Any] = {
+                    "feedback": failure.detail or failure.reason,
+                    "shape_hint": failure.shape_hint,
+                }
+
+                stages = [
+                    Stage("trigger", (), None),
+                    Stage("pair", ("trigger",), None),
+                    Stage("inject", ("pair",), _stage_inject),
+                ]
+                done = await rollback(
+                    stages, stage_ctx, failure.stage, reason=failure.reason
+                )
+                notes["rollback"] = {
+                    "target": done.target,
+                    "rerun": done.rerun,
+                    "reason": done.reason,
+                    "attempt": done.attempt,
+                    "detail": failure.detail,
+                    "shape_hint": failure.shape_hint,
+                    "verdict": inject.verdict,
+                }
             verdict = inject.verdict
             case_id = inject.case_id
             residue = inject.residue or 0
