@@ -43,6 +43,16 @@ def classify_inject(result: Any) -> FailureReport | None:
     notes: dict[str, Any] = getattr(result, "notes", None) or {}
     if verdict in {"EXECUTABLE", "EXECUTED"}:
         return None
+    copy_failure = str(notes.get("copy_failure") or "")
+    if copy_failure:
+        return FailureReport(
+            stage="inject",
+            reason=(
+                "the copy chain could not carry the marker to the read column "
+                f"({copy_failure}); the entry write is not enough"
+            ),
+            detail=_feedback(notes),
+        )
     context_kind = str(notes.get("context_kind") or "")
     found = bool(notes.get("tag_in_page"))
     executable = bool(notes.get("executable"))

@@ -284,6 +284,7 @@ class Store:
                 ("read_identity", "ALTER TABLE injection_queue ADD COLUMN read_identity TEXT NOT NULL DEFAULT ''"),
                 ("write_identity", "ALTER TABLE injection_queue ADD COLUMN write_identity TEXT NOT NULL DEFAULT ''"),
                 ("alternates", "ALTER TABLE injection_queue ADD COLUMN alternates TEXT NOT NULL DEFAULT '[]'"),
+                ("copy_paths", "ALTER TABLE injection_queue ADD COLUMN copy_paths TEXT NOT NULL DEFAULT '[]'"),
             ):
                 if name not in queue_columns:
                     conn.execute(ddl)
@@ -1230,8 +1231,8 @@ class Store:
                 conn.execute(
                     "INSERT INTO injection_queue (item_id, run_id, rank, write_slice_id, read_slice_id,"
                     " pair_id, table_name, columns, score, direction, reasons, status,"
-                    " read_identity, write_identity, alternates, created_at, updated_at)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?,?)",
+                    " read_identity, write_identity, alternates, copy_paths, created_at, updated_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?,?,?)",
                     (
                         str(item["item_id"]),
                         run_id,
@@ -1247,6 +1248,7 @@ class Store:
                         str(item.get("read_identity") or ""),
                         str(item.get("write_identity") or ""),
                         json.dumps(item.get("alternates") or [], ensure_ascii=False),
+                        json.dumps(item.get("copy_paths") or [], ensure_ascii=False),
                         now,
                         now,
                     ),
@@ -1318,6 +1320,7 @@ class Store:
             "read_identity": row["read_identity"],
             "write_identity": row["write_identity"],
             "alternates": json.loads(row["alternates"] or "[]"),
+            "copy_paths": json.loads(row["copy_paths"] or "[]"),
         }
 
     # -- identity-level conclusions --------------------------------------

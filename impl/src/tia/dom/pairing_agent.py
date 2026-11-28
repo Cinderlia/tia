@@ -527,6 +527,12 @@ def build_pairing_queue(
             continue
         per_write[write_id] = per_write.get(write_id, 0) + 1
         digest = hashlib.sha1(f"{run_id}|{key}".encode()).hexdigest()[:10]
+        item_paths = [
+            path
+            for path in result.paths
+            if str(path.get("table")) == str(primary["table"])
+            and str(path.get("column")) in {str(column) for column in primary["columns"]}
+        ][:3]
         ranked.append(
             {
                 "item_id": f"iq-{digest}",
@@ -540,6 +546,7 @@ def build_pairing_queue(
                 "reasons": list(primary["reasons"]),
                 "read_identity": group["read_identity"],
                 "write_identity": group["write_identity"],
+                "copy_paths": item_paths,
                 "alternates": [
                     {
                         "read_slice_id": alt["read_slice_id"],

@@ -439,6 +439,27 @@ async def _prepare_constraints(
     return mapping
 
 
+def _copy_paths_with_raw(
+    store: Any, item: dict[str, Any], url_for: Callable[[dict[str, Any]], str] | None
+) -> list[dict[str, Any]]:
+    """Attach each hop's slice payload and page URL to the queue's copy paths."""
+    paths: list[dict[str, Any]] = []
+    for path in (item.get("copy_paths") or [])[:2]:
+        hops: list[dict[str, Any]] = []
+        for hop in path.get("hops") or []:
+            row = store.get_slice(str(hop.get("write_slice_id")))
+            raw = dict(row["slice"]) if row is not None else {}
+            hops.append(
+                {
+                    **hop,
+                    "raw": raw,
+                    "url": url_for(raw) if (url_for is not None and raw) else "",
+                }
+            )
+        paths.append({**path, "hops": hops})
+    return paths
+
+
 async def walk_injection_queue(
     store: Any,
     pair_run_id: str,
@@ -478,6 +499,7 @@ async def walk_injection_queue(
             url_for,
             read_url,
         )
+        copy_paths = _copy_paths_with_raw(store, item, url_for)
         hint = {
             "pair_id": item["pair_id"],
             "table": item["table"],
@@ -515,6 +537,7 @@ async def walk_injection_queue(
             read_target=_read_target(read_raw, read_notes),
             constraint_plan=constraint_plan,
             pair_candidates=pair_map,
+            copy_paths=copy_paths,
         )
         if (
             len(hints) > 1
@@ -539,6 +562,7 @@ async def walk_injection_queue(
                     read_target=_read_target(read_raw, read_notes),
                     constraint_plan=constraint_plan,
                     pair_candidates=pair_map,
+                    copy_paths=copy_paths,
                 )
                 inject.notes["alternate_attempt"] = {
                     "slice_id": hints[1]["alternate_write_slice_id"],

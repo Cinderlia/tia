@@ -97,11 +97,13 @@ def test_injection_queue_store_roundtrip(tmp_path: Path) -> None:
             "score": 90,
             "direction": "write_then_read",
             "reasons": ["same table"],
+            "copy_paths": [{"path_id": "cp-1", "hops": []}],
         }
     ]
     assert store.replace_injection_queue("run-1", items) == 1
     listed = store.list_injection_queue("run-1")
     assert listed[0]["columns"] == ["comment"]
+    assert listed[0]["copy_paths"][0]["path_id"] == "cp-1"
     leased = store.next_injection_item("run-1")
     assert leased is not None and leased["status"] == "running"
     assert store.archive_injection_item("iq-1", "EXECUTABLE", case_id="case-1")
@@ -124,6 +126,7 @@ class _FakeInject:
         self.residue = 0
         self.case_id = "case-inject"
         self.trace: list[Any] = []
+        self.notes: dict[str, Any] = {}
 
 
 @pytest.mark.asyncio
@@ -147,3 +150,70 @@ async def test_injection_queue_walk_continues_after_success(tmp_path: Path, monk
     assert result.outcomes
     assert len(calls) == 2 * len(result.outcomes)
     assert result.stop_reason == "DONE"
+
+
+@pytest.mark.asyncio
+async def test_queue_item_carries_its_copy_path_into_the_injector(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    store = Store(tmp_path / "tia-copy.db")
+    proven = _proven(store, "trig-5")
+    proof_row = proven[0]
+    write_raw = {
+        "kind": "xss",
+        "sinkFile": "app/drafts.php",
+        "sinkLine": 10,
+        "sinkCode": "insert into drafts (body) values (:body)",
+        "params": ["body"],
+    }
+    ids = store.seed_slices("run-5", [write_raw])
+    write_id = ids[0]
+    store.replace_injection_queue(
+        "run-5",
+        [
+            {
+                "item_id": "iq-copy",
+                "write_slice_id": write_id,
+                "read_slice_id": str(proof_row["id"]),
+                "pair_id": "p-copy",
+                "table": "comments",
+                "columns": ["comment"],
+                "score": 88,
+                "direction": "write_then_read",
+                "reasons": ["copy"],
+                "copy_paths": [
+                    {
+                        "path_id": "cp-x",
+                        "table": "comments",
+                        "column": "comment",
+                        "hops": [
+                            {"write_slice_id": write_id, "table": "drafts", "column": "body"}
+                        ],
+                    }
+                ],
+            }
+        ],
+    )
+    captured: list[dict[str, Any]] = []
+
+    async def fake_inject(raw: dict[str, Any], **kwargs: Any) -> _FakeInject:
+        captured.append(kwargs)
+        return _FakeInject("EXECUTABLE")
+
+    from tia.dom import pipeline as pipeline_mod
+
+    monkeypatch.setattr(pipeline_mod, "run_inject", fake_inject)
+    await pipeline_mod.walk_injection_queue(
+        store,
+        "run-5",
+        "http://x/",
+        payload_base="<script>alert(1)</script>",
+        budget=40,
+        inject_client=None,
+        url_for=None,
+        reader=lambda file, line, width: [],
+    )
+    assert captured
+    paths = captured[0]["copy_paths"]
+    assert paths[0]["path_id"] == "cp-x"
+    assert paths[0]["hops"][0]["raw"]["sinkFile"] == "app/drafts.php"

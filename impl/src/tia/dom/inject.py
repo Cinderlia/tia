@@ -415,6 +415,7 @@ async def _run_inject(
     flow: dict[str, Any] | None = None,
     feedback: str = "",
     shape_hint: str = "",
+    copy_paths: list[dict[str, Any]] | None = None,
 ) -> InjectResult:
     kernel = Kernel(
         profile="inject", budget=budget, client=client or LocalToolClient(profile="inject")
@@ -1013,6 +1014,44 @@ async def _run_inject(
                     notes["write_signal"] = "probe" if retry_probed else "db_read"
     if delivery.last is not None and not submitted:
         submitted = {"http": {"status": delivery.last.status, "html": delivery.last.html}}
+    if not accepted and copy_paths:
+        # A direct write cannot carry the marker; walk the copy chain instead:
+        # the entry hop stores the payload, later hops make the application
+        # copy it into the column the read path renders.
+        from tia.dom.copy_run import run_copy_chain
+
+        chain_path = next((path for path in copy_paths if path.get("hops")), None)
+        if chain_path is not None:
+            notes["copy_path_id"] = str(chain_path.get("path_id") or "")
+            chain = await run_copy_chain(
+                call,
+                case_id=result.case_id,
+                copy_path=chain_path,
+                base_url=base_url,
+                payload=payload,
+                tag=tag,
+            )
+            notes["copy_hops"] = chain["hops"]
+            if chain["ok"]:
+                accepted = True
+                probed = True
+                stored = int(chain["stored"] or 0)
+                submitted = dict(chain["submitted"] or {})
+                notes["write_signal"] = "copy_path"
+                target["columns"] = list(
+                    dict.fromkeys(
+                        [
+                            *[str(column) for column in target.get("columns") or []],
+                            *[
+                                str(hop.get("column") or "")
+                                for hop in chain_path.get("hops") or []
+                                if hop.get("column")
+                            ],
+                        ]
+                    )
+                )
+            else:
+                notes["copy_failure"] = chain["failed_kind"]
     if not accepted:
         if armed:
             with contextlib.suppress(ToolCallError):
@@ -1734,6 +1773,7 @@ async def run_inject(
     flow: dict[str, Any] | None = None,
     feedback: str = "",
     shape_hint: str = "",
+    copy_paths: list[dict[str, Any]] | None = None,
 ) -> InjectResult:
     """Run the inject agent and always remove the rows it wrote through the app.
 
@@ -1762,6 +1802,7 @@ async def run_inject(
             flow=flow,
             feedback=feedback,
             shape_hint=shape_hint,
+            copy_paths=copy_paths,
         )
     finally:
         state = _ACTIVE_CLEANUP.get()
