@@ -526,6 +526,22 @@ def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="milliseconds")
 
 
+def _evidence_dir(tag: str) -> Any:
+    """Where this run keeps the browser screenshot (reports/<target>/evidence/<case>)."""
+
+    from tia.inf.calllog import CURRENT_CASE
+    from tia.inf.reports import reports_root
+    from tia.inf.runtime import get_runtime
+
+    case = CURRENT_CASE.get() or "no-case"
+    return reports_root(get_runtime().store) / "evidence" / _safe_name(case)
+
+
+def _safe_name(text: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in "-_." else "-" for ch in text)
+    return cleaned.strip("-") or "shot"
+
+
 async def _fetch(
     input_: VerifyTagInput, cookies: dict[str, str] | None = None
 ) -> tuple[str, str, dict[str, str], int]:
@@ -610,6 +626,8 @@ async def verify_tag(arguments: dict[str, Any]) -> ToolOutput:
             method=input_.execute_method,
             fields=input_.execute_fields,
             action=input_.url,
+            evidence_dir=_evidence_dir(input_.tag),
+            evidence_name=_safe_name(input_.tag),
         )
         result.execution = execution.to_dict()
         if execution.error is not None:

@@ -19,6 +19,7 @@ import hashlib
 import os
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from tia.ad.login import LoginResult
@@ -67,6 +68,7 @@ class ExecutionResult:
     final_url: str = ""
     duration_ms: int = 0
     screenshot_sha256: str | None = None
+    screenshot_path: str | None = None
     error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -79,6 +81,7 @@ class ExecutionResult:
             "final_url": self.final_url,
             "duration_ms": self.duration_ms,
             "screenshot_sha256": self.screenshot_sha256,
+            "screenshot_path": self.screenshot_path,
             "error": self.error,
         }
 
@@ -123,6 +126,8 @@ class BrowserExecutor:
         method: str = "GET",
         fields: dict[str, str] | None = None,
         action: str | None = None,
+        evidence_dir: Path | None = None,
+        evidence_name: str = "shot",
     ) -> ExecutionResult:
         started = time.monotonic()
         try:
@@ -142,6 +147,7 @@ class BrowserExecutor:
         page_errors: list[str] = []
         final_url = url
         screenshot_sha256: str | None = None
+        screenshot_path: str | None = None
 
         try:
             async with async_playwright() as playwright:
@@ -183,6 +189,11 @@ class BrowserExecutor:
                     try:
                         shot = await page.screenshot(type="png")
                         screenshot_sha256 = hashlib.sha256(shot).hexdigest()
+                        if evidence_dir is not None and shot:
+                            evidence_dir.mkdir(parents=True, exist_ok=True)
+                            target = evidence_dir / f"{evidence_name}-{screenshot_sha256[:8]}.png"
+                            target.write_bytes(shot)
+                            screenshot_path = str(target)
                     except Exception:  # noqa: BLE001 - screenshots are best effort
                         screenshot_sha256 = None
                 finally:
@@ -210,6 +221,7 @@ class BrowserExecutor:
             final_url=final_url,
             duration_ms=int((time.monotonic() - started) * 1000),
             screenshot_sha256=screenshot_sha256,
+            screenshot_path=screenshot_path,
             error=None,
         )
 
