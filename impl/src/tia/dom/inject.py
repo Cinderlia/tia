@@ -36,6 +36,7 @@ from tia.cap.entry import (
 )
 from tia.cap.forms import FormField, PageForm, find_form, forms_from_document
 from tia.cap.request_plan import plan_request
+from tia.cap.schema import fetch_brief, render_brief
 from tia.cap.trace_view import make_trace_probe
 from tia.dom.trigger import StageRecord
 from tia.inf.accounts import public_catalog
@@ -450,6 +451,16 @@ async def _run_inject(
         True,
         f"target={target['table']}.{target['column']} columns={target['columns']} line={insert_line}",
     )
+    schema_text = ""
+    try:
+        brief = await fetch_brief(
+            call, str(target["table"]), payload_columns=list(target["columns"])
+        )
+    except (ToolCallError, ValueError) as exc:
+        notes["schema_brief_error"] = str(exc)
+    else:
+        schema_text = render_brief(brief)
+        notes["schema_brief"] = brief.to_dict()
 
     # ---- I2 Entry reconstruction: fetch page to find form ----
     try:
@@ -709,6 +720,7 @@ async def _run_inject(
         trace_probe=make_trace_probe(
             call, case_id=result.case_id, file=read_file, line=read_line
         ),
+        schema=schema_text,
     )
     notes["write_attempts"] = [item.to_dict() for item in delivery.attempts]
     if delivery.plan is not None:

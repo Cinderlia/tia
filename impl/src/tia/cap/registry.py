@@ -1,7 +1,7 @@
 """Tool registry: the single source of truth is the design document "Tool Interface Documentation".
 
 Two responsibilities:
-1. Declare metadata and schema for 36 tools (``TOOLS``);
+1. Declare metadata and schema for 37 tools (``TOOLS``);
 2. Filter by profile and unify handler returns/exceptions into an envelope (``dispatch``).
 
 Handlers only write ``tia.cap.*`` / ``tia.ad.*``, loaded lazily via dot-separated paths,
@@ -307,7 +307,22 @@ _PROBE_DISARM_SCHEMA = {
     "additionalProperties": False,
 }
 
-#: 36 tools, order consistent with "Tool Interface Documentation".
+#: 37 tools, order consistent with "Tool Interface Documentation".
+_DB_PREREQUISITES_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "case_id": {"type": "string"},
+        "table": {"type": "string", "description": "Target table name"},
+        "payload_columns": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Columns that carry the payload; they are not prerequisites",
+        },
+    },
+    "required": ["case_id", "table"],
+    "additionalProperties": False,
+}
+
 _SLICE_NEXT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -357,6 +372,14 @@ TOOLS: tuple[ToolSpec, ...] = (
     # 2. Data and Probes (8)
     _t("db_schema", "Read database table schema", "data", handler_path="tia.cap.db:db_schema"),
     _t("db_read", "Read-only SQL query, returning rows and column metadata", "data", handler_path="tia.cap.db:db_read"),
+    _t(
+        "db_prerequisites",
+        "Read-only facts a table needs for a legal INSERT: required columns, "
+        "foreign-key parents, enum domains and widths",
+        "data",
+        input_schema=_DB_PREREQUISITES_SCHEMA,
+        handler_path="tia.cap.prereq:db_prerequisites",
+    ),
     _t("db_write", "Write to database (must return change_id and undo_sql)", "data", mutating=True, handler_path="tia.cap.db:db_write"),
     _t("db_undo", "Rollback own writes, must have residue==0", "data", mutating=True, handler_path="tia.cap.db:db_undo"),
     _t(
@@ -433,8 +456,8 @@ TOOLS: tuple[ToolSpec, ...] = (
 )
 
 _BY_NAME: dict[str, ToolSpec] = {spec.name: spec for spec in TOOLS}
-if len(_BY_NAME) != 36:  # pragma: no cover - design invariant
-    raise RuntimeError(f"Tool count should be 36, actual {len(_BY_NAME)}")
+if len(_BY_NAME) != 37:  # pragma: no cover - design invariant
+    raise RuntimeError(f"Tool count should be 37, actual {len(_BY_NAME)}")
 
 
 def tools_for_profile(profile: str) -> tuple[ToolSpec, ...]:

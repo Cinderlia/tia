@@ -8,17 +8,17 @@ from tia.cap import registry
 from tia.schemas.envelope import Envelope, ErrorCode
 
 
-def test_has_36_unique_tools() -> None:
+def test_has_37_unique_tools() -> None:
     names = [spec.name for spec in registry.TOOLS]
-    assert len(names) == 36
-    assert len(set(names)) == 36
+    assert len(names) == 37
+    assert len(set(names)) == 37
     assert tuple(names) == registry.tool_names("trigger")
 
 
 def test_main_profile_hides_exactly_22_tools() -> None:
     visible = registry.tool_names("main")
     all_names = registry.tool_names("trigger")
-    assert len(visible) == 14
+    assert len(visible) == 15
     assert len(registry.MAIN_EXCLUDED) == 22
     assert set(visible) == set(all_names) - registry.MAIN_EXCLUDED
     assert "verify_tag" not in visible
@@ -27,7 +27,7 @@ def test_main_profile_hides_exactly_22_tools() -> None:
 
 @pytest.mark.parametrize("profile", ["trigger", "inject"])
 def test_trigger_and_inject_see_all_tools(profile: str) -> None:
-    assert len(registry.tool_names(profile)) == 36
+    assert len(registry.tool_names(profile)) == 37
 
 
 def test_unknown_profile_rejected() -> None:

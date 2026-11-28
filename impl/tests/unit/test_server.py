@@ -34,7 +34,7 @@ async def _list_tools(profile: str) -> list[types.Tool]:
 
 @pytest.mark.parametrize(
     ("profile", "expected"),
-    [("main", 14), ("trigger", 36), ("inject", 36)],
+    [("main", 15), ("trigger", 37), ("inject", 37)],
 )
 async def test_tool_count_per_profile(profile: str, expected: int) -> None:
     tools = await _list_tools(profile)

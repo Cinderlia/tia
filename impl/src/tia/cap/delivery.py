@@ -158,6 +158,7 @@ async def deliver(
     accounts: list[dict[str, Any]] | None = None,
     trace: dict[str, Any] | None = None,
     trace_probe: TraceProbe | None = None,
+    schema: str = "",
 ) -> Delivery:
     """Plan and send a request, replanning with the failure as feedback."""
 
@@ -185,6 +186,7 @@ async def deliver(
             accounts=accounts,
             trace=trace_view,
             trace_diff=trace_diff,
+            schema=schema,
         )
         if plan is None:
             return delivery

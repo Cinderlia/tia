@@ -179,3 +179,18 @@ async def test_unknown_identity_is_dropped_with_a_warning() -> None:
     assert plan is not None
     assert plan.account == ""
     assert any("superuser" in warning for warning in plan.warnings)
+
+
+async def test_prompt_includes_schema_prerequisites() -> None:
+    from tia.cap.request_plan import _prompt
+
+    text = _prompt(
+        goal="insert",
+        page_url="http://example.test/write.php",
+        forms=[],
+        source_text="INSERT INTO t (a) VALUES ('x')",
+        payload="x",
+        hint="",
+        schema="SCHEMA PREREQUISITES for `t`: a: row (references parent)",
+    )
+    assert "SCHEMA PREREQUISITES for `t`" in text

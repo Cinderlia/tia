@@ -79,6 +79,7 @@ def _prompt(
     accounts: list[dict[str, Any]] | None = None,
     trace: dict[str, Any] | None = None,
     trace_diff: dict[str, Any] | None = None,
+    schema: str = "",
 ) -> str:
     shape = []
     for index, item in enumerate(forms):
@@ -145,6 +146,7 @@ def _prompt(
         f"HINT: {hint}\n"
         f"STORAGE COLUMNS: {constraints[:1200]}\n"
         f"SLICE SINK (build the payload for THIS context, not for any SQL nearby): {sink[:1500]}\n"
+        f"{schema[:1800] + chr(10) if schema else ''}"
         f"{trace_block}"
         f"{diff_block}"
         f"LAST ATTEMPT OBSERVATION: {observation[:800]}\n"
@@ -201,6 +203,7 @@ async def plan_request(
     accounts: list[dict[str, Any]] | None = None,
     trace: dict[str, Any] | None = None,
     trace_diff: dict[str, Any] | None = None,
+    schema: str = "",
 ) -> PlannedRequest | None:
     """Ask the model for a request plan; validate it; fall back to a local fill."""
     allowed = {entry.name for form in forms for entry in form.fields}
@@ -222,6 +225,7 @@ async def plan_request(
                 accounts=accounts,
                 trace=trace,
                 trace_diff=trace_diff,
+                schema=schema,
             ),
         )
         url = str(reply.get("url") or "")

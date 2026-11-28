@@ -29,6 +29,7 @@ from tia.cap.entry import (
 )
 from tia.cap.forms import FormField, PageForm
 from tia.cap.request_plan import plan_request
+from tia.cap.schema import fetch_brief, render_brief
 from tia.inf.reports import write_case_report
 from tia.inf.runtime import get_runtime
 from tia.inf.settings import attempt_limit
@@ -682,6 +683,17 @@ async def _run_trigger(
         except ToolCallError:
             update_row = None
     notes["write_mode"] = write_mode
+    schema_text = ""
+    if write_mode == "insert":
+        # An INSERT must satisfy every NOT NULL column and parent row; give the
+        # planner those facts instead of letting it discover them by ENV_ERROR.
+        try:
+            brief = await fetch_brief(kernel.call, table, payload_columns=value_columns)
+        except (ToolCallError, ValueError) as exc:
+            notes["schema_brief_error"] = str(exc)
+        else:
+            schema_text = render_brief(brief)
+            notes["schema_brief"] = brief.to_dict()
     # The application writes rows as well (the verification POST submits the
     # form), so tag-based cleanup covers both our direct writes and the app's.
     if case is not None:
@@ -728,6 +740,7 @@ async def _run_trigger(
         tag=tag,
         sink=f"{sink.get('file')}:{sink.get('line')}\n{sink.get('code')}",
         fallback_fields={name: f"tia-{tag}" for name in value_columns},
+        schema=schema_text,
     )
     if selection is not None:
         notes["payload_plan"] = selection.to_dict()
